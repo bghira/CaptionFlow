@@ -1,13 +1,26 @@
 orchestrator:
-  host: 0.0.0.0
+  host: "0.0.0.0"
   port: 8765
-  #ssl:
-  #  # Use the paths output by 'caption-flow generate-cert' command
-  #  cert: /etc/letsencrypt/live/caption.example.com/fullchain.pem  # From generate-cert output
-  #  key: /etc/letsencrypt/live/caption.example.com/privkey.pem      # From generate-cert output
+  
+  # Dataset configuration
+  dataset:
+    path: "NebulaeWis/e621-2024-webp-4Mpixel"  # HuggingFace dataset path
+    type: "huggingface"  # or "local" or "url"
+    
+  # Storage configuration
   storage:
-    data_dir: ./caption_data
-    checkpoint_interval: 1000
+    data_dir: "./caption_data"
+    checkpoint_dir: "./checkpoints"
+    
+    # Buffer sizes - these control when data is written to disk
+    caption_buffer_size: 100  # Flush captions after this many
+    job_buffer_size: 50       # Flush jobs after this many
+    contributor_buffer_size: 10
+    
+    # Checkpoint interval (number of captions)
+    checkpoint_interval: 1000  # Force flush every 1000 captions
+    
+  # Authentication
   auth:
     worker_tokens:
       - token: "worker-alpha-2024"
@@ -16,18 +29,34 @@ orchestrator:
         name: "Community-Worker-1"
     admin_tokens:
       - "admin-secret-2024"
+      
+  # SSL (optional, for production)
+  ssl:
+    cert: null  # Path to SSL certificate
+    key: null   # Path to SSL private key
 
 worker:
-  batch_size: 32
-  model: "llava-v1.6-34b"
+  # These can be overridden by CLI args
+  server: "ws://localhost:8765"  # or wss:// for SSL
+  token: "worker-alpha-2024"  # Worker token for authentication
+  batch_size: 1
+  verify_ssl: false  # Set to true in production
+  
+  # Dataset configuration (must match orchestrator)
+  dataset_type: "huggingface"  # or "local" or "url"
+  dataset_path: null  # For local datasets
+  dataset_url: null   # For URL-based datasets
+  fallback_to_direct: false  # Try direct URL access if tar fails
+  
+  # vLLM specific settings
+  gpu_id: 0
+  precision: "fp16"  # fp16, fp8, or awq
+  model: "Qwen/Qwen2.5-VL-3B-Instruct"
+  temperature: 0.7
+  coalesce_ms: 30  # Batch inference delay in milliseconds
   max_retries: 3
-  heartbeat_interval: 30
-  preprocessing:
-    num_workers: 4
-    image_size: [224, 224]
 
 monitor:
-  refresh_rate: 1.0
-  show_contributors: true
-  show_quality_metrics: true
-  max_activity_items: 20
+  server: "ws://localhost:8765"
+  token: "admin-secret-2024"
+  verify_ssl: false
