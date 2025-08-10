@@ -5,16 +5,26 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+
 class JobStatus(Enum):
     """Job processing status."""
+
     PENDING = "pending"
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
 
+    def __str__(self):
+        return self.value
+
+    def to_json(self):
+        return self.value
+
+
 @dataclass
 class Job:
     """Captioning job."""
+
     job_id: str
     dataset: str
     shard: str
@@ -22,14 +32,16 @@ class Job:
     status: JobStatus = JobStatus.PENDING
     assigned_to: Optional[str] = None
     created_at: datetime = None
-    
+
     def __post_init__(self):
         if self.created_at is None:
             self.created_at = datetime.utcnow()
 
+
 @dataclass
 class Caption:
     """Generated caption with attribution."""
+
     job_id: str
     dataset: str
     shard: str
@@ -39,9 +51,11 @@ class Caption:
     timestamp: datetime
     quality_score: Optional[float] = None
 
+
 @dataclass
 class Contributor:
     """Contributor information."""
+
     contributor_id: str
     name: str
     total_captions: int = 0
