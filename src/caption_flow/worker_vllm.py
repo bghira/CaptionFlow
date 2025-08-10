@@ -23,6 +23,7 @@ import numpy as np
 
 from .models import Job, JobStatus
 from .utils import CaptionUtils
+from .worker import Worker
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class InferenceConfig:
     model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     temperature: float = 0.7
 
-class VLLMWorker:
+class VLLMWorker(Worker):
     """Worker node that processes captioning jobs using vLLM."""
     
     def __init__(self, config: Dict[str, Any]):
@@ -82,16 +83,7 @@ class VLLMWorker:
         # Metrics
         self.processed_count = 0
         self.error_count = 0
-    
-    def _setup_ssl(self) -> Optional[ssl.SSLContext]:
-        """Configure SSL context."""
-        if not self.config.get("verify_ssl", True):
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            return context
-        return ssl.create_default_context()
-    
+        
     def _setup_vllm(self):
         """Initialize vLLM components."""
         # Set GPU visibility
