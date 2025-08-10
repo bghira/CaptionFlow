@@ -1,10 +1,10 @@
-"""Improved vLLM worker that processes shard chunks directly.
+"""Improved vLLM worker that processes shard chunks directly and returns caption lists.
 
 The worker now:
 1. Receives shard chunk assignments from orchestrator
 2. Directly streams WebDataset shards with readahead
 3. Extracts metadata from images
-4. Submits captions + metadata back to orchestrator
+4. Submits LIST of captions + metadata back to orchestrator
 """
 
 import os
@@ -60,12 +60,12 @@ class ProcessingItem:
 
 @dataclass
 class ProcessedResult:
-    """Result with caption and metadata."""
+    """Result with multiple captions and metadata."""
 
     chunk_id: str
     shard_name: str
     item_key: str
-    caption: str
+    captions: List[str]
     image_width: int
     image_height: int
     image_format: str
@@ -454,6 +454,7 @@ class VLLMWorker:
         prompts = [
             "describe this image in detail",
             "provide a comprehensive description of the visual content",
+            "what are the key elements in this image?",
         ]
 
         while self.running:
@@ -482,32 +483,35 @@ class VLLMWorker:
 
                 # Process outputs
                 for i, item in enumerate(batch):
-                    # Get both prompt outputs
+                    # Get all prompt outputs as a list
                     idx = i * len(prompts)
-                    descriptions = [
-                        self._clean_output(outputs[idx + j].outputs[0].text)
-                        for j in range(len(prompts))
-                        if idx + j < len(outputs) and outputs[idx + j].outputs
-                    ]
+                    captions = []
 
-                    # Combine captions
-                    caption = CaptionUtils.combine(descriptions)
+                    for j in range(len(prompts)):
+                        if idx + j < len(outputs) and outputs[idx + j].outputs:
+                            caption_text = self._clean_output(outputs[idx + j].outputs[0].text)
+                            if caption_text:  # Only add non-empty captions
+                                captions.append(caption_text)
 
-                    # Extract metadata
-                    result = ProcessedResult(
-                        chunk_id=item.chunk_id,
-                        shard_name=Path(item.chunk_id).stem.rsplit("_chunk_", 1)[0],
-                        item_key=item.item_key,
-                        caption=caption,
-                        image_width=item.image.width,
-                        image_height=item.image.height,
-                        image_format=item.image.format or "unknown",
-                        file_size=len(item.image_data),
-                        processing_time_ms=(time.time() - start_time) * 1000 / len(batch),
-                    )
+                    # Only create result if we have at least one caption
+                    if captions:
+                        result = ProcessedResult(
+                            chunk_id=item.chunk_id,
+                            shard_name=Path(item.chunk_id).stem.rsplit("_chunk_", 1)[0],
+                            item_key=item.item_key,
+                            captions=captions,  # Now storing list of captions
+                            image_width=item.image.width,
+                            image_height=item.image.height,
+                            image_format=item.image.format or "unknown",
+                            file_size=len(item.image_data),
+                            processing_time_ms=(time.time() - start_time) * 1000 / len(batch),
+                        )
 
-                    self.result_queue.put(result)
-                    self.items_processed += 1
+                        self.result_queue.put(result)
+                        self.items_processed += 1
+                    else:
+                        logger.warning(f"No valid captions generated for item {item.item_key}")
+                        self.items_failed += 1
 
             except Empty:
                 continue
@@ -577,15 +581,17 @@ class VLLMWorker:
                     sent_results = []
                     for result in pending_results:
                         try:
+                            # Send the list of captions
                             await self.websocket.send(
                                 json.dumps(
                                     {
-                                        "type": "submit_caption",
+                                        "type": "submit_captions",
                                         "chunk_id": result.chunk_id,
                                         "dataset": self.config.get("dataset_path", "unknown"),
                                         "shard": result.shard_name,
                                         "item_key": result.item_key,
-                                        "caption": result.caption,
+                                        "captions": result.captions,
+                                        "caption_count": len(result.captions),
                                         "image_width": result.image_width,
                                         "image_height": result.image_height,
                                         "image_format": result.image_format,
@@ -597,7 +603,10 @@ class VLLMWorker:
                             sent_results.append(result)
 
                             if self.items_processed % 100 == 0:
-                                logger.info(f"Processed {self.items_processed} items")
+                                logger.info(
+                                    f"Processed {self.items_processed} items "
+                                    f"(~{self.items_processed * len(prompts)} captions)"
+                                )
                         except (
                             websockets.exceptions.ConnectionClosed,
                             websockets.exceptions.ConnectionClosedError,

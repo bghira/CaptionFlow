@@ -1,4 +1,4 @@
-"""Orchestrator with proper chunk sizing and timeout configuration."""
+"""Orchestrator with proper chunk sizing and caption list handling."""
 
 import asyncio
 import json
@@ -47,7 +47,7 @@ class ShardAssignment:
 
 
 class Orchestrator:
-    """Orchestrator with configurable chunk sizing."""
+    """Orchestrator with configurable chunk sizing and caption list support."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -100,9 +100,12 @@ class Orchestrator:
             "pending_chunks": 0,
             "total_items_processed": 0,
             "total_captions": 0,
+            "total_unique_images": 0,  # Track unique images
+            "avg_captions_per_image": 0,  # Track average captions per image
             "connected_workers": 0,
             "avg_processing_time_ms": 0,
             "items_per_minute": 0,
+            "captions_per_minute": 0,  # Track caption generation rate
             "estimated_completion_hours": 0,
         }
 
@@ -110,6 +113,7 @@ class Orchestrator:
         self.processing_start_time = None
         self.last_stats_time = datetime.utcnow()
         self.last_items_count = 0
+        self.last_captions_count = 0
 
     async def initialize(self):
         """Initialize orchestrator and create chunks."""
@@ -332,24 +336,59 @@ class Orchestrator:
         if msg_type == "request_chunks":
             await self._assign_chunks_to_worker(worker_id)
 
-        elif msg_type == "submit_caption":
-            # Process caption submission
-            caption = Caption(
-                job_id=f"{data['shard']}_{data['item_key']}",
-                dataset=data["dataset"],
-                shard=data["shard"],
-                item_key=data["item_key"],
-                caption=data["caption"],
-                contributor_id=worker_id,
-                timestamp=datetime.utcnow(),
-                quality_score=None,
-            )
+        elif msg_type == "submit_captions":  # Changed from submit_caption to handle lists
+            # Process multiple captions submission
+            captions = data.get("captions", [])
+            if isinstance(captions, str):
+                # unpack json?
+                try:
+                    captions = json.loads(captions)
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid JSON in captions for worker {worker_id}")
+                    return
 
-            await self.storage.save_caption(caption)
+            if not isinstance(captions, list):
+                logger.error(
+                    f"Expected list of captions, got {type(captions)} for worker {worker_id}"
+                )
+                return
+            caption_count = data.get("caption_count", len(captions))
+
+            if not captions:
+                logger.warning(f"Received empty captions list for item {data.get('item_key')}")
+                return
+
+            # Create a single caption entry with list of captions
+            caption_data = {
+                "job_id": f"{data['shard']}_{data['item_key']}",
+                "dataset": data["dataset"],
+                "shard": data["shard"],
+                "item_key": data["item_key"],
+                "captions": captions,  # Store as list
+                "caption_count": caption_count,
+                "contributor_id": worker_id,
+                "timestamp": datetime.utcnow(),
+                "quality_scores": None,  # Could be populated if we have quality metrics
+                "image_width": data.get("image_width"),
+                "image_height": data.get("image_height"),
+                "image_format": data.get("image_format"),
+                "file_size": data.get("file_size"),
+                "processing_time_ms": data.get("processing_time_ms"),
+            }
+
+            # logger.info(f"Received caption data: {caption_data}")
+            await self.storage.save_captions(caption_data)
 
             # Update statistics
             self.stats["total_items_processed"] += 1
-            self.stats["total_captions"] += 1
+            self.stats["total_captions"] += caption_count  # Add all captions in the list
+            self.stats["total_unique_images"] = self.stats["total_items_processed"]
+
+            # Calculate average captions per image
+            if self.stats["total_unique_images"] > 0:
+                self.stats["avg_captions_per_image"] = (
+                    self.stats["total_captions"] / self.stats["total_unique_images"]
+                )
 
             # Update chunk progress
             chunk_id = data.get("chunk_id")
@@ -367,6 +406,14 @@ class Orchestrator:
 
             # Update processing rate
             self._update_processing_rate()
+
+            # Log progress periodically
+            if self.stats["total_items_processed"] % 100 == 0:
+                logger.info(
+                    f"Progress: {self.stats['total_items_processed']} images, "
+                    f"{self.stats['total_captions']} captions "
+                    f"(avg {self.stats['avg_captions_per_image']:.1f} captions/image)"
+                )
 
         elif msg_type == "chunk_complete":
             await self._complete_chunk(data["chunk_id"])
@@ -459,14 +506,19 @@ class Orchestrator:
                         await self._handle_chunk_failure(chunk_id, "Timeout")
 
     def _update_processing_rate(self):
-        """Update items per minute calculation."""
+        """Update items and captions per minute calculation."""
         now = datetime.utcnow()
         time_delta = (now - self.last_stats_time).total_seconds()
 
         if time_delta > 10:  # Update every 10 seconds
             items_delta = self.stats["total_items_processed"] - self.last_items_count
+            captions_delta = self.stats["total_captions"] - self.last_captions_count
+
             items_per_second = items_delta / time_delta if time_delta > 0 else 0
+            captions_per_second = captions_delta / time_delta if time_delta > 0 else 0
+
             self.stats["items_per_minute"] = round(items_per_second * 60, 1)
+            self.stats["captions_per_minute"] = round(captions_per_second * 60, 1)
 
             # Estimate completion time
             remaining_items = (
@@ -478,6 +530,7 @@ class Orchestrator:
 
             self.last_stats_time = now
             self.last_items_count = self.stats["total_items_processed"]
+            self.last_captions_count = self.stats["total_captions"]
 
     async def _performance_monitor(self):
         """Monitor performance and alert on issues."""
@@ -505,7 +558,9 @@ class Orchestrator:
                 )
                 logger.info(
                     f"Progress: {progress:.1f}%, "
-                    f"Rate: {self.stats['items_per_minute']:.1f} items/min, "
+                    f"Images: {self.stats['items_per_minute']:.1f}/min, "
+                    f"Captions: {self.stats['captions_per_minute']:.1f}/min, "
+                    f"Avg captions/image: {self.stats['avg_captions_per_image']:.1f}, "
                     f"ETA: {self.stats['estimated_completion_hours']:.1f} hours"
                 )
 
@@ -516,7 +571,12 @@ class Orchestrator:
 
             if self.storage.caption_buffer:
                 await self.storage.checkpoint()
-                logger.info(f"Checkpoint: {self.storage.total_captions_written} captions written")
+                stats = await self.storage.get_caption_stats()
+                logger.info(
+                    f"Checkpoint: {stats['total_rows']} images, "
+                    f"{stats['total_captions']} captions "
+                    f"(avg {stats['avg_captions_per_image']:.1f} per image)"
+                )
 
     async def _stats_reporter(self):
         """Report statistics."""
@@ -569,7 +629,12 @@ class Orchestrator:
 
         # Final checkpoint
         await self.storage.checkpoint()
-        logger.info(f"Final checkpoint: {self.storage.total_captions_written} captions written")
+        stats = await self.storage.get_caption_stats()
+        logger.info(
+            f"Final checkpoint: {stats['total_rows']} images with "
+            f"{stats['total_captions']} total captions "
+            f"(avg {stats['avg_captions_per_image']:.1f} captions per image)"
+        )
 
         logger.info("Orchestrator shutdown complete.")
         await asyncio.sleep(1)  # Allow time for cleanup

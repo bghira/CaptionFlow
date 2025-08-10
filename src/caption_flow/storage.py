@@ -1,11 +1,12 @@
-"""Arrow/Parquet storage management."""
+"""Arrow/Parquet storage management with list column support for captions."""
 
 import asyncio
+import json
 import logging
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Dict, Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pyarrow import fs
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class StorageManager:
-    """Manages Arrow/Parquet storage for captions and jobs."""
+    """Manages Arrow/Parquet storage for captions and jobs with list column support."""
 
     def __init__(
         self,
@@ -50,20 +51,27 @@ class StorageManager:
 
         # Statistics
         self.total_captions_written = 0
+        self.total_caption_entries_written = 0  # Total individual captions
         self.total_flushes = 0
         self.duplicates_skipped = 0
 
-        # Schemas
+        # Schemas - Updated caption schema to support list of captions
         self.caption_schema = pa.schema(
             [
                 ("job_id", pa.string()),
                 ("dataset", pa.string()),
                 ("shard", pa.string()),
                 ("item_key", pa.string()),
-                ("caption", pa.string()),
+                ("captions", pa.list_(pa.string())),  # Changed from single caption to list
+                ("caption_count", pa.int32()),  # Number of captions for this item
                 ("contributor_id", pa.string()),
                 ("timestamp", pa.timestamp("us")),
-                ("quality_score", pa.float32()),
+                ("quality_scores", pa.list_(pa.float32())),  # Optional quality scores per caption
+                ("image_width", pa.int32()),
+                ("image_height", pa.int32()),
+                ("image_format", pa.string()),
+                ("file_size", pa.int64()),
+                ("processing_time_ms", pa.float32()),
             ]
         )
 
@@ -99,10 +107,16 @@ class StorageManager:
                 "dataset": [],
                 "shard": [],
                 "item_key": [],
-                "caption": [],
+                "captions": [],
+                "caption_count": [],
                 "contributor_id": [],
                 "timestamp": [],
-                "quality_score": [],
+                "quality_scores": [],
+                "image_width": [],
+                "image_height": [],
+                "image_format": [],
+                "file_size": [],
+                "processing_time_ms": [],
             }
             empty_table = pa.Table.from_pydict(empty_dict, schema=self.caption_schema)
             pq.write_table(empty_table, self.captions_path)
@@ -148,25 +162,53 @@ class StorageManager:
             self.existing_contributor_ids = set(existing_contributors["contributor_id"].to_pylist())
             logger.info(f"Loaded {len(self.existing_contributor_ids)} existing contributor IDs")
 
-    async def save_caption(self, caption: Caption):
-        """Save a caption to storage - buffers until batch size reached, with deduplication."""
-        # Check if we already have a caption for this job_id
-        if caption.job_id in self.existing_caption_job_ids:
+    async def save_captions(self, caption_data: Dict[str, Any]):
+        """Save captions for an image - single row with list of captions."""
+        job_id = caption_data["job_id"]
+
+        # Check if we already have captions for this job_id
+        if job_id in self.existing_caption_job_ids:
             self.duplicates_skipped += 1
-            logger.debug(f"Skipping duplicate caption for job_id: {caption.job_id}")
+            logger.debug(f"Skipping duplicate captions for job_id: {job_id}")
             return
 
         # Check if it's already in the buffer
         for buffered in self.caption_buffer:
-            if buffered["job_id"] == caption.job_id:
-                logger.debug(f"Caption for job_id {caption.job_id} already in buffer")
+            if buffered["job_id"] == job_id:
+                logger.debug(f"Captions for job_id {job_id} already in buffer")
                 return
 
-        self.caption_buffer.append(asdict(caption))
-        self.existing_caption_job_ids.add(caption.job_id)
+        # Ensure captions is a list (not a JSON string)
+        captions = caption_data.get("captions")
+        if isinstance(captions, str):
+            # If it's a JSON string, decode it
+            import json
+
+            try:
+                captions = json.loads(captions)
+                caption_data["captions"] = captions
+                logger.warning(f"Decoded JSON string to list for job_id {job_id}")
+            except json.JSONDecodeError:
+                logger.error(f"Invalid captions format for job_id {job_id}")
+                return
+
+        if not isinstance(captions, list):
+            logger.error(f"Captions must be a list for job_id {job_id}, got {type(captions)}")
+            return
+
+        # Add caption count
+        caption_data["caption_count"] = len(captions)
+
+        # Add default values for optional fields if not present
+        if "quality_scores" not in caption_data:
+            caption_data["quality_scores"] = None
+
+        self.caption_buffer.append(caption_data)
+        self.existing_caption_job_ids.add(job_id)
 
         # Log buffer status
         logger.debug(f"Caption buffer size: {len(self.caption_buffer)}/{self.caption_buffer_size}")
+        logger.debug(f"  Added captions for {job_id}: {len(captions)} captions")
 
         # Flush if buffer is large enough
         if len(self.caption_buffer) >= self.caption_buffer_size:
@@ -205,39 +247,70 @@ class StorageManager:
         if not self.caption_buffer:
             return
 
-        num_captions = len(self.caption_buffer)
-        logger.info(f"Flushing {num_captions} captions to disk")
+        num_rows = len(self.caption_buffer)
+        num_captions = sum(len(row["captions"]) for row in self.caption_buffer)
+        logger.info(f"Flushing {num_rows} rows with {num_captions} total captions to disk")
 
-        # Create table from buffer
+        # Ensure all captions are proper lists before creating table
+        for row in self.caption_buffer:
+            if isinstance(row["captions"], str):
+                import json
+
+                try:
+                    row["captions"] = json.loads(row["captions"])
+                except:
+                    logger.error(f"Failed to decode captions for {row['job_id']}")
+                    row["captions"] = [row["captions"]]  # Wrap string in list as fallback
+
+        # Create table from buffer with explicit schema
         table = pa.Table.from_pylist(self.caption_buffer, schema=self.caption_schema)
 
         if self.captions_path.exists():
-            # Read existing, deduplicate, and write back
+            # Read existing table
             existing = pq.read_table(self.captions_path)
-            existing_df = existing.to_pandas()
-            new_df = table.to_pandas()
 
-            # Deduplicate based on job_id (keep first occurrence)
-            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-            combined_df = combined_df.drop_duplicates(subset=["job_id"], keep="first")
+            # Get existing job_ids for deduplication
+            existing_job_ids = set(existing.column("job_id").to_pylist())
 
-            # Convert back to Arrow table
-            combined = pa.Table.from_pandas(combined_df, schema=self.caption_schema)
-            pq.write_table(combined, self.captions_path)
+            # Filter new data to exclude duplicates
+            new_rows = []
+            for row in self.caption_buffer:
+                if row["job_id"] not in existing_job_ids:
+                    new_rows.append(row)
 
-            actual_new = len(combined_df) - len(existing_df)
-            logger.info(
-                f"Added {actual_new} new captions (skipped {num_captions - actual_new} duplicates)"
-            )
+            if new_rows:
+                # Create table from new rows only
+                new_table = pa.Table.from_pylist(new_rows, schema=self.caption_schema)
+
+                # Combine tables using PyArrow concat (preserves list types better)
+                combined = pa.concat_tables([existing, new_table])
+
+                # Write with proper list column preservation
+                pq.write_table(combined, self.captions_path, compression="snappy")
+
+                logger.info(
+                    f"Added {len(new_rows)} new rows (skipped {num_rows - len(new_rows)} duplicates)"
+                )
+                actual_new = len(new_rows)
+            else:
+                logger.info(f"All {num_rows} rows were duplicates, skipping write")
+                actual_new = 0
         else:
-            pq.write_table(table, self.captions_path)
+            # Write new file with proper list columns
+            pq.write_table(table, self.captions_path, compression="snappy")
+            actual_new = num_rows
 
-        self.total_captions_written += num_captions
+        self.total_captions_written += actual_new
+        self.total_caption_entries_written += sum(
+            len(row["captions"]) for row in self.caption_buffer[:actual_new]
+        )
         self.total_flushes += 1
         self.caption_buffer.clear()
 
         logger.info(
-            f"Successfully wrote captions (total: {self.total_captions_written}, duplicates skipped: {self.duplicates_skipped})"
+            f"Successfully wrote captions (rows: {self.total_captions_written}, "
+            f"total captions: {self.total_caption_entries_written}, "
+            f"duplicates skipped: {self.duplicates_skipped})"
         )
 
     async def _flush_jobs(self):
@@ -310,7 +383,9 @@ class StorageManager:
         await self._flush_contributors()
 
         logger.info(
-            f"Checkpoint complete. Total captions: {self.total_captions_written}, Duplicates skipped: {self.duplicates_skipped}"
+            f"Checkpoint complete. Total rows: {self.total_captions_written}, "
+            f"Total caption entries: {self.total_caption_entries_written}, "
+            f"Duplicates skipped: {self.duplicates_skipped}"
         )
 
     async def job_exists(self, job_id: str) -> bool:
@@ -324,6 +399,36 @@ class StorageManager:
                 return True
 
         return False
+
+    async def get_captions(self, job_id: str) -> Optional[List[str]]:
+        """Retrieve captions for a specific job_id."""
+        # Check buffer first
+        for buffered in self.caption_buffer:
+            if buffered["job_id"] == job_id:
+                return buffered["captions"]
+
+        if not self.captions_path.exists():
+            return None
+
+        table = pq.read_table(self.captions_path)
+        df = table.to_pandas()
+
+        row = df[df["job_id"] == job_id]
+        if row.empty:
+            return None
+
+        captions = row.iloc[0]["captions"]
+
+        # Handle both correct list storage and incorrect JSON string storage
+        if isinstance(captions, str):
+            # This shouldn't happen with correct storage, but handle legacy data
+            try:
+                captions = json.loads(captions)
+                logger.warning(f"Had to decode JSON string for job_id {job_id} - file needs fixing")
+            except json.JSONDecodeError:
+                captions = [captions]  # Wrap single string as list
+
+        return captions
 
     async def get_job(self, job_id: str) -> Optional[Job]:
         """Retrieve a job by ID."""
@@ -386,93 +491,78 @@ class StorageManager:
 
         return jobs
 
-    async def get_pending_jobs(self) -> List[Job]:
-        """Get all pending jobs."""
-        if not self.jobs_path.exists():
+    async def get_caption_stats(self) -> Dict[str, Any]:
+        """Get statistics about stored captions."""
+        if not self.captions_path.exists():
+            return {
+                "total_rows": 0,
+                "total_captions": 0,
+                "avg_captions_per_image": 0,
+                "min_captions": 0,
+                "max_captions": 0,
+            }
+
+        table = pq.read_table(self.captions_path)
+        df = table.to_pandas()
+
+        if len(df) == 0:
+            return {
+                "total_rows": 0,
+                "total_captions": 0,
+                "avg_captions_per_image": 0,
+                "min_captions": 0,
+                "max_captions": 0,
+            }
+
+        caption_counts = df["caption_count"].values
+
+        return {
+            "total_rows": len(df),
+            "total_captions": caption_counts.sum(),
+            "avg_captions_per_image": caption_counts.mean(),
+            "min_captions": caption_counts.min(),
+            "max_captions": caption_counts.max(),
+            "std_captions": caption_counts.std(),
+        }
+
+    async def get_sample_captions(self, n: int = 5) -> List[Dict[str, Any]]:
+        """Get a sample of caption entries for inspection."""
+        if not self.captions_path.exists():
             return []
 
-        table = pq.read_table(self.jobs_path)
+        table = pq.read_table(self.captions_path)
         df = table.to_pandas()
 
-        rows = df[df["status"] == JobStatus.PENDING.value]
-
-        jobs = []
-        for _, row in rows.iterrows():
-            jobs.append(
-                Job(
-                    job_id=row["job_id"],
-                    dataset=row["dataset"],
-                    shard=row["shard"],
-                    item_key=row["item_key"],
-                    status=JobStatus.PENDING,
-                    assigned_to=None,
-                    created_at=row["created_at"],
-                )
-            )
-
-        return jobs
-
-    async def get_contributor(self, contributor_id: str) -> Optional[Contributor]:
-        """Get contributor by ID."""
-        if not self.contributors_path.exists():
-            return None
-
-        table = pq.read_table(self.contributors_path)
-        df = table.to_pandas()
-
-        row = df[df["contributor_id"] == contributor_id]
-        if row.empty:
-            return None
-
-        return Contributor(
-            contributor_id=row.iloc[0]["contributor_id"],
-            name=row.iloc[0]["name"],
-            total_captions=row.iloc[0]["total_captions"],
-            trust_level=row.iloc[0]["trust_level"],
-        )
-
-    async def get_top_contributors(self, limit: int = 10) -> List[Contributor]:
-        """Get top contributors by caption count."""
-        if not self.contributors_path.exists():
+        if len(df) == 0:
             return []
 
-        table = pq.read_table(self.contributors_path)
-        df = table.to_pandas()
+        sample_df = df.sample(min(n, len(df)))
+        samples = []
 
-        df = df.nlargest(limit, "total_captions")
-
-        contributors = []
-        for _, row in df.iterrows():
-            contributors.append(
-                Contributor(
-                    contributor_id=row["contributor_id"],
-                    name=row["name"],
-                    total_captions=row["total_captions"],
-                    trust_level=row["trust_level"],
-                )
+        for _, row in sample_df.iterrows():
+            samples.append(
+                {
+                    "job_id": row["job_id"],
+                    "item_key": row["item_key"],
+                    "captions": row["captions"],
+                    "caption_count": row["caption_count"],
+                    "image_dims": f"{row.get('image_width', 'N/A')}x{row.get('image_height', 'N/A')}",
+                }
             )
 
-        return contributors
-
-    async def count_jobs(self) -> int:
-        """Count total jobs."""
-        if not self.jobs_path.exists():
-            return 0
-
-        table = pq.read_table(self.jobs_path)
-        return len(table)
-
-    async def count_completed_jobs(self) -> int:
-        """Count completed jobs."""
-        if not self.jobs_path.exists():
-            return 0
-
-        table = pq.read_table(self.jobs_path)
-        df = table.to_pandas()
-        return len(df[df["status"] == JobStatus.COMPLETED.value])
+        return samples
 
     async def count_captions(self) -> int:
-        """Count total captions."""
+        """Count total caption entries (not rows)."""
+        if not self.captions_path.exists():
+            return 0
+
+        table = pq.read_table(self.captions_path, columns=["caption_count"])
+        df = table.to_pandas()
+        return df["caption_count"].sum()
+
+    async def count_caption_rows(self) -> int:
+        """Count total rows (unique images with captions)."""
         if not self.captions_path.exists():
             return 0
 
@@ -483,5 +573,7 @@ class StorageManager:
         """Close storage and flush buffers."""
         await self.checkpoint()
         logger.info(
-            f"Storage closed. Total captions: {self.total_captions_written}, Duplicates skipped: {self.duplicates_skipped}"
+            f"Storage closed. Total rows: {self.total_captions_written}, "
+            f"Total caption entries: {self.total_caption_entries_written}, "
+            f"Duplicates skipped: {self.duplicates_skipped}"
         )
