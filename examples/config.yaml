@@ -1,0 +1,33 @@
+orchestrator:
+  host: 0.0.0.0
+  port: 8765
+  #ssl:
+  #  # Use the paths output by 'caption-flow generate-cert' command
+  #  cert: /etc/letsencrypt/live/caption.example.com/fullchain.pem  # From generate-cert output
+  #  key: /etc/letsencrypt/live/caption.example.com/privkey.pem      # From generate-cert output
+  storage:
+    data_dir: ./caption_data
+    checkpoint_interval: 1000
+  auth:
+    worker_tokens:
+      - token: "worker-alpha-2024"
+        name: "GPU-Cluster-1"
+      - token: "worker-beta-2024"
+        name: "Community-Worker-1"
+    admin_tokens:
+      - "admin-secret-2024"
+
+worker:
+  batch_size: 32
+  model: "llava-v1.6-34b"
+  max_retries: 3
+  heartbeat_interval: 30
+  preprocessing:
+    num_workers: 4
+    image_size: [224, 224]
+
+monitor:
+  refresh_rate: 1.0
+  show_contributors: true
+  show_quality_metrics: true
+  max_activity_items: 20
