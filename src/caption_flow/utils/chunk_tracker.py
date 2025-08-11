@@ -77,7 +77,7 @@ class ChunkTracker:
                 self.chunks = {}
                 self.completed_chunks = set()
 
-    def _save_checkpoint(self):
+    def save_checkpoint(self):
         """Save checkpoint to disk."""
         try:
             # Ensure parent directory exists
@@ -133,7 +133,7 @@ class ChunkTracker:
                 chunk_size=chunk_size,
                 status="pending",
             )
-            self._save_checkpoint()
+            self.save_checkpoint()
 
         return True
 
@@ -144,7 +144,7 @@ class ChunkTracker:
             chunk.status = "assigned"
             chunk.assigned_to = worker_id
             chunk.assigned_at = datetime.utcnow()
-            self._save_checkpoint()
+            self.save_checkpoint()
 
     def mark_completed(self, chunk_id: str):
         """Mark chunk as completed."""
@@ -153,7 +153,7 @@ class ChunkTracker:
             chunk.status = "completed"
             chunk.completed_at = datetime.utcnow()
             self.completed_chunks.add(chunk_id)
-            self._save_checkpoint()
+            self.save_checkpoint()
             logger.info(f"Chunk {chunk_id} marked as completed")
 
     def mark_failed(self, chunk_id: str):
@@ -163,7 +163,7 @@ class ChunkTracker:
             chunk.status = "pending"  # Reset to pending for retry
             chunk.assigned_to = None
             chunk.assigned_at = None
-            self._save_checkpoint()
+            self.save_checkpoint()
 
     def release_worker_chunks(self, worker_id: str):
         """Release all chunks assigned to a worker."""
@@ -174,7 +174,7 @@ class ChunkTracker:
                 chunk.assigned_to = None
                 chunk.assigned_at = None
                 released_chunks.append(chunk_id)
-        self._save_checkpoint()
+        self.save_checkpoint()
         return released_chunks
 
     def get_pending_chunks(self, shard_name: Optional[str] = None) -> List[str]:
@@ -353,4 +353,4 @@ class ChunkTracker:
 
                 logger.info(f"Inferred {len(self.completed_chunks)} completed chunks from job_ids")
 
-            self._save_checkpoint()
+            self.save_checkpoint()

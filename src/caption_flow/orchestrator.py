@@ -229,6 +229,16 @@ class Orchestrator:
             "last_checkpoint": None,
         }
 
+        # Rate tracking
+        self.rate_tracker = {
+            "start_time": time.time(),
+            "last_update_time": time.time(),
+            "last_caption_count": 0,
+            "current_rate": 0.0,
+            "average_rate": 0.0,
+            "expected_rate": 0.0,
+        }
+
         # Shard processing state
         self.all_shards = []
         self.current_shard_index = 0
@@ -531,6 +541,7 @@ class Orchestrator:
 
         logger.info(f"Worker {worker_id} connected")
         await self._broadcast_stats()
+        await self._send_activity(f"Worker {worker_id} connected")
 
         try:
             # Send welcome message with dataset configuration
@@ -565,6 +576,7 @@ class Orchestrator:
                 )
 
             await self._broadcast_stats()
+            await self._send_activity(f"Worker {worker_id} disconnected")
 
     async def _process_worker_message(self, worker_id: str, data: Dict):
         """Process message from worker."""
@@ -601,6 +613,7 @@ class Orchestrator:
                 )
                 chunk_ids = [c["chunk_id"] for c in chunk_data]
                 logger.info(f"Assigned {len(chunks)} chunks to worker {worker_id}: {chunk_ids}")
+                await self._send_activity(f"Assigned {len(chunks)} chunks to {worker_id}")
             else:
                 await self.workers[worker_id].send(safe_json_dumps({"type": "no_chunks"}))
 
@@ -614,6 +627,7 @@ class Orchestrator:
 
                 logger.info(f"Chunk {chunk_id} completed by worker {worker_id}")
                 await self._check_shard_completion(chunk_id)
+                await self._send_activity(f"Chunk {chunk_id} completed by {worker_id}")
         elif msg_type == "chunk_failed":
             chunk_id = data["chunk_id"]
             error = data.get("error", "Unknown error")
@@ -624,6 +638,7 @@ class Orchestrator:
                     self.chunk_tracker.mark_failed(chunk_id)
 
                 logger.warning(f"Chunk {chunk_id} failed on worker {worker_id}: {error}")
+                await self._send_activity(f"Chunk {chunk_id} failed on {worker_id}: {error}")
 
         elif msg_type == "submit_captions":
             await self._handle_captions_submission(worker_id, data)
@@ -704,6 +719,7 @@ class Orchestrator:
             logger.info(f"Shard {shard_name} complete!")
             self.shard_tracker.mark_complete(shard_name)
             self.stats["completed_shards"] += 1
+            await self._send_activity(f"Shard {shard_name} completed!")
 
     async def _handle_monitor(self, websocket: WebSocketServerProtocol):
         """Handle monitor connection."""
@@ -744,6 +760,15 @@ class Orchestrator:
         chunk_stats = self.chunk_manager.get_stats()
         self.stats.update({f"chunks_{k}": v for k, v in chunk_stats.items()})
 
+        # Add rate information
+        self.stats.update(
+            {
+                "current_rate": self.rate_tracker["current_rate"],
+                "average_rate": self.rate_tracker["average_rate"],
+                "expected_rate": self.rate_tracker["expected_rate"],
+            }
+        )
+
         message = safe_json_dumps({"type": "stats", "data": self.stats})
 
         # Send to all monitors
@@ -755,6 +780,24 @@ class Orchestrator:
                 disconnected.add(monitor)
 
         # Clean up disconnected monitors
+        self.monitors -= disconnected
+
+    async def _send_activity(self, activity: str):
+        """Send activity update to monitors."""
+        if not self.monitors:
+            return
+
+        message = safe_json_dumps(
+            {"type": "activity", "data": f"[{datetime.now().strftime('%H:%M:%S')}] {activity}"}
+        )
+
+        disconnected = set()
+        for monitor in self.monitors:
+            try:
+                await monitor.send(message)
+            except websockets.exceptions.ConnectionClosed:
+                disconnected.add(monitor)
+
         self.monitors -= disconnected
 
     async def _heartbeat_loop(self):
@@ -821,6 +864,41 @@ class Orchestrator:
             target_buffer = max(self.min_chunk_buffer, worker_count * self.chunk_buffer_multiplier)
             active_chunks = self.stats["pending_chunks"] + self.stats["assigned_chunks"]
             self.stats["chunk_buffer_status"] = f"{active_chunks}/{target_buffer}"
+
+            # Update rate information
+            current_time = time.time()
+            elapsed_since_update = current_time - self.rate_tracker["last_update_time"]
+
+            if elapsed_since_update > 0:
+                # Calculate current rate (captions per minute)
+                caption_diff = (
+                    self.stats["total_captions"] - self.rate_tracker["last_caption_count"]
+                )
+                self.rate_tracker["current_rate"] = (caption_diff / elapsed_since_update) * 60
+
+                # Calculate average rate since start
+                total_elapsed = current_time - self.rate_tracker["start_time"]
+                if total_elapsed > 0:
+                    self.rate_tracker["average_rate"] = (
+                        self.stats["total_captions"] / total_elapsed
+                    ) * 60
+
+                # Calculate expected rate based on workers
+                # Assume each worker processes ~10 images/minute with 3 captions each
+                self.rate_tracker["expected_rate"] = worker_count * 10 * 3
+
+                # Update trackers
+                self.rate_tracker["last_update_time"] = current_time
+                self.rate_tracker["last_caption_count"] = self.stats["total_captions"]
+
+            # Log rate information when workers are connected
+            if worker_count > 0:
+                logger.info(
+                    f"Rate: {self.rate_tracker['current_rate']:.1f} captions/min "
+                    f"(avg: {self.rate_tracker['average_rate']:.1f}, "
+                    f"expected: {self.rate_tracker['expected_rate']:.1f}) | "
+                    f"Workers: {worker_count}, Chunks: {active_chunks}/{target_buffer}"
+                )
 
             await self._broadcast_stats()
 

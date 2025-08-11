@@ -25,7 +25,9 @@ def setup_logging(verbose: bool = False):
     logging.basicConfig(
         level=level,
         format="%(message)s",
-        handlers=[RichHandler(console=console, rich_tracebacks=True)],
+        handlers=[
+            RichHandler(console=console, rich_tracebacks=True, show_path=False, show_time=False)
+        ],
     )
 
 
