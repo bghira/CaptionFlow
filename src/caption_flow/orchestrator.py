@@ -266,6 +266,13 @@ class Orchestrator:
             "expected_rate": 0.0,
         }
 
+        # Data sample queue for VLLMWorkers
+        self.data_sample_queue = asyncio.Queue(maxsize=1000)
+        self.data_workers: Dict[str, WebSocketServerProtocol] = {}
+
+        # Backpressure threshold
+        self.backpressure_threshold = config.get("backpressure_threshold", 800)
+
         # Shard processing state
         self.all_shards = []
         self.current_shard_index = 0
@@ -547,6 +554,8 @@ class Orchestrator:
                 await self._handle_worker(websocket, auth_ticket)
             elif auth_ticket.role == "monitor":
                 await self._handle_monitor(websocket)
+            elif auth_ticket.role == "data_worker":
+                await self._handle_data_worker(websocket, auth_ticket)
             else:
                 await websocket.send(safe_json_dumps({"error": "Unknown role"}))
 
@@ -673,7 +682,16 @@ class Orchestrator:
 
         elif msg_type == "submit_captions":
             await self._handle_captions_submission(worker_id, data)
-
+        elif msg_type == "request_job":
+            # VLLMWorker requesting a job from data samples
+            try:
+                job = await asyncio.wait_for(self.data_sample_queue.get(), timeout=5)
+                await self.workers[worker_id].send(
+                    json.dumps({"type": "job_assignment", "job": job})
+                )
+                logger.debug(f"Assigned job {job['job_id']} to worker {worker_id}")
+            except asyncio.TimeoutError:
+                await self.workers[worker_id].send(json.dumps({"type": "no_jobs"}))
         elif msg_type == "heartbeat":
             # Update worker stats
             logger.debug(f"Heartbeat from {worker_id}: {data}")
@@ -751,6 +769,75 @@ class Orchestrator:
             self.shard_tracker.mark_complete(shard_name)
             self.stats["completed_shards"] += 1
             await self._send_activity(f"Shard {shard_name} completed!")
+
+    async def _handle_data_worker(self, websocket: WebSocketServerProtocol, auth_ticket):
+        """Handle data worker connection."""
+        worker_id = getattr(auth_ticket, "name", str(uuid.uuid4()))
+        self.data_workers[worker_id] = websocket
+
+        logger.info(f"Data worker {worker_id} connected")
+
+        try:
+            # Send welcome with storage config
+            storage_config = self.config.get(
+                "data_worker_storage",
+                {
+                    "forward_to_orchestrator": True,
+                    "local": {"enabled": False},
+                    "s3": {"enabled": False},
+                },
+            )
+
+            await websocket.send(
+                json.dumps(
+                    {"type": "welcome", "worker_id": worker_id, "storage_config": storage_config}
+                )
+            )
+
+            # Track if we've sent backpressure
+            backpressure_sent = False
+
+            async for message in websocket:
+                data = json.loads(message)
+                msg_type = data.get("type")
+
+                if msg_type == "submit_samples":
+                    # Check queue size for backpressure
+                    if self.data_sample_queue.qsize() > self.backpressure_threshold:
+                        if not backpressure_sent:
+                            await websocket.send(json.dumps({"type": "backpressure"}))
+                            backpressure_sent = True
+                            logger.warning(f"Backpressure applied to data worker {worker_id}")
+                    else:
+                        if backpressure_sent:
+                            await websocket.send(json.dumps({"type": "resume"}))
+                            backpressure_sent = False
+
+                    # Receive image data for each sample
+                    samples = data["samples"]
+                    for sample in samples:
+                        # Receive binary image data
+                        image_data = await websocket.recv()
+
+                        # Create job and add to queue
+                        job = {
+                            "job_id": f"data_{worker_id}_{sample['sample_id']}",
+                            "sample_id": sample["sample_id"],
+                            "image_data": image_data,
+                            "metadata": sample.get("metadata", {}),
+                            "source": "data_worker",
+                            "worker_id": worker_id,
+                        }
+
+                        await self.data_sample_queue.put(job)
+
+                elif msg_type == "heartbeat":
+                    logger.debug(f"Data worker {worker_id} heartbeat: {data}")
+
+        except websockets.exceptions.ConnectionClosed:
+            logger.info(f"Data worker {worker_id} disconnected")
+        finally:
+            del self.data_workers[worker_id]
 
     async def _handle_monitor(self, websocket: WebSocketServerProtocol):
         """Handle monitor connection."""

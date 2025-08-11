@@ -123,7 +123,6 @@ class VLLMWorker:
         self.assigned_chunks = deque()
         self.current_chunk = None
         self.current_chunk_progress = 0
-
         # Batching queues - will be cleared on disconnect
         self.readahead_queue = Queue(maxsize=256)
         self.inference_queue = Queue(maxsize=128)
@@ -133,6 +132,10 @@ class VLLMWorker:
         self.items_processed = 0
         self.items_failed = 0
         self.chunks_completed = 0
+
+        # Job mode for shards vs jobs and job queue.
+        self.job_mode = config.get("job_mode", False)
+        self.job_queue = Queue(maxsize=32)
 
     def _setup_ssl(self) -> Optional[ssl.SSLContext]:
         """Configure SSL context."""
@@ -193,6 +196,40 @@ class VLLMWorker:
 
         # Update config manager's tracking
         self.vllm_config_manager.current_config = self.vllm_config
+
+    async def _handle_job_assignment(self, job_data: Dict):
+        """Handle job assignment from orchestrator."""
+        try:
+            # Convert to processing item
+            image = Image.open(io.BytesIO(job_data["image_data"]))
+
+            item = ProcessingItem(
+                chunk_id=job_data["job_id"],
+                item_key=job_data["sample_id"],
+                image=image,
+                image_data=job_data["image_data"],
+            )
+
+            # Add to inference queue
+            self.readahead_queue.put(item)
+            logger.debug(f"Queued job {job_data['job_id']} for processing")
+
+        except Exception as e:
+            logger.error(f"Error handling job assignment: {e}")
+
+    async def _job_request_loop(self):
+        """Request jobs from orchestrator in job mode."""
+        while self.running and self.connected.is_set():
+            try:
+                # Check if we need more work
+                if self.readahead_queue.qsize() < self.vllm_config.get("batch_size", 8):
+                    await self.websocket.send(json.dumps({"type": "request_job"}))
+
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Job request error: {e}")
+                await asyncio.sleep(5)
 
     def _handle_vllm_config_update(self, new_config: Dict[str, Any]) -> bool:
         """
@@ -441,8 +478,12 @@ class VLLMWorker:
                     logger.error("Failed to update vLLM configuration")
                     # Continue with existing config
 
-            # Request initial chunks
-            await websocket.send(json.dumps({"type": "request_chunks", "count": 2}))
+            if self.job_mode:
+                # In job mode, request individual jobs instead of chunks
+                tasks.append(asyncio.create_task(self._job_request_loop()))
+            else:
+                # Request initial chunks
+                await websocket.send(json.dumps({"type": "request_chunks", "count": 2}))
 
             # Start processing
             try:
@@ -505,6 +546,13 @@ class VLLMWorker:
                         new_config = data.get("vllm_config")
                         if new_config:
                             self._handle_vllm_config_update(new_config)
+
+                    elif msg_type == "job_assignment":
+                        await self._handle_job_assignment(data["job"])
+
+                    elif msg_type == "no_jobs":
+                        logger.debug("No jobs available")
+                        await asyncio.sleep(2)
 
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid message format: {e}")
