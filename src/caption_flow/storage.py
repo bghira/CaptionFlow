@@ -62,6 +62,7 @@ class StorageManager:
                 ("job_id", pa.string()),
                 ("dataset", pa.string()),
                 ("shard", pa.string()),
+                ("chunk_id", pa.string()),
                 ("item_key", pa.string()),
                 ("captions", pa.list_(pa.string())),  # Changed from single caption to list
                 ("caption_count", pa.int32()),  # Number of captions for this item
@@ -107,6 +108,7 @@ class StorageManager:
                 "job_id": [],
                 "dataset": [],
                 "shard": [],
+                "chunk_id": [],
                 "item_key": [],
                 "captions": [],
                 "caption_count": [],

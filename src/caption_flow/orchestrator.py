@@ -28,6 +28,7 @@ from .models import Caption, Contributor
 from .utils.auth import AuthManager
 from .utils.dataset_loader import DatasetLoader, ShardTracker
 from .utils.json_utils import safe_dict, safe_json_dumps, to_json_dict
+from .utils.chunk_tracker import ChunkTracker
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +51,13 @@ class ShardChunk:
 class ChunkManager:
     """Manages shard chunk creation and assignment."""
 
-    def __init__(self, chunk_size: int = 1000):
+    def __init__(self, chunk_size: int = 1000, tracker: Optional[ChunkTracker] = None):
         self.chunk_size = chunk_size
         self.chunks: Dict[str, ShardChunk] = {}
         self.pending_chunks: Deque[str] = deque()
         self.assigned_chunks: Dict[str, Set[str]] = defaultdict(set)  # worker_id -> chunk_ids
         self.lock = threading.Lock()
+        self.tracker = tracker  # Reference to chunk tracker
 
     def create_chunks_from_shard(
         self, shard_url: str, shard_name: str, total_items: int
@@ -81,7 +83,9 @@ class ChunkManager:
 
         return chunks
 
-    def get_chunks_for_worker(self, worker_id: str, count: int = 1) -> List[ShardChunk]:
+    def get_chunks_for_worker(
+        self, worker_id: str, count: int = 1, tracker: Optional["ChunkTracker"] = None
+    ) -> List[ShardChunk]:
         """Get available chunks for a worker."""
         assigned = []
 
@@ -96,6 +100,8 @@ class ChunkManager:
 
                 self.assigned_chunks[worker_id].add(chunk_id)
                 assigned.append(chunk)
+                if tracker:
+                    tracker.mark_assigned(chunk_id, worker_id)
 
         return assigned
 
@@ -167,8 +173,8 @@ class Orchestrator:
         self.dataset_type = self.dataset_config.get("type", "huggingface")
 
         # Chunk configuration
-        self.chunk_size = config.get("chunk_size", 1000)
-        self.chunks_per_request = config.get("chunks_per_request", 2)
+        self.chunk_size = config.get("chunk_size", 50)
+        self.chunks_per_request = config.get("chunks_per_request", 4)
 
         # Initialize components
         storage_config = config.get("storage", {})
@@ -179,15 +185,17 @@ class Orchestrator:
             contributor_buffer_size=storage_config.get("contributor_buffer_size", 10),
         )
         self.auth = AuthManager(config.get("auth", {}))
-        self.chunk_manager = ChunkManager(self.chunk_size)
 
         # Dataset components
         self.dataset_loader = None
         self.shard_tracker = None
+        self.chunk_tracker = None
         if self.dataset_path:
             self.dataset_loader = DatasetLoader(self.dataset_path, self.dataset_type)
             checkpoint_dir = Path(config.get("storage", {}).get("checkpoint_dir", "./checkpoints"))
+            self.chunk_tracker = ChunkTracker(checkpoint_dir / "chunks.json")
             self.shard_tracker = ShardTracker(checkpoint_dir / "shards.json")
+        self.chunk_manager = ChunkManager(self.chunk_size, self.chunk_tracker)
 
         # Track connections
         self.workers: Dict[str, WebSocketServerProtocol] = {}
@@ -254,6 +262,13 @@ class Orchestrator:
             shard_name = Path(shard_url).stem
             self.stats["current_shard"] = shard_name
 
+            # Check if shard is already complete in chunk tracker
+            if self.chunk_tracker and self.chunk_tracker.is_shard_complete(shard_name):
+                logger.info(f"Shard {shard_name} already complete, skipping")
+                self.shard_tracker.mark_complete(shard_name)
+                self.stats["completed_shards"] += 1
+                continue
+
             try:
                 # Count items in shard
                 item_count = 0
@@ -262,13 +277,37 @@ class Orchestrator:
 
                 logger.info(f"Shard {shard_name} has {item_count} items")
 
-                # Create chunks
-                chunks = self.chunk_manager.create_chunks_from_shard(
-                    shard_url, shard_name, item_count
-                )
+                # Create chunks, checking with tracker
+                created_chunks = 0
+                for start_idx in range(0, item_count, self.chunk_size):
+                    chunk_id = f"{shard_name}_chunk_{start_idx}"
+                    chunk_size = min(self.chunk_size, item_count - start_idx)
 
-                self.stats["total_chunks"] += len(chunks)
-                logger.info(f"Created {len(chunks)} chunks from shard {shard_name}")
+                    # Check if chunk is already completed
+                    if self.chunk_tracker:
+                        if not self.chunk_tracker.add_chunk(
+                            chunk_id, shard_name, start_idx, chunk_size
+                        ):
+                            logger.debug(f"Chunk {chunk_id} already completed, skipping")
+                            continue
+
+                    # Create chunk in memory
+                    chunk = ShardChunk(
+                        chunk_id=chunk_id,
+                        shard_url=shard_url,
+                        shard_name=shard_name,
+                        start_index=start_idx,
+                        chunk_size=chunk_size,
+                    )
+
+                    with self.chunk_manager.lock:
+                        self.chunk_manager.chunks[chunk_id] = chunk
+                        self.chunk_manager.pending_chunks.append(chunk_id)
+
+                    created_chunks += 1
+
+                self.stats["total_chunks"] += created_chunks
+                logger.info(f"Created {created_chunks} new chunks from shard {shard_name}")
 
             except Exception as e:
                 logger.error(f"Error processing shard {shard_name}: {e}")
@@ -281,6 +320,8 @@ class Orchestrator:
 
         # Load existing state
         await self.storage.initialize()
+        if self.chunk_tracker:
+            await self.chunk_tracker.sync_with_storage(self.storage)
         await self._restore_state()
 
         # Start chunk creation thread if dataset is configured
@@ -364,7 +405,11 @@ class Orchestrator:
         finally:
             del self.workers[worker_id]
             self.stats["connected_workers"] = len(self.workers)
+            # Release chunks in both managers
             self.chunk_manager.release_worker_chunks(worker_id)
+            if self.chunk_tracker:
+                self.chunk_tracker.release_worker_chunks(worker_id)
+
             await self._broadcast_stats()
 
     async def _process_worker_message(self, worker_id: str, data: Dict):
@@ -373,11 +418,10 @@ class Orchestrator:
 
         if msg_type == "request_chunks":
             count = data.get("count", self.chunks_per_request)
-            chunks = self.chunk_manager.get_chunks_for_worker(worker_id, count)
+            chunks = self.chunk_manager.get_chunks_for_worker(worker_id, count, self.chunk_tracker)
 
             if chunks:
                 # Only send the fields that worker expects
-                # Worker's ShardChunk doesn't need tracking fields like assigned_to, status, etc.
                 chunk_data = []
                 for chunk in chunks:
                     chunk_data.append(
@@ -401,14 +445,21 @@ class Orchestrator:
             chunk_id = data["chunk_id"]
             if self.chunk_manager.complete_chunk(chunk_id, worker_id):
                 self.stats["completed_chunks"] += 1
+
+                if self.chunk_tracker:
+                    self.chunk_tracker.mark_completed(chunk_id)
+
                 logger.info(f"Chunk {chunk_id} completed by worker {worker_id}")
                 await self._check_shard_completion(chunk_id)
-
         elif msg_type == "chunk_failed":
             chunk_id = data["chunk_id"]
             error = data.get("error", "Unknown error")
             if self.chunk_manager.fail_chunk(chunk_id, worker_id):
                 self.stats["failed_chunks"] += 1
+
+                if self.chunk_tracker:
+                    self.chunk_tracker.mark_failed(chunk_id)
+
                 logger.warning(f"Chunk {chunk_id} failed on worker {worker_id}: {error}")
 
         elif msg_type == "submit_captions":
@@ -428,31 +479,29 @@ class Orchestrator:
             f"Received {len(captions_list)} captions for item {item_key} from worker {worker_id}"
         )
 
-        # Create caption records for each caption
-        for idx, caption_text in enumerate(captions_list):
-            caption = Caption(
-                job_id=f"{chunk_id}_{item_key}_{idx}",  # Unique ID for each caption
-                dataset=data.get("dataset"),
-                shard=data.get("shard"),
-                item_key=item_key,
-                caption=caption_text,
-                contributor_id=worker_id,
-                timestamp=datetime.utcnow(),
-                quality_score=None,
-                # Image metadata
-                image_width=data.get("image_width"),
-                image_height=data.get("image_height"),
-                image_format=data.get("image_format"),
-                file_size=data.get("file_size"),
-                # Processing metadata
-                caption_index=idx,
-                total_captions=len(captions_list),
-                processing_time_ms=data.get("processing_time_ms"),
-                chunk_id=chunk_id,
-            )
+        # Create a SINGLE caption record with ALL captions as a list
+        caption = Caption(
+            job_id=f"{chunk_id}_{item_key}",  # Single ID for the item
+            dataset=data.get("dataset"),
+            shard=data.get("shard"),
+            item_key=item_key,
+            captions=captions_list,  # Store ALL captions as a list
+            contributor_id=worker_id,
+            timestamp=datetime.utcnow(),
+            quality_scores=None,  # Could be a list of scores matching captions
+            # Image metadata
+            image_width=data.get("image_width"),
+            image_height=data.get("image_height"),
+            image_format=data.get("image_format"),
+            file_size=data.get("file_size"),
+            # Processing metadata
+            caption_count=len(captions_list),
+            processing_time_ms=data.get("processing_time_ms"),
+            chunk_id=chunk_id,
+        )
 
-            # Add to central storage buffer
-            await self.storage.save_caption(caption)
+        # Add to central storage buffer as a single entry
+        await self.storage.save_caption(caption)
 
         # Update statistics
         self.stats["total_captions"] += len(captions_list)

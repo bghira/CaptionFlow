@@ -47,10 +47,13 @@ class Caption:
     dataset: str
     shard: str
     item_key: str
-    caption: str
     contributor_id: str
     timestamp: datetime
+    caption_count: int = 1  # Number of captions generated for this item
+    caption: Optional[str] = None
+    captions: Optional[list] = None
     quality_score: Optional[float] = None
+    quality_scores: Optional[list] = None
 
     # Image metadata
     image_width: Optional[int] = None
@@ -63,6 +66,10 @@ class Caption:
     total_captions: Optional[int] = None  # Total captions for this image
     processing_time_ms: Optional[float] = None
     chunk_id: Optional[str] = None
+
+    def __post_init__(self):
+        if self.caption is None and self.captions is None:
+            raise ValueError("At least one of 'caption' or 'captions' must be provided")
 
 
 @dataclass

@@ -1,10 +1,10 @@
-"""Improved vLLM worker that processes shard chunks directly and returns caption lists.
+"""Improved vLLM worker with proper connection recovery and chunk abandonment.
 
-The worker now:
-1. Receives shard chunk assignments from orchestrator
-2. Directly streams WebDataset shards with readahead
-3. Extracts metadata from images
-4. Submits LIST of captions + metadata back to orchestrator
+Key improvements:
+1. Detects disconnection and stops current chunk processing
+2. Clears all queues and abandons current chunk on disconnect
+3. Maintains vLLM instance across reconnections
+4. Properly handles connection state in all threads
 """
 
 import os
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from queue import Queue, Empty
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from collections import deque
 
 import websockets
@@ -89,7 +89,7 @@ class InferenceConfig:
 
 
 class VLLMWorker:
-    """Worker that processes shard chunks directly."""
+    """Worker that processes shard chunks directly with proper reconnection."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -121,6 +121,11 @@ class VLLMWorker:
         self.worker_id: Optional[str] = None
         self.websocket: Optional[WebSocketClientProtocol] = None
         self.running = False
+        self.main_loop: Optional[asyncio.AbstractEventLoop] = None  # Store main event loop
+
+        # Connection state events
+        self.connected = Event()
+        self.should_stop_processing = Event()
 
         # Inference components (initialized in setup)
         self.llm = None
@@ -134,7 +139,7 @@ class VLLMWorker:
         self.current_chunk = None
         self.current_chunk_progress = 0
 
-        # Batching queues
+        # Batching queues - will be cleared on disconnect
         self.readahead_queue = Queue(maxsize=256)
         self.inference_queue = Queue(maxsize=128)
         self.result_queue = Queue()
@@ -213,10 +218,41 @@ class VLLMWorker:
 
         logger.info("vLLM initialization complete")
 
+    def _clear_state_on_disconnect(self):
+        """Clear all processing state when disconnected."""
+        logger.info("Clearing state due to disconnection")
+
+        # Signal threads to stop current processing
+        self.should_stop_processing.set()
+
+        with self.chunk_lock:
+            # Clear assigned chunks
+            self.assigned_chunks.clear()
+            self.current_chunk = None
+            self.current_chunk_progress = 0
+
+        # Clear all queues
+        self._clear_queue(self.readahead_queue)
+        self._clear_queue(self.inference_queue)
+        self._clear_queue(self.result_queue)
+
+        logger.info("State cleared, ready for reconnection")
+
+    def _clear_queue(self, queue: Queue):
+        """Clear all items from a queue."""
+        try:
+            while True:
+                queue.get_nowait()
+        except Empty:
+            pass
+
     async def start(self):
         """Start the worker with automatic reconnection."""
-        # Initialize vLLM
+        # Initialize vLLM once
         self._setup_vllm()
+
+        # Capture the main event loop for use in background threads
+        self.main_loop = asyncio.get_running_loop()
 
         # Start background threads
         self.running = True
@@ -236,6 +272,9 @@ class VLLMWorker:
         # Connect to orchestrator with retries
         while self.running:
             try:
+                # Clear stop signal before connecting
+                self.should_stop_processing.clear()
+
                 await self._connect_and_run()
 
                 # Reset delay on successful connection
@@ -243,6 +282,13 @@ class VLLMWorker:
 
             except Exception as e:
                 logger.error(f"Connection error: {e}")
+
+                # Mark as disconnected
+                self.connected.clear()
+                self.websocket = None
+
+                # Clear all state on disconnect
+                self._clear_state_on_disconnect()
 
             if self.running:
                 logger.info(f"Reconnecting in {reconnect_delay} seconds...")
@@ -257,6 +303,7 @@ class VLLMWorker:
 
         async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
             self.websocket = websocket
+            self.connected.set()
 
             # Authenticate
             await websocket.send(json.dumps({"token": self.token, "name": self.name}))
@@ -285,12 +332,17 @@ class VLLMWorker:
             await websocket.send(json.dumps({"type": "request_chunks", "count": 2}))
 
             # Start processing
-            await asyncio.gather(
-                self._heartbeat_loop(),
-                self._message_handler(),
-                self._result_sender(),
-                return_exceptions=True,
-            )
+            try:
+                await asyncio.gather(
+                    self._heartbeat_loop(),
+                    self._message_handler(),
+                    self._result_sender(),
+                    return_exceptions=False,
+                )
+            finally:
+                # Ensure we mark as disconnected
+                self.connected.clear()
+                self.websocket = None
 
     async def _message_handler(self):
         """Handle messages from orchestrator."""
@@ -308,15 +360,14 @@ class VLLMWorker:
                                 self.assigned_chunks.append(chunk)
                             logger.info(f"Received chunk assignment: {chunk.chunk_id}")
 
-                        # Request more chunks if queue is low
-                        if len(self.assigned_chunks) < 2 and self.websocket:
-                            await self.websocket.send(
-                                json.dumps({"type": "request_chunks", "count": 2})
-                            )
-
                     elif msg_type == "no_chunks":
                         logger.info("No chunks available from orchestrator")
                         await asyncio.sleep(10)
+                        # Request again after waiting
+                        if self.websocket:
+                            await self.websocket.send(
+                                json.dumps({"type": "request_chunks", "count": 2})
+                            )
 
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid message format: {e}")
@@ -325,16 +376,27 @@ class VLLMWorker:
 
         except websockets.exceptions.ConnectionClosed as e:
             logger.info(f"Connection closed by orchestrator: {e}")
-            self.websocket = None
+            raise  # Re-raise to trigger cleanup
         except Exception as e:
             logger.error(f"Message handler error: {e}")
-            self.websocket = None
+            raise
 
     def _shard_reader_thread(self):
         """Background thread that reads from WebDataset shards."""
         logger.info("Starting shard reader thread")
 
         while self.running:
+            # Check if we should stop processing
+            if self.should_stop_processing.is_set():
+                logger.info("Shard reader stopping due to disconnection")
+                self.should_stop_processing.wait()  # Wait until cleared
+                continue
+
+            # Only process if connected
+            if not self.connected.is_set():
+                time.sleep(1)
+                continue
+
             # Get next chunk to process
             with self.chunk_lock:
                 if not self.current_chunk and self.assigned_chunks:
@@ -350,47 +412,67 @@ class VLLMWorker:
                 # Process the chunk
                 self._process_shard_chunk(self.current_chunk)
 
-                # Mark chunk as complete
-                logger.info(f"Completed chunk {self.current_chunk.chunk_id}")
-                self.chunks_completed += 1
+                # Only mark complete if still connected
+                if self.connected.is_set() and not self.should_stop_processing.is_set():
+                    logger.info(f"Completed chunk {self.current_chunk.chunk_id}")
+                    self.chunks_completed += 1
 
-                # Notify orchestrator if connected
-                if self.websocket:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self.websocket.send(
-                                json.dumps(
-                                    {
-                                        "type": "chunk_complete",
-                                        "chunk_id": self.current_chunk.chunk_id,
-                                    }
-                                )
-                            ),
-                            asyncio.get_event_loop(),
-                        ).result(timeout=5)
-                    except Exception as e:
-                        logger.warning(f"Could not notify orchestrator of chunk completion: {e}")
+                    # Notify orchestrator if connected
+                    if self.websocket and self.main_loop:
+                        try:
+                            # Notify completion
+                            asyncio.run_coroutine_threadsafe(
+                                self.websocket.send(
+                                    json.dumps(
+                                        {
+                                            "type": "chunk_complete",
+                                            "chunk_id": self.current_chunk.chunk_id,
+                                        }
+                                    )
+                                ),
+                                self.main_loop,
+                            ).result(timeout=5)
+
+                            # Request more chunks if queue is low
+                            with self.chunk_lock:
+                                queue_size = len(self.assigned_chunks)
+
+                            if queue_size < 2:
+                                logger.info(f"Requesting more chunks (queue size: {queue_size})")
+                                asyncio.run_coroutine_threadsafe(
+                                    self.websocket.send(
+                                        json.dumps({"type": "request_chunks", "count": 2})
+                                    ),
+                                    self.main_loop,
+                                ).result(timeout=5)
+
+                        except Exception as e:
+                            logger.warning(f"Could not notify orchestrator: {e}")
 
                 with self.chunk_lock:
                     self.current_chunk = None
 
             except Exception as e:
-                logger.error(f"Error processing chunk {self.current_chunk.chunk_id}: {e}")
+                logger.error(f"Error processing chunk: {e}")
 
-                # Notify orchestrator of failure if connected
-                if self.websocket:
+                # Only notify of failure if still connected
+                if self.connected.is_set() and self.websocket and self.main_loop:
                     try:
                         asyncio.run_coroutine_threadsafe(
                             self.websocket.send(
                                 json.dumps(
                                     {
                                         "type": "chunk_failed",
-                                        "chunk_id": self.current_chunk.chunk_id,
+                                        "chunk_id": (
+                                            self.current_chunk.chunk_id
+                                            if self.current_chunk
+                                            else "unknown"
+                                        ),
                                         "error": str(e),
                                     }
                                 )
                             ),
-                            asyncio.get_event_loop(),
+                            self.main_loop,
                         ).result(timeout=5)
                     except Exception as send_error:
                         logger.warning(
@@ -426,7 +508,9 @@ class VLLMWorker:
         items_to_skip = chunk.start_index
 
         for key, image_data in ds:
-            if not self.running:
+            # Check if we should stop
+            if not self.running or self.should_stop_processing.is_set():
+                logger.info(f"Stopping chunk processing early due to disconnect")
                 break
 
             # Skip to start index
@@ -448,7 +532,16 @@ class VLLMWorker:
                 )
 
                 # Add to readahead queue (blocks if full - provides backpressure)
-                self.readahead_queue.put(item, timeout=30)
+                # Use timeout to allow checking for disconnection
+                timeout_end = time.time() + 30
+                while self.running and not self.should_stop_processing.is_set():
+                    try:
+                        self.readahead_queue.put(item, timeout=1)
+                        break
+                    except:
+                        if time.time() > timeout_end:
+                            raise TimeoutError("Queue put timeout")
+                        continue
 
                 items_processed += 1
                 self.current_chunk_progress = items_processed
@@ -458,11 +551,14 @@ class VLLMWorker:
                     self._batch_for_inference()
 
             except Exception as e:
+                if self.should_stop_processing.is_set():
+                    break
                 logger.error(f"Error processing item {key}: {e}")
                 self.items_failed += 1
 
-        # Process remaining items
-        self._batch_for_inference()
+        # Process remaining items only if still connected
+        if not self.should_stop_processing.is_set():
+            self._batch_for_inference()
 
         logger.info(f"Chunk {chunk.chunk_id} processed {items_processed} items")
 
@@ -492,10 +588,14 @@ class VLLMWorker:
 
         while self.running:
             try:
-                # Get batch from queue
+                # Get batch from queue with timeout
                 batch = self.inference_queue.get(timeout=1)
 
                 if not batch:
+                    continue
+
+                # Skip if disconnected
+                if self.should_stop_processing.is_set():
                     continue
 
                 logger.debug(f"Processing batch of {len(batch)} images")
@@ -514,41 +614,44 @@ class VLLMWorker:
                 # Run inference
                 outputs = self.llm.generate(requests, self.sampling_params)
 
-                # Process outputs
-                for i, item in enumerate(batch):
-                    # Get all prompt outputs as a list
-                    idx = i * len(prompts)
-                    captions = []
+                # Process outputs only if still connected
+                if not self.should_stop_processing.is_set():
+                    for i, item in enumerate(batch):
+                        # Get all prompt outputs as a list
+                        idx = i * len(prompts)
+                        captions = []
 
-                    for j in range(len(prompts)):
-                        if idx + j < len(outputs) and outputs[idx + j].outputs:
-                            caption_text = self._clean_output(outputs[idx + j].outputs[0].text)
-                            if caption_text:  # Only add non-empty captions
-                                captions.append(caption_text)
+                        for j in range(len(prompts)):
+                            if idx + j < len(outputs) and outputs[idx + j].outputs:
+                                caption_text = self._clean_output(outputs[idx + j].outputs[0].text)
+                                if caption_text:  # Only add non-empty captions
+                                    captions.append(caption_text)
 
-                    # Only create result if we have at least one caption
-                    if captions:
-                        result = ProcessedResult(
-                            chunk_id=item.chunk_id,
-                            shard_name=Path(item.chunk_id).stem.rsplit("_chunk_", 1)[0],
-                            item_key=item.item_key,
-                            captions=captions,
-                            image_width=item.image.width,
-                            image_height=item.image.height,
-                            image_format=item.image.format or "unknown",
-                            file_size=len(item.image_data),
-                            processing_time_ms=(time.time() - start_time) * 1000 / len(batch),
-                        )
+                        # Only create result if we have at least one caption
+                        if captions:
+                            result = ProcessedResult(
+                                chunk_id=item.chunk_id,
+                                shard_name=Path(item.chunk_id).stem.rsplit("_chunk_", 1)[0],
+                                item_key=item.item_key,
+                                captions=captions,
+                                image_width=item.image.width,
+                                image_height=item.image.height,
+                                image_format=item.image.format or "unknown",
+                                file_size=len(item.image_data),
+                                processing_time_ms=(time.time() - start_time) * 1000 / len(batch),
+                            )
 
-                        self.result_queue.put(result)
-                        self.items_processed += 1
-                    else:
-                        logger.warning(f"No valid captions generated for item {item.item_key}")
-                        self.items_failed += 1
+                            self.result_queue.put(result)
+                            self.items_processed += 1
+                        else:
+                            logger.warning(f"No valid captions generated for item {item.item_key}")
+                            self.items_failed += 1
 
             except Empty:
                 continue
             except Exception as e:
+                if self.should_stop_processing.is_set():
+                    continue
                 logger.error(f"Inference error: {e}")
 
     def _build_vllm_input(self, image: Image.Image, prompt: str) -> Dict:
@@ -609,8 +712,8 @@ class VLLMWorker:
                 except Empty:
                     pass
 
-                # Try to send all pending results
-                if pending_results and self.websocket:
+                # Only try to send if connected
+                if pending_results and self.websocket and self.connected.is_set():
                     sent_results = []
                     for result in pending_results:
                         try:
@@ -644,6 +747,7 @@ class VLLMWorker:
                                 )
                         except websockets.exceptions.ConnectionClosed as e:
                             logger.warning(f"Connection lost while sending result: {e}")
+                            self.connected.clear()
                             self.websocket = None
                             break
                         except Exception as e:
@@ -654,9 +758,12 @@ class VLLMWorker:
                     for result in sent_results:
                         pending_results.remove(result)
 
-                # If disconnected and buffer is getting large, warn
-                if not self.websocket and len(pending_results) > 100:
-                    logger.warning(f"Result buffer growing: {len(pending_results)} pending results")
+                # Clear pending results if disconnected and buffer is too large
+                if not self.connected.is_set() and len(pending_results) > 1000:
+                    logger.warning(
+                        f"Clearing {len(pending_results)} pending results due to prolonged disconnection"
+                    )
+                    pending_results.clear()
 
                 await asyncio.sleep(0.1)
 
@@ -666,7 +773,7 @@ class VLLMWorker:
 
     async def _heartbeat_loop(self):
         """Send periodic heartbeats with connection checking."""
-        while self.running:
+        while self.running and self.connected.is_set():
             try:
                 if self.websocket:
                     await self.websocket.send(
@@ -691,10 +798,12 @@ class VLLMWorker:
                 await asyncio.sleep(30)
             except websockets.exceptions.ConnectionClosed as e:
                 logger.info(f"Connection lost during heartbeat: {e}")
+                self.connected.clear()
                 self.websocket = None
                 break
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
+                self.connected.clear()
                 self.websocket = None
                 break
 
@@ -702,6 +811,8 @@ class VLLMWorker:
         """Graceful shutdown."""
         logger.info("Shutting down worker...")
         self.running = False
+        self.connected.clear()
+        self.should_stop_processing.set()
 
         # Stop processing threads by adding stop signals
         self.readahead_queue.put(None)
