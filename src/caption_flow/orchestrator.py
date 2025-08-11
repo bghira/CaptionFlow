@@ -135,7 +135,7 @@ class ChunkManager:
     def release_worker_chunks(self, worker_id: str):
         """Release all chunks assigned to a worker."""
         with self.lock:
-            chunk_ids = list(self.assigned_chunks[worker_id])
+            chunk_ids = list(self.assigned_chunks.get(worker_id, []))
             for chunk_id in chunk_ids:
                 if chunk_id in self.chunks:
                     chunk = self.chunks[chunk_id]
@@ -145,7 +145,8 @@ class ChunkManager:
                         chunk.assigned_at = None
                         self.pending_chunks.append(chunk_id)
 
-            del self.assigned_chunks[worker_id]
+            if worker_id in self.assigned_chunks:
+                del self.assigned_chunks[worker_id]
 
     def get_stats(self) -> Dict[str, int]:
         """Get chunk statistics."""
@@ -237,6 +238,12 @@ class Orchestrator:
         self.chunk_creation_thread = None
         self.stop_chunk_creation = threading.Event()
 
+        # State restoration flag
+        self.state_restored = threading.Event()
+        # If no dataset, state is already "restored"
+        if not self.dataset_loader:
+            self.state_restored.set()
+
     def _setup_ssl(self) -> Optional[ssl.SSLContext]:
         """Configure SSL if certificates are provided."""
         ssl_config = self.config.get("ssl", {})
@@ -251,9 +258,13 @@ class Orchestrator:
         """Background thread to create chunks from dataset shards on demand."""
         if not self.dataset_loader:
             logger.warning("No dataset configured, skipping chunk creation")
+            self.state_restored.set()  # No state to restore
             return
 
         logger.info("Starting chunk creation thread")
+
+        # Mark state as not restored until we process checkpoints
+        self.state_restored.clear()
 
         # Get all shards
         self.all_shards = self.dataset_loader.get_shard_list()
@@ -273,20 +284,34 @@ class Orchestrator:
 
         # Get shards that need processing
         remaining_shards = self.shard_tracker.get_remaining_shards(self.all_shards)
-        self.stats["completed_shards"] = len(self.all_shards) - len(remaining_shards)
+
+        # Also check which shards already have chunks (partial or complete)
+        shards_with_chunks = set()
+        for shard_name in shards_summary.keys():
+            shards_with_chunks.add(shard_name)
+
+        # Filter out shards that already have chunks created
+        remaining_shards = [
+            shard for shard in remaining_shards if Path(shard).stem not in shards_with_chunks
+        ]
+
+        self.stats["completed_shards"] = len(completed_shards)
 
         logger.info(
             f"Total shards: {len(self.all_shards)}, "
             f"Completed: {self.stats['completed_shards']}, "
-            f"Remaining: {len(remaining_shards)}"
+            f"Shards with chunks: {len(shards_with_chunks)}, "
+            f"Remaining to process: {len(remaining_shards)}"
         )
 
         # First, re-queue any existing pending chunks
         initial_pending = 0
+        requeued_chunks_by_shard = defaultdict(list)
+
         for shard_name, shard_info in shards_summary.items():
             with self.chunk_manager.lock:
                 for chunk_state in shard_info["chunks"]:
-                    if chunk_state.status in ["pending", "failed"]:
+                    if chunk_state.status in ["pending", "failed", "assigned"]:
                         # Find shard URL
                         shard_url = None
                         for url in self.all_shards:
@@ -304,9 +329,16 @@ class Orchestrator:
                             )
                             self.chunk_manager.chunks[chunk_state.chunk_id] = chunk
                             self.chunk_manager.pending_chunks.append(chunk_state.chunk_id)
+                            requeued_chunks_by_shard[shard_name].append(chunk_state.chunk_id)
                             initial_pending += 1
 
         logger.info(f"Re-queued {initial_pending} existing pending chunks")
+        for shard_name, chunk_ids in requeued_chunks_by_shard.items():
+            logger.info(f"  Shard {shard_name}: {len(chunk_ids)} chunks - {chunk_ids}")
+
+        # Mark state as restored
+        self.state_restored.set()
+        logger.info("State restoration complete, accepting chunk requests")
 
         # Process shards on-demand
         shard_iter = iter(remaining_shards)
@@ -353,9 +385,11 @@ class Orchestrator:
                         current_shard_name = Path(current_shard_url).stem
                         self.stats["current_shard"] = current_shard_name
 
-                        # Skip if we already processed this shard
+                        # Skip if we already have chunks from this shard
                         if current_shard_name in shards_summary:
-                            logger.debug(f"Skipping already-processed shard {current_shard_name}")
+                            logger.debug(
+                                f"Skipping shard {current_shard_name} - already has chunks"
+                            )
                             current_shard_url = None
                             continue
 
@@ -428,7 +462,7 @@ class Orchestrator:
         """Start the orchestrator server."""
         logger.info(f"Starting vLLM orchestrator on {self.host}:{self.port}")
 
-        # Load existing state
+        # Load existing state BEFORE accepting connections
         await self.storage.initialize()
         if self.chunk_tracker:
             await self.chunk_tracker.sync_with_storage(self.storage)
@@ -440,6 +474,9 @@ class Orchestrator:
                 target=self._create_chunks_from_dataset, daemon=True
             )
             self.chunk_creation_thread.start()
+
+            # Give chunk creation thread time to restore existing chunks
+            await asyncio.sleep(2)
 
         # Start background tasks
         asyncio.create_task(self._heartbeat_loop())
@@ -467,7 +504,7 @@ class Orchestrator:
 
             # Route by role
             if auth_ticket.role == "worker":
-                await self._handle_worker(websocket, auth_data)
+                await self._handle_worker(websocket, auth_ticket)
             elif auth_ticket.role == "monitor":
                 await self._handle_monitor(websocket)
             else:
@@ -475,11 +512,14 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"Connection error: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
             await websocket.close()
 
-    async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_data: Dict):
+    async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_ticket):
         """Handle worker connection lifecycle."""
-        worker_id = auth_data.get("name", str(uuid.uuid4()))
+        worker_id = getattr(auth_ticket, "name", str(uuid.uuid4()))
         self.workers[worker_id] = websocket
         self.stats["connected_workers"] = len(self.workers)
 
@@ -518,7 +558,11 @@ class Orchestrator:
             # Release chunks in both managers
             self.chunk_manager.release_worker_chunks(worker_id)
             if self.chunk_tracker:
-                self.chunk_tracker.release_worker_chunks(worker_id)
+                # Mark released chunks as pending in tracker
+                released_chunks = self.chunk_tracker.release_worker_chunks(worker_id)
+                logger.info(
+                    f"Released {len(released_chunks) if released_chunks is not None else 0} chunks from worker {worker_id}"
+                )
 
             await self._broadcast_stats()
 
@@ -527,6 +571,14 @@ class Orchestrator:
         msg_type = data.get("type")
 
         if msg_type == "request_chunks":
+            # Wait for state restoration to complete
+            if not self.state_restored.is_set():
+                logger.info(f"Worker {worker_id} requesting chunks, but state not yet restored")
+                await self.workers[worker_id].send(
+                    safe_json_dumps({"type": "no_chunks", "reason": "state_restoring"})
+                )
+                return
+
             count = data.get("count", self.chunks_per_request)
             chunks = self.chunk_manager.get_chunks_for_worker(worker_id, count, self.chunk_tracker)
 
@@ -547,7 +599,8 @@ class Orchestrator:
                 await self.workers[worker_id].send(
                     safe_json_dumps({"type": "shard_assignment", "chunks": chunk_data})
                 )
-                logger.info(f"Assigned {len(chunks)} chunks to worker {worker_id}")
+                chunk_ids = [c["chunk_id"] for c in chunk_data]
+                logger.info(f"Assigned {len(chunks)} chunks to worker {worker_id}: {chunk_ids}")
             else:
                 await self.workers[worker_id].send(safe_json_dumps({"type": "no_chunks"}))
 
@@ -787,11 +840,24 @@ class Orchestrator:
         if self.chunk_creation_thread:
             self.chunk_creation_thread.join(timeout=5)
 
+        # Release all assigned chunks before closing connections
+        for worker_id in list(self.workers.keys()):
+            self.chunk_manager.release_worker_chunks(worker_id)
+            if self.chunk_tracker:
+                # Update chunk tracker to mark assigned chunks as pending
+                with self.chunk_manager.lock:
+                    for chunk_id in list(self.chunk_manager.assigned_chunks.get(worker_id, [])):
+                        self.chunk_tracker.mark_pending(chunk_id)
+
         # Close all connections
         for ws in list(self.workers.values()):
             await ws.close()
         for ws in list(self.monitors):
             await ws.close()
+
+        # Save chunk state
+        if self.chunk_tracker:
+            self.chunk_tracker.save_checkpoint()
 
         # Final checkpoint
         logger.info(f"Final flush: {len(self.storage.caption_buffer)} captions in buffer")

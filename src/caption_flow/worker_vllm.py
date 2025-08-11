@@ -272,9 +272,6 @@ class VLLMWorker:
         # Connect to orchestrator with retries
         while self.running:
             try:
-                # Clear stop signal before connecting
-                self.should_stop_processing.clear()
-
                 await self._connect_and_run()
 
                 # Reset delay on successful connection
@@ -304,6 +301,9 @@ class VLLMWorker:
         async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
             self.websocket = websocket
             self.connected.set()
+
+            # Clear stop signal now that we're connected
+            self.should_stop_processing.clear()
 
             # Authenticate
             await websocket.send(json.dumps({"token": self.token, "name": self.name}))
@@ -373,10 +373,15 @@ class VLLMWorker:
                             logger.info(f"Received chunk assignment: {chunk.chunk_id}")
 
                     elif msg_type == "no_chunks":
-                        logger.info("No chunks available from orchestrator")
-                        await asyncio.sleep(10)
+                        reason = data.get("reason", "unknown")
+                        logger.info(f"No chunks available from orchestrator (reason: {reason})")
+
+                        # Different wait times based on reason
+                        wait_time = 2 if reason == "state_restoring" else 10
+                        await asyncio.sleep(wait_time)
+
                         # Request again after waiting
-                        if self.websocket:
+                        if self.websocket and self.connected.is_set():
                             await self.websocket.send(
                                 json.dumps({"type": "request_chunks", "count": 2})
                             )
@@ -400,8 +405,8 @@ class VLLMWorker:
         while self.running:
             # Check if we should stop processing
             if self.should_stop_processing.is_set():
-                logger.info("Shard reader stopping due to disconnection")
-                self.should_stop_processing.wait()  # Wait until cleared
+                logger.info("Shard reader waiting for reconnection")
+                time.sleep(1)
                 continue
 
             # Only process if connected
@@ -521,7 +526,11 @@ class VLLMWorker:
 
         for key, image_data in ds:
             # Check if we should stop
-            if not self.running or self.should_stop_processing.is_set():
+            if (
+                not self.running
+                or self.should_stop_processing.is_set()
+                or not self.connected.is_set()
+            ):
                 logger.info(f"Stopping chunk processing early due to disconnect")
                 break
 
@@ -546,7 +555,11 @@ class VLLMWorker:
                 # Add to readahead queue (blocks if full - provides backpressure)
                 # Use timeout to allow checking for disconnection
                 timeout_end = time.time() + 30
-                while self.running and not self.should_stop_processing.is_set():
+                while (
+                    self.running
+                    and not self.should_stop_processing.is_set()
+                    and self.connected.is_set()
+                ):
                     try:
                         self.readahead_queue.put(item, timeout=1)
                         break
@@ -554,6 +567,11 @@ class VLLMWorker:
                         if time.time() > timeout_end:
                             raise TimeoutError("Queue put timeout")
                         continue
+
+                # If we couldn't queue due to disconnection, skip this item
+                if not self.connected.is_set() or self.should_stop_processing.is_set():
+                    logger.debug(f"Skipping item {key} due to disconnection")
+                    break
 
                 items_processed += 1
                 self.current_chunk_progress = items_processed
@@ -713,111 +731,116 @@ class VLLMWorker:
         """Send results back to orchestrator."""
         pending_results = []  # Buffer for results during disconnection
 
-        while self.running:
-            try:
-                # Get result (with timeout to allow checking self.running)
+        try:
+            while self.running and self.connected.is_set():
                 try:
-                    result = await asyncio.get_event_loop().run_in_executor(
-                        None, self.result_queue.get, True, 1
-                    )
-                    pending_results.append(result)
-                except Empty:
-                    pass
+                    # Get result (with timeout to allow checking self.running)
+                    try:
+                        result = await asyncio.get_event_loop().run_in_executor(
+                            None, self.result_queue.get, True, 1
+                        )
+                        pending_results.append(result)
+                    except Empty:
+                        pass
 
-                # Only try to send if connected
-                if pending_results and self.websocket and self.connected.is_set():
-                    sent_results = []
-                    for result in pending_results:
-                        try:
-                            # Send result with all captions
-                            await self.websocket.send(
-                                json.dumps(
-                                    {
-                                        "type": "submit_captions",
-                                        "chunk_id": result.chunk_id,
-                                        "dataset": self.dataset_config.get(
-                                            "dataset_path", "unknown"
-                                        ),
-                                        "shard": result.shard_name,
-                                        "item_key": result.item_key,
-                                        "captions": result.captions,
-                                        "caption_count": len(result.captions),
-                                        "image_width": result.image_width,
-                                        "image_height": result.image_height,
-                                        "image_format": result.image_format,
-                                        "file_size": result.file_size,
-                                        "processing_time_ms": result.processing_time_ms,
-                                    }
+                    # Only try to send if connected
+                    if pending_results and self.websocket and self.connected.is_set():
+                        sent_results = []
+                        for result in pending_results:
+                            try:
+                                # Send result with all captions
+                                await self.websocket.send(
+                                    json.dumps(
+                                        {
+                                            "type": "submit_captions",
+                                            "chunk_id": result.chunk_id,
+                                            "dataset": self.dataset_config.get(
+                                                "dataset_path", "unknown"
+                                            ),
+                                            "shard": result.shard_name,
+                                            "item_key": result.item_key,
+                                            "captions": result.captions,
+                                            "caption_count": len(result.captions),
+                                            "image_width": result.image_width,
+                                            "image_height": result.image_height,
+                                            "image_format": result.image_format,
+                                            "file_size": result.file_size,
+                                            "processing_time_ms": result.processing_time_ms,
+                                        }
+                                    )
                                 )
-                            )
-                            sent_results.append(result)
+                                sent_results.append(result)
 
-                            if self.items_processed % 100 == 0:
-                                logger.info(
-                                    f"Processed {self.items_processed} items "
-                                    f"(~{self.items_processed * 3} captions)"
-                                )
-                        except websockets.exceptions.ConnectionClosed as e:
-                            logger.warning(f"Connection lost while sending result: {e}")
-                            self.connected.clear()
-                            self.websocket = None
-                            break
-                        except Exception as e:
-                            logger.error(f"Error sending result: {e}")
-                            break
+                                if self.items_processed % 100 == 0:
+                                    logger.info(
+                                        f"Processed {self.items_processed} items "
+                                        f"(~{self.items_processed * 3} captions)"
+                                    )
+                            except websockets.exceptions.ConnectionClosed as e:
+                                logger.warning(f"Connection lost while sending result: {e}")
+                                raise  # Re-raise to trigger task completion
+                            except Exception as e:
+                                logger.error(f"Error sending result: {e}")
+                                break
 
-                    # Remove successfully sent results
-                    for result in sent_results:
-                        pending_results.remove(result)
+                        # Remove successfully sent results
+                        for result in sent_results:
+                            pending_results.remove(result)
 
-                # Clear pending results if disconnected and buffer is too large
-                if not self.connected.is_set() and len(pending_results) > 1000:
-                    logger.warning(
-                        f"Clearing {len(pending_results)} pending results due to prolonged disconnection"
-                    )
-                    pending_results.clear()
+                    # Clear pending results if disconnected and buffer is too large
+                    if not self.connected.is_set() and len(pending_results) > 1000:
+                        logger.warning(
+                            f"Clearing {len(pending_results)} pending results due to prolonged disconnection"
+                        )
+                        pending_results.clear()
 
-                await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.1)
 
-            except Exception as e:
-                logger.error(f"Unexpected error in result sender: {e}")
-                await asyncio.sleep(1)
+                except Exception as e:
+                    if isinstance(e, websockets.exceptions.ConnectionClosed):
+                        raise  # Re-raise connection errors
+                    logger.error(f"Unexpected error in result sender: {e}")
+                    await asyncio.sleep(1)
+
+        except asyncio.CancelledError:
+            logger.debug("Result sender cancelled")
+            raise
 
     async def _heartbeat_loop(self):
         """Send periodic heartbeats with connection checking."""
-        while self.running and self.connected.is_set():
-            try:
-                if self.websocket:
-                    await self.websocket.send(
-                        json.dumps(
-                            {
-                                "type": "heartbeat",
-                                "processed": self.items_processed,
-                                "failed": self.items_failed,
-                                "chunks_completed": self.chunks_completed,
-                                "current_chunk": (
-                                    self.current_chunk.chunk_id if self.current_chunk else None
-                                ),
-                                "chunk_progress": self.current_chunk_progress,
-                                "queue_sizes": {
-                                    "readahead": self.readahead_queue.qsize(),
-                                    "inference": self.inference_queue.qsize(),
-                                    "results": self.result_queue.qsize(),
-                                },
-                            }
+        try:
+            while self.running and self.connected.is_set():
+                try:
+                    if self.websocket:
+                        await self.websocket.send(
+                            json.dumps(
+                                {
+                                    "type": "heartbeat",
+                                    "processed": self.items_processed,
+                                    "failed": self.items_failed,
+                                    "chunks_completed": self.chunks_completed,
+                                    "current_chunk": (
+                                        self.current_chunk.chunk_id if self.current_chunk else None
+                                    ),
+                                    "chunk_progress": self.current_chunk_progress,
+                                    "queue_sizes": {
+                                        "readahead": self.readahead_queue.qsize(),
+                                        "inference": self.inference_queue.qsize(),
+                                        "results": self.result_queue.qsize(),
+                                    },
+                                }
+                            )
                         )
-                    )
-                await asyncio.sleep(30)
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.info(f"Connection lost during heartbeat: {e}")
-                self.connected.clear()
-                self.websocket = None
-                break
-            except Exception as e:
-                logger.error(f"Heartbeat error: {e}")
-                self.connected.clear()
-                self.websocket = None
-                break
+                    await asyncio.sleep(30)
+                except websockets.exceptions.ConnectionClosed as e:
+                    logger.info(f"Connection lost during heartbeat: {e}")
+                    raise  # Re-raise to trigger task completion
+                except Exception as e:
+                    logger.error(f"Heartbeat error: {e}")
+                    raise  # Re-raise to trigger task completion
+        except asyncio.CancelledError:
+            logger.debug("Heartbeat loop cancelled")
+            raise
 
     async def shutdown(self):
         """Graceful shutdown."""

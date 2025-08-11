@@ -167,12 +167,15 @@ class ChunkTracker:
 
     def release_worker_chunks(self, worker_id: str):
         """Release all chunks assigned to a worker."""
+        released_chunks = []
         for chunk_id, chunk in self.chunks.items():
             if chunk.assigned_to == worker_id and chunk.status == "assigned":
                 chunk.status = "pending"
                 chunk.assigned_to = None
                 chunk.assigned_at = None
+                released_chunks.append(chunk_id)
         self._save_checkpoint()
+        return released_chunks
 
     def get_pending_chunks(self, shard_name: Optional[str] = None) -> List[str]:
         """Get list of pending chunk IDs, optionally filtered by shard."""
