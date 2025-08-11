@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import ssl
+import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -34,6 +35,13 @@ class Monitor:
         self.leaderboard = []
         self.recent_activity = []
         self.running = False
+
+        # Rate tracking
+        self.rate_info = {
+            "current_rate": 0.0,
+            "average_rate": 0.0,
+            "expected_rate": 0.0,
+        }
 
         # Rich console
         self.console = Console()
@@ -83,6 +91,10 @@ class Monitor:
 
         if msg_type == "stats":
             self.stats = data["data"]
+            # Extract rate info if present
+            self.rate_info["current_rate"] = self.stats.get("current_rate", 0.0)
+            self.rate_info["average_rate"] = self.stats.get("average_rate", 0.0)
+            self.rate_info["expected_rate"] = self.stats.get("expected_rate", 0.0)
         elif msg_type == "leaderboard":
             self.leaderboard = data["data"]
         elif msg_type == "activity":
@@ -104,7 +116,10 @@ class Monitor:
         layout = Layout()
 
         layout.split_column(
-            Layout(name="header", size=3), Layout(name="body"), Layout(name="footer", size=3)
+            Layout(name="header", size=3),
+            Layout(name="rates", size=5),
+            Layout(name="body"),
+            Layout(name="footer", size=3),
         )
 
         layout["body"].split_row(
@@ -125,13 +140,32 @@ class Monitor:
             )
         )
 
+        # Rates panel
+        rates_table = Table(show_header=False, expand=True)
+        rates_table.add_column("Metric", style="bold")
+        rates_table.add_column("Value", style="cyan", justify="right")
+
+        rates_table.add_row("Current Rate", f"{self.rate_info['current_rate']:.1f} captions/min")
+        rates_table.add_row("Average Rate", f"{self.rate_info['average_rate']:.1f} captions/min")
+        rates_table.add_row("Expected Rate", f"{self.rate_info['expected_rate']:.1f} captions/min")
+
+        # Add efficiency percentage if we have expected rate
+        if self.rate_info["expected_rate"] > 0:
+            efficiency = (self.rate_info["current_rate"] / self.rate_info["expected_rate"]) * 100
+            color = "green" if efficiency >= 80 else "yellow" if efficiency >= 50 else "red"
+            rates_table.add_row("Efficiency", f"[{color}]{efficiency:.1f}%[/{color}]")
+
+        layout["rates"].update(Panel(rates_table, title="Processing Rates", border_style="magenta"))
+
         # Statistics panel
         stats_table = Table(show_header=False, expand=True)
         stats_table.add_column("Metric")
         stats_table.add_column("Value", style="cyan")
 
+        # Filter out rate stats (already shown in rates panel)
         for key, value in self.stats.items():
-            stats_table.add_row(key.replace("_", " ").title(), str(value))
+            if key not in ["current_rate", "average_rate", "expected_rate"]:
+                stats_table.add_row(key.replace("_", " ").title(), str(value))
 
         layout["stats"].update(Panel(stats_table, title="System Statistics", border_style="green"))
 
