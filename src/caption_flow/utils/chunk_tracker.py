@@ -3,7 +3,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import Set, Dict, List, Optional
+from typing import Set, Dict, List, Optional, Any
 from datetime import datetime
 from dataclasses import dataclass, asdict
 
@@ -202,6 +202,82 @@ class ChunkTracker:
             "failed": sum(1 for c in self.chunks.values() if c.status == "failed"),
         }
         return stats
+
+    def get_shards_summary(self) -> Dict[str, Dict[str, Any]]:
+        """Get summary of all shards and their chunk status."""
+        shards = {}
+
+        for chunk_id, chunk_state in self.chunks.items():
+            shard_name = chunk_state.shard_name
+            if shard_name not in shards:
+                shards[shard_name] = {
+                    "total_chunks": 0,
+                    "completed_chunks": 0,
+                    "pending_chunks": 0,
+                    "assigned_chunks": 0,
+                    "failed_chunks": 0,
+                    "is_complete": True,
+                    "chunks": [],
+                }
+
+            shards[shard_name]["chunks"].append(chunk_state)
+            shards[shard_name]["total_chunks"] += 1
+
+            if chunk_state.status == "completed":
+                shards[shard_name]["completed_chunks"] += 1
+            elif chunk_state.status == "pending":
+                shards[shard_name]["pending_chunks"] += 1
+                shards[shard_name]["is_complete"] = False
+            elif chunk_state.status == "assigned":
+                shards[shard_name]["assigned_chunks"] += 1
+                shards[shard_name]["is_complete"] = False
+            elif chunk_state.status == "failed":
+                shards[shard_name]["failed_chunks"] += 1
+                shards[shard_name]["is_complete"] = False
+
+        return shards
+
+    def get_incomplete_shards(self) -> Set[str]:
+        """Get set of shard names that have incomplete chunks."""
+        incomplete = set()
+        for chunk_id, chunk_state in self.chunks.items():
+            if chunk_state.status != "completed":
+                incomplete.add(chunk_state.shard_name)
+        return incomplete
+
+    def get_shards_summary(self) -> Dict[str, Dict[str, Any]]:
+        """Get summary of all shards and their chunk status."""
+        shards = {}
+
+        for chunk_id, chunk_state in self.chunks.items():
+            shard_name = chunk_state.shard_name
+            if shard_name not in shards:
+                shards[shard_name] = {
+                    "total_chunks": 0,
+                    "completed_chunks": 0,
+                    "pending_chunks": 0,
+                    "assigned_chunks": 0,
+                    "failed_chunks": 0,
+                    "is_complete": True,
+                    "chunks": [],
+                }
+
+            shards[shard_name]["chunks"].append(chunk_state)
+            shards[shard_name]["total_chunks"] += 1
+
+            if chunk_state.status == "completed":
+                shards[shard_name]["completed_chunks"] += 1
+            elif chunk_state.status == "pending":
+                shards[shard_name]["pending_chunks"] += 1
+                shards[shard_name]["is_complete"] = False
+            elif chunk_state.status == "assigned":
+                shards[shard_name]["assigned_chunks"] += 1
+                shards[shard_name]["is_complete"] = False
+            elif chunk_state.status == "failed":
+                shards[shard_name]["failed_chunks"] += 1
+                shards[shard_name]["is_complete"] = False
+
+        return shards
 
     async def sync_with_storage(self, storage_manager):
         """Sync chunk state with storage to detect already-processed chunks."""
