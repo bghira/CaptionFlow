@@ -135,6 +135,8 @@ def json_serializer(obj: Any) -> Any:
         return str(obj)
     elif isinstance(obj, Enum):
         return obj.value
+    elif type(obj).__name__ == "int64":
+        return int(obj)
     elif is_dataclass(obj):
         return sanitize_dict(asdict(obj))
     elif hasattr(obj, "__dict__"):
