@@ -1,26 +1,28 @@
+# Caption Flow Configuration
+
 orchestrator:
-  host: "0.0.0.0"
+  host: 0.0.0.0
   port: 8765
-  
-  # Dataset configuration
+  #ssl:
+  #  # Use the paths output by 'caption-flow generate-cert' command
+  #  cert: /etc/letsencrypt/live/caption.example.com/fullchain.pem  # From generate-cert output
+  #  key: /etc/letsencrypt/live/caption.example.com/privkey.pem      # From generate-cert output
+
+  # Dataset configuration - centrally managed by orchestrator
   dataset:
-    path: "NebulaeWis/e621-2024-webp-4Mpixel"  # HuggingFace dataset path
-    type: "huggingface"  # or "local" or "url"
-    
-  # Storage configuration
+    type: "huggingface" # or "local"
+    path: "NebulaeWis/e621-2024-webp-4Mpixel" # HF dataset path or local directory
+    name: "e621"
+    version: "1.0"
+
   storage:
-    data_dir: "./caption_data"
-    checkpoint_dir: "./checkpoints"
-    
-    # Buffer sizes - these control when data is written to disk
-    caption_buffer_size: 100  # Flush captions after this many
-    job_buffer_size: 50       # Flush jobs after this many
+    data_dir: ./caption_data
+    checkpoint_interval: 1000
+    caption_buffer_size: 100
+    job_buffer_size: 100
     contributor_buffer_size: 10
-    
-    # Checkpoint interval (number of captions)
-    checkpoint_interval: 1000  # Force flush every 1000 captions
-    
-  # Authentication
+    checkpoint_dir: ./checkpoints
+
   auth:
     worker_tokens:
       - token: "worker-alpha-2024"
@@ -29,34 +31,37 @@ orchestrator:
         name: "Community-Worker-1"
     admin_tokens:
       - "admin-secret-2024"
-      
-  # SSL (optional, for production)
-  ssl:
-    cert: null  # Path to SSL certificate
-    key: null   # Path to SSL private key
 
+# Worker configuration (dataset info removed - received from orchestrator)
 worker:
-  # These can be overridden by CLI args
-  server: "ws://localhost:8765"  # or wss:// for SSL
-  token: "worker-alpha-2024"  # Worker token for authentication
-  batch_size: 1
-  verify_ssl: false  # Set to true in production
-  
-  # Dataset configuration (must match orchestrator)
-  dataset_type: "huggingface"  # or "local" or "url"
-  dataset_path: null  # For local datasets
-  dataset_url: null   # For URL-based datasets
-  fallback_to_direct: false  # Try direct URL access if tar fails
-  
-  # vLLM specific settings
-  gpu_id: 0
-  precision: "fp16"  # fp16, fp8, or awq
-  model: "Qwen/Qwen2.5-VL-3B-Instruct"
+  # Connection settings
+  server: "ws://localhost:8765" # or wss:// for SSL
+  token: "worker-alpha-2024"
+
+  # GPU and model settings
+  gpu_id: 0 # Which GPU to use
+  model: "Qwen/Qwen2.5-VL-3B-Instruct" # Vision-language model
   temperature: 0.7
-  coalesce_ms: 30  # Batch inference delay in milliseconds
   max_retries: 3
 
+  # Batching configuration
+  batch_size: 8 # Images per vLLM batch
+
+  # Readahead configuration
+  readahead_size: 256 # Maximum items in readahead queue
+  prefetch_batches: 4 # Number of batches to prefetch
+
+  # Performance tuning
+  num_inference_threads: 1
+  coalesce_ms: 30 # Time to wait for batch formation
+  precision: "fp16" # or "fp8", "awq"
+
 monitor:
-  server: "ws://localhost:8765"
-  token: "admin-secret-2024"
-  verify_ssl: false
+  refresh_rate: 1.0
+  show_contributors: true
+  show_quality_metrics: true
+  max_activity_items: 20
+  # Display options
+  show_chunk_progress: true
+  show_worker_queues: true
+  show_throughput_graph: true
