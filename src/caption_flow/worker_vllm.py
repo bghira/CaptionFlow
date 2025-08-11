@@ -35,6 +35,7 @@ from huggingface_hub import get_token
 from .models import JobStatus, Job
 from .utils import CaptionUtils
 from .utils.dataset_loader import DatasetLoader
+from .utils.vllm_config import VLLMConfigManager
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ class VLLMWorker:
         # vLLM configuration will be received from orchestrator
         self.vllm_config = None
         self.inference_prompts = None
+        self.vllm_config_manager = VLLMConfigManager()
 
         # Backward compatibility: local config for GPU selection
         self.gpu_id = config.get("gpu_id", 0)
@@ -174,38 +176,100 @@ class VLLMWorker:
         model_name = self.vllm_config["model"]
         logger.info(f"Loading {model_name} on GPU {self.gpu_id}")
 
+        # Always reload tokenizer/processor (they're model-specific)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True, use_fast=True
         )
         self.processor = AutoProcessor.from_pretrained(model_name)
 
-        # Initialize LLM with settings from orchestrator
-        self.llm = LLM(
-            model=model_name,
-            trust_remote_code=True,
-            tensor_parallel_size=self.vllm_config.get("tensor_parallel_size", 1),
-            max_model_len=self.vllm_config.get("max_model_len", 16384),
-            enforce_eager=self.vllm_config.get("enforce_eager", True),
-            gpu_memory_utilization=self.vllm_config.get("gpu_memory_utilization", 0.92),
-            dtype=self.vllm_config.get("dtype", "float16"),
-            limit_mm_per_prompt=self.vllm_config.get("limit_mm_per_prompt", {"image": 1}),
-            disable_mm_preprocessor_cache=self.vllm_config.get(
-                "disable_mm_preprocessor_cache", True
-            ),
-        )
+        # Initialize LLM with settings from orchestrator using config manager
+        vllm_params = self.vllm_config_manager.get_vllm_init_params(self.vllm_config)
+        self.llm = LLM(**vllm_params)
 
         # Create sampling params from orchestrator config
-        sampling_config = self.vllm_config.get("sampling", {})
-        self.sampling_params = SamplingParams(
-            temperature=sampling_config.get("temperature", 0.7),
-            top_p=sampling_config.get("top_p", 0.95),
-            max_tokens=sampling_config.get("max_tokens", 256),
-            stop=sampling_config.get("stop", ["<|end|>", "<|endoftext|>", "<|im_end|>"]),
-            repetition_penalty=sampling_config.get("repetition_penalty", 1.05),
-            skip_special_tokens=sampling_config.get("skip_special_tokens", True),
-        )
+        self.sampling_params = self.vllm_config_manager.create_sampling_params(self.vllm_config)
 
         logger.info("vLLM initialization complete")
+
+        # Update config manager's tracking
+        self.vllm_config_manager.current_config = self.vllm_config
+
+    def _handle_vllm_config_update(self, new_config: Dict[str, Any]) -> bool:
+        """
+        Handle vLLM configuration updates.
+
+        Returns:
+            True if config was updated successfully, False if reload is needed
+        """
+        if not new_config:
+            return True
+
+        # Check what changed
+        change = self.vllm_config_manager.analyze_config_change(self.vllm_config, new_config)
+
+        if not change.changed_fields:
+            # No changes
+            return True
+
+        if change.requires_reload:
+            # Need to reload vLLM
+            logger.info(f"vLLM config changes require reload: {change.changed_fields}")
+
+            # Save old config
+            old_config = self.vllm_config
+            self.vllm_config = new_config
+
+            try:
+                # Reload vLLM with new config
+                logger.info("Reloading vLLM with new configuration...")
+
+                # Clean up old instance
+                if hasattr(self, "llm") and self.llm:
+                    del self.llm
+
+                # Also clean up tokenizer/processor if model changed
+                if change.model_changed:
+                    if hasattr(self, "tokenizer"):
+                        del self.tokenizer
+                    if hasattr(self, "processor"):
+                        del self.processor
+
+                import gc
+
+                gc.collect()
+
+                # Reload with new config
+                self._setup_vllm()
+
+                # Update prompts
+                self.inference_prompts = new_config.get("inference_prompts", self.inference_prompts)
+
+                logger.info("vLLM reload complete")
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to reload vLLM: {e}")
+                # Restore old config
+                self.vllm_config = old_config
+                return False
+
+        else:
+            # Can update without reload
+            logger.info(f"Updating vLLM config without reload: {change.changed_fields}")
+
+            # Update sampling params if changed
+            if change.sampling_changed:
+                self.sampling_params = self.vllm_config_manager.create_sampling_params(new_config)
+
+            # Update prompts if changed
+            if change.prompts_changed:
+                self.inference_prompts = new_config.get("inference_prompts", self.inference_prompts)
+                logger.info(f"Updated inference prompts: {len(self.inference_prompts)} prompts")
+
+            # Update config
+            self.vllm_config = new_config
+            logger.info("vLLM configuration updated successfully without reload")
+            return True
 
     def _clear_state_on_disconnect(self):
         """Clear all processing state when disconnected."""
@@ -322,6 +386,9 @@ class VLLMWorker:
                 ],
             )
 
+            # Store config in manager
+            self.vllm_config_manager.current_config = self.vllm_config
+
             # Extract dataset configuration
             dataset_config = welcome_data.get("dataset_config", {})
             if dataset_config:
@@ -368,10 +435,11 @@ class VLLMWorker:
             new_vllm_config = welcome_data.get("vllm_config")
             if new_vllm_config and new_vllm_config != self.vllm_config:
                 logger.info("Received updated vLLM configuration")
-                self.vllm_config = new_vllm_config
-                self.inference_prompts = self.vllm_config.get(
-                    "inference_prompts", self.inference_prompts
-                )
+
+                # Handle config update (may trigger reload)
+                if not self._handle_vllm_config_update(new_vllm_config):
+                    logger.error("Failed to update vLLM configuration")
+                    # Continue with existing config
 
             # Request initial chunks
             await websocket.send(json.dumps({"type": "request_chunks", "count": 2}))
@@ -430,6 +498,13 @@ class VLLMWorker:
                             await self.websocket.send(
                                 json.dumps({"type": "request_chunks", "count": 2})
                             )
+
+                    elif msg_type == "reload_vllm":
+                        # Orchestrator requested vLLM reload
+                        logger.info("Orchestrator requested vLLM reload")
+                        new_config = data.get("vllm_config")
+                        if new_config:
+                            self._handle_vllm_config_update(new_config)
 
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid message format: {e}")
