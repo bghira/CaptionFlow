@@ -333,12 +333,24 @@ class VLLMWorker:
 
             # Start processing
             try:
-                await asyncio.gather(
-                    self._heartbeat_loop(),
-                    self._message_handler(),
-                    self._result_sender(),
-                    return_exceptions=False,
-                )
+                # Create tasks
+                tasks = [
+                    asyncio.create_task(self._heartbeat_loop()),
+                    asyncio.create_task(self._message_handler()),
+                    asyncio.create_task(self._result_sender()),
+                ]
+
+                # Wait for any task to complete (likely due to disconnection)
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                # Cancel remaining tasks
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
             finally:
                 # Ensure we mark as disconnected
                 self.connected.clear()
