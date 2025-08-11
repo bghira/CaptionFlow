@@ -174,6 +174,33 @@ class Orchestrator:
         self.dataset_path = self.dataset_config.get("path")
         self.dataset_type = self.dataset_config.get("type", "huggingface")
 
+        # vLLM configuration to distribute to workers
+        self.vllm_config = config.get(
+            "vllm",
+            {
+                "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+                "gpu_memory_utilization": 0.92,
+                "max_model_len": 16384,
+                "tensor_parallel_size": 1,
+                "dtype": "float16",
+                "enforce_eager": True,
+                "limit_mm_per_prompt": {"image": 1},
+                "disable_mm_preprocessor_cache": True,
+                "sampling": {
+                    "temperature": 0.7,
+                    "top_p": 0.95,
+                    "max_tokens": 256,
+                    "repetition_penalty": 1.05,
+                    "stop": ["<|end|>", "<|endoftext|>", "<|im_end|>"],
+                },
+                "inference_prompts": [
+                    "describe this image in detail",
+                    "provide a comprehensive description of the visual content",
+                    "what are the key elements in this image?",
+                ],
+            },
+        )
+
         # Chunk configuration
         self.chunk_size = config.get("chunk_size", 1000)
         self.chunks_per_request = config.get("chunks_per_request", 2)
@@ -471,6 +498,9 @@ class Orchestrator:
     async def start(self):
         """Start the orchestrator server."""
         logger.info(f"Starting vLLM orchestrator on {self.host}:{self.port}")
+        logger.info(
+            f"vLLM config: model={self.vllm_config.get('model')}, batch_size={self.vllm_config.get('batch_size')}"
+        )
 
         # Load existing state BEFORE accepting connections
         await self.storage.initialize()
@@ -554,6 +584,7 @@ class Orchestrator:
                     "path": self.dataset_path,  # For compatibility
                     "type": self.dataset_type,  # For compatibility
                 },
+                "vllm_config": self.vllm_config,
             }
             await websocket.send(safe_json_dumps(welcome_message))
 
@@ -769,6 +800,10 @@ class Orchestrator:
             }
         )
 
+        # Add vLLM info
+        self.stats["vllm_model"] = self.vllm_config.get("model", "unknown")
+        self.stats["vllm_batch_size"] = self.vllm_config.get("batch_size", 0)
+
         message = safe_json_dumps({"type": "stats", "data": self.stats})
 
         # Send to all monitors
@@ -884,8 +919,11 @@ class Orchestrator:
                     ) * 60
 
                 # Calculate expected rate based on workers
-                # Assume each worker processes ~10 images/minute with 3 captions each
-                self.rate_tracker["expected_rate"] = worker_count * 10 * 3
+                # Assume each worker processes batch_size images every ~2 seconds with 3 captions each
+                batch_size = self.vllm_config.get("batch_size", 8)
+                num_prompts = len(self.vllm_config.get("inference_prompts", ["", "", ""]))
+                images_per_minute = 30  # Rough estimate: 30 images/min per worker
+                self.rate_tracker["expected_rate"] = worker_count * images_per_minute * num_prompts
 
                 # Update trackers
                 self.rate_tracker["last_update_time"] = current_time
