@@ -15,6 +15,43 @@ orchestrator:
     name: "e621"
     version: "1.0"
 
+  # vLLM configuration - distributed to all workers
+  vllm:
+    # Model settings
+    model: "Qwen/Qwen2.5-VL-3B-Instruct"
+    tensor_parallel_size: 1
+    max_model_len: 16384
+    dtype: "float16" # or "float32", "bfloat16"
+    gpu_memory_utilization: 0.92
+    enforce_eager: true
+    disable_mm_preprocessor_cache: true
+    limit_mm_per_prompt:
+      image: 1
+
+    # Batching
+    batch_size: 8
+
+    # Sampling parameters
+    sampling:
+      temperature: 0.7
+      top_p: 0.95
+      max_tokens: 256
+      repetition_penalty: 1.05
+      skip_special_tokens: true
+      stop:
+        - "<|end|>"
+        - "<|endoftext|>"
+        - "<|im_end|>"
+
+    # Inference prompts - each image gets captions from all prompts
+    inference_prompts:
+      - "describe this image in detail"
+      - "provide a comprehensive description of the visual content"
+      - "what are the key elements in this image?"
+      # Add more prompts for diverse captions
+      # - "describe the scene, including any notable objects, people, or activities"
+      # - "what story does this image tell?"
+
   storage:
     data_dir: ./caption_data
     checkpoint_interval: 1000
@@ -22,6 +59,12 @@ orchestrator:
     job_buffer_size: 100
     contributor_buffer_size: 10
     checkpoint_dir: ./checkpoints
+
+  # Chunk processing settings
+  chunk_size: 1000 # Items per chunk
+  chunks_per_request: 2 # Chunks sent to worker at once
+  chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
+  min_chunk_buffer: 10 # Minimum chunks to keep ready
 
   auth:
     worker_tokens:
@@ -32,29 +75,18 @@ orchestrator:
     admin_tokens:
       - "admin-secret-2024"
 
-# Worker configuration (dataset info removed - received from orchestrator)
+# Worker configuration (minimal - most config comes from orchestrator)
 worker:
   # Connection settings
   server: "ws://localhost:8765" # or wss:// for SSL
   token: "worker-alpha-2024"
 
-  # GPU and model settings
-  gpu_id: 0 # Which GPU to use
-  model: "Qwen/Qwen2.5-VL-3B-Instruct" # Vision-language model
-  temperature: 0.7
-  max_retries: 3
+  # Local GPU selection
+  gpu_id: 0 # Which GPU to use on this machine
 
-  # Batching configuration
-  batch_size: 8 # Images per vLLM batch
-
-  # Readahead configuration
+  # Local queue settings
   readahead_size: 256 # Maximum items in readahead queue
-  prefetch_batches: 4 # Number of batches to prefetch
-
-  # Performance tuning
-  num_inference_threads: 1
-  coalesce_ms: 30 # Time to wait for batch formation
-  precision: "fp16" # or "fp8", "awq"
+  inference_queue_size: 128 # Maximum batches in inference queue
 
 monitor:
   refresh_rate: 1.0
