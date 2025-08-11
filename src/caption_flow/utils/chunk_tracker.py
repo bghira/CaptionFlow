@@ -80,24 +80,44 @@ class ChunkTracker:
     def _save_checkpoint(self):
         """Save checkpoint to disk."""
         try:
+            # Ensure parent directory exists
+            self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+
             # Convert chunks to serializable format
             data = {
                 "chunks": {chunk_id: chunk.to_dict() for chunk_id, chunk in self.chunks.items()},
                 "updated_at": datetime.utcnow().isoformat(),
             }
 
-            # Write atomically
-            tmp_file = self.checkpoint_file.with_suffix(".tmp")
+            # Write atomically with absolute paths
+            tmp_file = self.checkpoint_file.parent / f"{self.checkpoint_file.name}.tmp"
+
+            # Write to temp file
             with open(tmp_file, "w") as f:
                 json.dump(data, f, indent=2)
 
-            # Move atomically
-            tmp_file.replace(self.checkpoint_file)
+            # Ensure temp file was created
+            if not tmp_file.exists():
+                raise IOError(f"Failed to create temporary file: {tmp_file}")
 
-            logger.debug(f"Saved chunk checkpoint with {len(self.chunks)} chunks")
+            # Move atomically (use rename for same filesystem)
+            import shutil
+
+            shutil.move(str(tmp_file), str(self.checkpoint_file))
+
+            logger.debug(
+                f"Saved chunk checkpoint with {len(self.chunks)} chunks to {self.checkpoint_file}"
+            )
 
         except Exception as e:
-            logger.error(f"Error saving chunk checkpoint: {e}")
+            logger.error(f"Error saving chunk checkpoint: {e}", exc_info=True)
+            # Try direct write as fallback
+            try:
+                with open(self.checkpoint_file, "w") as f:
+                    json.dump(data, f, indent=2)
+                logger.info("Saved checkpoint using fallback direct write")
+            except Exception as fallback_error:
+                logger.error(f"Fallback save also failed: {fallback_error}")
 
     def add_chunk(self, chunk_id: str, shard_name: str, start_index: int, chunk_size: int) -> bool:
         """Add a new chunk. Returns False if chunk already exists and is completed."""

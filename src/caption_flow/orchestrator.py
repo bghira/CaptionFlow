@@ -248,13 +248,43 @@ class Orchestrator:
 
         # Get all shards
         self.all_shards = self.dataset_loader.get_shard_list()
+        self.stats["total_shards"] = len(self.all_shards)
+
+        # Get list of shards we've already seen from ChunkTracker
+        processed_shards = set()
+        shards_with_chunks = {}  # shard_name -> (has_chunks, is_complete)
+
+        if self.chunk_tracker:
+            # Group chunks by shard to see which shards we know about
+            for chunk_id, chunk_state in self.chunk_tracker.chunks.items():
+                shard_name = chunk_state.shard_name
+                if shard_name not in shards_with_chunks:
+                    shards_with_chunks[shard_name] = {"chunks": [], "complete": True}
+
+                shards_with_chunks[shard_name]["chunks"].append(chunk_state)
+                # If any chunk is not completed, shard is not complete
+                if chunk_state.status != "completed":
+                    shards_with_chunks[shard_name]["complete"] = False
+
+            # Mark fully completed shards
+            for shard_name, info in shards_with_chunks.items():
+                if info["complete"]:
+                    processed_shards.add(shard_name)
+                    logger.info(f"Shard {shard_name} is fully complete, skipping")
+
+        # Get shards that still need processing from ShardTracker
         remaining_shards = self.shard_tracker.get_remaining_shards(self.all_shards)
 
-        self.stats["total_shards"] = len(self.all_shards)
-        self.stats["completed_shards"] = len(self.all_shards) - len(remaining_shards)
+        # Update completed count
+        self.stats["completed_shards"] = len(processed_shards)
 
-        logger.info(f"Total shards: {len(self.all_shards)}, " f"Remaining: {len(remaining_shards)}")
+        logger.info(
+            f"Total shards: {len(self.all_shards)}, "
+            f"Fully completed: {len(processed_shards)}, "
+            f"Remaining in shard tracker: {len(remaining_shards)}"
+        )
 
+        # Process only shards that need work
         for shard_url in remaining_shards:
             if self.stop_chunk_creation.is_set():
                 break
@@ -262,33 +292,63 @@ class Orchestrator:
             shard_name = Path(shard_url).stem
             self.stats["current_shard"] = shard_name
 
-            # Check if shard is already complete in chunk tracker
-            if self.chunk_tracker and self.chunk_tracker.is_shard_complete(shard_name):
-                logger.info(f"Shard {shard_name} already complete, skipping")
-                self.shard_tracker.mark_complete(shard_name)
-                self.stats["completed_shards"] += 1
+            # Skip if we already have all chunks for this shard
+            if shard_name in shards_with_chunks:
+                shard_info = shards_with_chunks[shard_name]
+
+                # If shard is complete, mark it in ShardTracker and skip
+                if shard_info["complete"]:
+                    logger.info(
+                        f"Shard {shard_name} already has all chunks completed, marking in ShardTracker"
+                    )
+                    self.shard_tracker.mark_complete(shard_name)
+                    self.stats["completed_shards"] += 1
+                    continue
+
+                # If we already have chunks but shard isn't complete, just add them to queue
+                logger.info(
+                    f"Shard {shard_name} has {len(shard_info['chunks'])} existing chunks, adding pending ones to queue"
+                )
+
+                with self.chunk_manager.lock:
+                    for chunk_state in shard_info["chunks"]:
+                        if chunk_state.status == "pending":
+                            # Re-create the chunk object
+                            chunk = ShardChunk(
+                                chunk_id=chunk_state.chunk_id,
+                                shard_url=shard_url,
+                                shard_name=chunk_state.shard_name,
+                                start_index=chunk_state.start_index,
+                                chunk_size=chunk_state.chunk_size,
+                            )
+                            self.chunk_manager.chunks[chunk_state.chunk_id] = chunk
+                            self.chunk_manager.pending_chunks.append(chunk_state.chunk_id)
+                            logger.debug(f"Re-queued pending chunk {chunk_state.chunk_id}")
+
                 continue
 
+            # Only count items for shards we haven't seen before
             try:
-                # Count items in shard
+                logger.info(f"Counting items in new shard {shard_name}")
                 item_count = 0
                 for _ in self.dataset_loader.iterate_shard(shard_url):
                     item_count += 1
 
                 logger.info(f"Shard {shard_name} has {item_count} items")
 
-                # Create chunks, checking with tracker
+                # Create chunks for this new shard
                 created_chunks = 0
                 for start_idx in range(0, item_count, self.chunk_size):
                     chunk_id = f"{shard_name}_chunk_{start_idx}"
                     chunk_size = min(self.chunk_size, item_count - start_idx)
 
-                    # Check if chunk is already completed
+                    # Add to ChunkTracker
                     if self.chunk_tracker:
                         if not self.chunk_tracker.add_chunk(
                             chunk_id, shard_name, start_idx, chunk_size
                         ):
-                            logger.debug(f"Chunk {chunk_id} already completed, skipping")
+                            # This shouldn't happen for new shards
+                            logger.warning(f"Chunk {chunk_id} already exists in tracker?")
                             continue
 
                     # Create chunk in memory
@@ -307,12 +367,56 @@ class Orchestrator:
                     created_chunks += 1
 
                 self.stats["total_chunks"] += created_chunks
-                logger.info(f"Created {created_chunks} new chunks from shard {shard_name}")
+                logger.info(f"Created {created_chunks} new chunks for shard {shard_name}")
 
             except Exception as e:
                 logger.error(f"Error processing shard {shard_name}: {e}")
 
+        # Final pass: add any pending chunks from ChunkTracker that weren't in remaining_shards
+        if self.chunk_tracker:
+            orphaned_pending = []
+            with self.chunk_manager.lock:
+                for chunk_id, chunk_state in self.chunk_tracker.chunks.items():
+                    if (
+                        chunk_state.status == "pending"
+                        and chunk_id not in self.chunk_manager.chunks
+                    ):
+                        orphaned_pending.append(chunk_state)
+
+            if orphaned_pending:
+                logger.info(
+                    f"Found {len(orphaned_pending)} orphaned pending chunks, re-queueing them"
+                )
+                for chunk_state in orphaned_pending:
+                    # Find shard URL
+                    shard_url = None
+                    for url in self.all_shards:
+                        if Path(url).stem == chunk_state.shard_name:
+                            shard_url = url
+                            break
+
+                    if shard_url:
+                        chunk = ShardChunk(
+                            chunk_id=chunk_state.chunk_id,
+                            shard_url=shard_url,
+                            shard_name=chunk_state.shard_name,
+                            start_index=chunk_state.start_index,
+                            chunk_size=chunk_state.chunk_size,
+                        )
+                        with self.chunk_manager.lock:
+                            self.chunk_manager.chunks[chunk_state.chunk_id] = chunk
+                            self.chunk_manager.pending_chunks.append(chunk_state.chunk_id)
+
         logger.info("Chunk creation thread finished")
+
+        # Log final stats
+        chunk_stats = self.chunk_tracker.get_stats() if self.chunk_tracker else {}
+        logger.info(
+            f"Chunk creation complete. "
+            f"Total chunks: {chunk_stats.get('total', 0)}, "
+            f"Pending: {chunk_stats.get('pending', 0)}, "
+            f"Completed: {chunk_stats.get('completed', 0)}"
+        )
 
     async def start(self):
         """Start the orchestrator server."""
