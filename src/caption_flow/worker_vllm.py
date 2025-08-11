@@ -15,11 +15,12 @@ import asyncio
 import io
 import json
 import logging
+import ssl
 import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, AsyncGenerator
+from typing import Dict, Any, Optional, List
 from queue import Queue, Empty
 from threading import Thread, Lock
 from collections import deque
@@ -31,8 +32,9 @@ import numpy as np
 import webdataset as wds
 from huggingface_hub import get_token
 
-from .models import JobStatus
+from .models import JobStatus, Job
 from .utils import CaptionUtils
+from .utils.dataset_loader import DatasetLoader
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,19 @@ class ProcessedResult:
     processing_time_ms: float
 
 
+@dataclass
+class InferenceConfig:
+    """Configuration for vLLM inference."""
+
+    gpu_id: int = 0
+    precision: str = "fp16"
+    batch_size: int = 8
+    coalesce_ms: int = 30
+    max_retries: int = 3
+    model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    temperature: float = 0.7
+
+
 class VLLMWorker:
     """Worker that processes shard chunks directly."""
 
@@ -81,65 +96,102 @@ class VLLMWorker:
         self.server_url = config["server"]
         self.token = config["token"]
         self.name = config.get("name", "worker")
-        self.dataset_type = config.get("dataset_type", "huggingface")
+
+        # Dataset configuration will be received from orchestrator
+        self.dataset_config = None
+        self.dataset_loader = None
+        self.dataset_type = None
+        self.hf_token = get_token()
 
         # vLLM configuration
-        self.gpu_id = config.get("gpu_id", 0)
-        self.batch_size = config.get("batch_size", 8)
-        self.model_name = config.get("model", "Qwen/Qwen2.5-VL-3B-Instruct")
-        self.temperature = config.get("temperature", 0.7)
-        self.max_retries = config.get("max_retries", 3)
+        self.inference_config = InferenceConfig(
+            gpu_id=config.get("gpu_id", 0),
+            precision=config.get("precision", "fp16"),
+            batch_size=config.get("batch_size", 8),
+            coalesce_ms=config.get("coalesce_ms", 30),
+            max_retries=config.get("max_retries", 3),
+            model_name=config.get("model", "Qwen/Qwen2.5-VL-3B-Instruct"),
+            temperature=config.get("temperature", 0.7),
+        )
 
-        # Readahead configuration
-        self.readahead_size = config.get("readahead_size", 256)
-        self.prefetch_batches = config.get("prefetch_batches", 4)
-
-        # HuggingFace token for dataset access
-        self.hf_token = get_token()
+        # SSL configuration
+        self.ssl_context = self._setup_ssl()
 
         # State
         self.worker_id: Optional[str] = None
         self.websocket: Optional[WebSocketClientProtocol] = None
         self.running = False
 
-        # Shard processing
-        self.assigned_chunks: deque = deque()
-        self.current_chunk: Optional[ShardChunk] = None
-        self.chunk_lock = Lock()
-
-        # Processing queues
-        self.readahead_queue = Queue(maxsize=self.readahead_size)
-        self.inference_queue = Queue(maxsize=self.batch_size * 2)
-        self.result_queue = Queue()
-
-        # vLLM components
+        # Inference components (initialized in setup)
         self.llm = None
         self.processor = None
         self.tokenizer = None
         self.sampling_params = None
 
+        # Shard chunk processing
+        self.chunk_lock = Lock()
+        self.assigned_chunks = deque()
+        self.current_chunk = None
+        self.current_chunk_progress = 0
+
+        # Batching queues
+        self.readahead_queue = Queue(maxsize=256)
+        self.inference_queue = Queue(maxsize=128)
+        self.result_queue = Queue()
+
         # Metrics
         self.items_processed = 0
         self.items_failed = 0
-        self.current_chunk_progress = 0
+        self.chunks_completed = 0
+
+    def _setup_ssl(self) -> Optional[ssl.SSLContext]:
+        """Configure SSL context."""
+        if self.server_url.startswith("ws://"):
+            logger.warning("Using insecure WebSocket connection")
+            return None
+
+        if not self.config.get("verify_ssl", True):
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            return context
+
+        return ssl.create_default_context()
+
+    def _setup_dataset_loader(self, dataset_config: Dict[str, Any]):
+        """Initialize dataset loader with config from orchestrator."""
+        dataset_path = dataset_config.get("dataset_path") or dataset_config.get("path")
+        dataset_type = dataset_config.get("dataset_type") or dataset_config.get(
+            "type", "huggingface"
+        )
+
+        if dataset_path:
+            logger.info(f"Initializing dataset loader for {dataset_type}: {dataset_path}")
+            self.dataset_loader = DatasetLoader(dataset_path, dataset_type)
+            self.dataset_config = dataset_config
+            self.dataset_type = dataset_type
+        else:
+            logger.warning("No dataset path provided by orchestrator")
 
     def _setup_vllm(self):
         """Initialize vLLM components."""
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.inference_config.gpu_id)
 
         from vllm import LLM, SamplingParams
         from transformers import AutoTokenizer, AutoProcessor
 
-        logger.info(f"Loading {self.model_name} on GPU {self.gpu_id}")
+        logger.info(
+            f"Loading {self.inference_config.model_name} on GPU {self.inference_config.gpu_id}"
+        )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name, trust_remote_code=True, use_fast=True
+            self.inference_config.model_name, trust_remote_code=True, use_fast=True
         )
-        self.processor = AutoProcessor.from_pretrained(self.model_name)
+        self.processor = AutoProcessor.from_pretrained(self.inference_config.model_name)
 
         # Initialize LLM with optimized settings
         self.llm = LLM(
-            model=self.model_name,
+            model=self.inference_config.model_name,
             trust_remote_code=True,
             tensor_parallel_size=1,
             max_model_len=16384,
@@ -151,7 +203,7 @@ class VLLMWorker:
         )
 
         self.sampling_params = SamplingParams(
-            temperature=self.temperature,
+            temperature=self.inference_config.temperature,
             top_p=0.95,
             max_tokens=256,
             stop=["<|end|>", "<|endoftext|>", "<|im_end|>"],
@@ -200,70 +252,48 @@ class VLLMWorker:
                 reconnect_delay = min(reconnect_delay * 2, max_delay)
 
     async def _connect_and_run(self):
-        """Connect to orchestrator and process chunks with graceful disconnection handling."""
+        """Connect to orchestrator and process chunks."""
         logger.info(f"Connecting to {self.server_url}")
 
-        try:
-            async with websockets.connect(self.server_url) as websocket:
-                self.websocket = websocket
+        async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
+            self.websocket = websocket
 
-                # Authenticate
-                await websocket.send(json.dumps({"token": self.token, "name": self.name}))
+            # Authenticate
+            await websocket.send(json.dumps({"token": self.token, "name": self.name}))
 
-                # Wait for welcome
-                welcome = await websocket.recv()
-                welcome_data = json.loads(welcome)
+            # Wait for welcome message with dataset config
+            welcome = await websocket.recv()
+            welcome_data = json.loads(welcome)
 
-                if "error" in welcome_data:
-                    logger.error(f"Authentication failed: {welcome_data['error']}")
-                    self.running = False
-                    return
+            if "error" in welcome_data:
+                logger.error(f"Authentication failed: {welcome_data['error']}")
+                self.running = False
+                return
 
-                self.worker_id = welcome_data.get("worker_id")
-                config = welcome_data.get("config", {})
+            self.worker_id = welcome_data.get("worker_id")
+            logger.info(f"Connected as {self.worker_id}")
 
-                logger.info(f"Connected as {self.worker_id}")
+            # Extract and setup dataset configuration from orchestrator
+            dataset_config = welcome_data.get("dataset_config", {})
+            if dataset_config:
+                self._setup_dataset_loader(dataset_config)
+                logger.info(f"Received dataset config: {dataset_config}")
+            else:
+                logger.warning("No dataset configuration received from orchestrator")
 
-                # Request initial chunks
-                await websocket.send(json.dumps({"type": "request_chunks"}))
+            # Request initial chunks
+            await websocket.send(json.dumps({"type": "request_chunks", "count": 2}))
 
-                # Start processing tasks
-                tasks = [
-                    asyncio.create_task(self._message_handler()),
-                    asyncio.create_task(self._result_sender()),
-                    asyncio.create_task(self._heartbeat_loop()),
-                ]
-
-                # Wait for any task to complete (usually due to disconnection)
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-                # Cancel remaining tasks
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-
-                # Check why we stopped
-                for task in done:
-                    try:
-                        task.result()
-                    except Exception as e:
-                        logger.debug(f"Task ended with: {e}")
-
-        except websockets.exceptions.InvalidStatusCode as e:
-            logger.error(f"Failed to connect (server might be down): {e}")
-        except websockets.exceptions.WebSocketException as e:
-            logger.error(f"WebSocket error: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected connection error: {e}")
-        finally:
-            self.websocket = None
-            logger.info("Disconnected from orchestrator")
+            # Start processing
+            await asyncio.gather(
+                self._heartbeat_loop(),
+                self._message_handler(),
+                self._result_sender(),
+                return_exceptions=True,
+            )
 
     async def _message_handler(self):
-        """Handle messages from orchestrator with graceful disconnection."""
+        """Handle messages from orchestrator."""
         try:
             async for message in self.websocket:
                 try:
@@ -280,7 +310,13 @@ class VLLMWorker:
 
                         # Request more chunks if queue is low
                         if len(self.assigned_chunks) < 2 and self.websocket:
-                            await self.websocket.send(json.dumps({"type": "request_chunks"}))
+                            await self.websocket.send(
+                                json.dumps({"type": "request_chunks", "count": 2})
+                            )
+
+                    elif msg_type == "no_chunks":
+                        logger.info("No chunks available from orchestrator")
+                        await asyncio.sleep(10)
 
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid message format: {e}")
@@ -316,6 +352,7 @@ class VLLMWorker:
 
                 # Mark chunk as complete
                 logger.info(f"Completed chunk {self.current_chunk.chunk_id}")
+                self.chunks_completed += 1
 
                 # Notify orchestrator if connected
                 if self.websocket:
@@ -333,10 +370,6 @@ class VLLMWorker:
                         ).result(timeout=5)
                     except Exception as e:
                         logger.warning(f"Could not notify orchestrator of chunk completion: {e}")
-                else:
-                    logger.warning(
-                        f"Completed chunk {self.current_chunk.chunk_id} but not connected to orchestrator"
-                    )
 
                 with self.chunk_lock:
                     self.current_chunk = None
@@ -421,7 +454,7 @@ class VLLMWorker:
                 self.current_chunk_progress = items_processed
 
                 # Batch items for inference
-                if self.readahead_queue.qsize() >= self.batch_size:
+                if self.readahead_queue.qsize() >= self.inference_config.batch_size:
                     self._batch_for_inference()
 
             except Exception as e:
@@ -438,7 +471,7 @@ class VLLMWorker:
         batch = []
 
         try:
-            while len(batch) < self.batch_size:
+            while len(batch) < self.inference_config.batch_size:
                 item = self.readahead_queue.get_nowait()
                 batch.append(item)
         except Empty:
@@ -499,7 +532,7 @@ class VLLMWorker:
                             chunk_id=item.chunk_id,
                             shard_name=Path(item.chunk_id).stem.rsplit("_chunk_", 1)[0],
                             item_key=item.item_key,
-                            captions=captions,  # Now storing list of captions
+                            captions=captions,
                             image_width=item.image.width,
                             image_height=item.image.height,
                             image_format=item.image.format or "unknown",
@@ -562,7 +595,7 @@ class VLLMWorker:
         return text.strip()
 
     async def _result_sender(self):
-        """Send results back to orchestrator with reconnection handling."""
+        """Send results back to orchestrator."""
         pending_results = []  # Buffer for results during disconnection
 
         while self.running:
@@ -581,13 +614,15 @@ class VLLMWorker:
                     sent_results = []
                     for result in pending_results:
                         try:
-                            # Send the list of captions
+                            # Send result with all captions
                             await self.websocket.send(
                                 json.dumps(
                                     {
                                         "type": "submit_captions",
                                         "chunk_id": result.chunk_id,
-                                        "dataset": self.config.get("dataset_path", "unknown"),
+                                        "dataset": self.dataset_config.get(
+                                            "dataset_path", "unknown"
+                                        ),
                                         "shard": result.shard_name,
                                         "item_key": result.item_key,
                                         "captions": result.captions,
@@ -605,13 +640,9 @@ class VLLMWorker:
                             if self.items_processed % 100 == 0:
                                 logger.info(
                                     f"Processed {self.items_processed} items "
-                                    f"(~{self.items_processed * len(prompts)} captions)"
+                                    f"(~{self.items_processed * 3} captions)"
                                 )
-                        except (
-                            websockets.exceptions.ConnectionClosed,
-                            websockets.exceptions.ConnectionClosedError,
-                            websockets.exceptions.ConnectionClosedOK,
-                        ) as e:
+                        except websockets.exceptions.ConnectionClosed as e:
                             logger.warning(f"Connection lost while sending result: {e}")
                             self.websocket = None
                             break
@@ -644,6 +675,7 @@ class VLLMWorker:
                                 "type": "heartbeat",
                                 "processed": self.items_processed,
                                 "failed": self.items_failed,
+                                "chunks_completed": self.chunks_completed,
                                 "current_chunk": (
                                     self.current_chunk.chunk_id if self.current_chunk else None
                                 ),
@@ -657,11 +689,7 @@ class VLLMWorker:
                         )
                     )
                 await asyncio.sleep(30)
-            except (
-                websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.ConnectionClosedError,
-                websockets.exceptions.ConnectionClosedOK,
-            ) as e:
+            except websockets.exceptions.ConnectionClosed as e:
                 logger.info(f"Connection lost during heartbeat: {e}")
                 self.websocket = None
                 break

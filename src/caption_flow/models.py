@@ -40,8 +40,9 @@ class Job:
 
 @dataclass
 class Caption:
-    """Generated caption with attribution."""
+    """Generated caption with attribution and image metadata."""
 
+    # Core fields
     job_id: str
     dataset: str
     shard: str
@@ -50,6 +51,18 @@ class Caption:
     contributor_id: str
     timestamp: datetime
     quality_score: Optional[float] = None
+
+    # Image metadata
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    image_format: Optional[str] = None
+    file_size: Optional[int] = None
+
+    # Processing metadata
+    caption_index: Optional[int] = None  # Which caption this is (0, 1, 2...)
+    total_captions: Optional[int] = None  # Total captions for this image
+    processing_time_ms: Optional[float] = None
+    chunk_id: Optional[str] = None
 
 
 @dataclass

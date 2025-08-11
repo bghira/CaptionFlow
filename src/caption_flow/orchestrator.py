@@ -1,14 +1,24 @@
-"""Orchestrator with proper chunk sizing and caption list handling."""
+"""Enhanced orchestrator with shard chunk assignment for vLLM workers.
+
+This orchestrator:
+1. Divides dataset shards into chunks for parallel processing
+2. Assigns chunks to workers on request
+3. Collects captions from workers centrally
+4. Manages checkpoints and fault tolerance
+"""
 
 import asyncio
 import json
 import logging
+import ssl
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Set, Optional, Any, List
-from collections import deque
+from typing import Dict, Set, Optional, Any, List, Deque
+from collections import deque, defaultdict
+import threading
+from queue import Queue, Empty
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -16,255 +26,335 @@ from websockets.server import WebSocketServerProtocol
 from .storage import StorageManager
 from .models import Caption, Contributor
 from .utils.auth import AuthManager
+from .utils.dataset_loader import DatasetLoader, ShardTracker
+from .utils.json_utils import safe_dict, safe_json_dumps, to_json_dict
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ShardChunk:
-    """A chunk of a shard assigned to a worker."""
+    """Represents a chunk of a shard for processing."""
 
     chunk_id: str
-    dataset: str
     shard_url: str
     shard_name: str
     start_index: int
     chunk_size: int
     assigned_to: Optional[str] = None
+    status: str = "pending"  # pending, assigned, completed, failed
     assigned_at: Optional[datetime] = None
-    completed_items: int = 0
-    status: str = "pending"
+    completed_at: Optional[datetime] = None
 
 
-@dataclass
-class ShardAssignment:
-    """Track which worker is processing which shard chunks."""
+class ChunkManager:
+    """Manages shard chunk creation and assignment."""
 
-    worker_id: str
-    chunks: List[ShardChunk] = field(default_factory=list)
-    items_processed: int = 0
-    items_failed: int = 0
+    def __init__(self, chunk_size: int = 1000):
+        self.chunk_size = chunk_size
+        self.chunks: Dict[str, ShardChunk] = {}
+        self.pending_chunks: Deque[str] = deque()
+        self.assigned_chunks: Dict[str, Set[str]] = defaultdict(set)  # worker_id -> chunk_ids
+        self.lock = threading.Lock()
+
+    def create_chunks_from_shard(
+        self, shard_url: str, shard_name: str, total_items: int
+    ) -> List[ShardChunk]:
+        """Create chunks from a shard."""
+        chunks = []
+
+        for start_idx in range(0, total_items, self.chunk_size):
+            chunk_id = f"{shard_name}_chunk_{start_idx}"
+            chunk = ShardChunk(
+                chunk_id=chunk_id,
+                shard_url=shard_url,
+                shard_name=shard_name,
+                start_index=start_idx,
+                chunk_size=min(self.chunk_size, total_items - start_idx),
+            )
+
+            with self.lock:
+                self.chunks[chunk_id] = chunk
+                self.pending_chunks.append(chunk_id)
+
+            chunks.append(chunk)
+
+        return chunks
+
+    def get_chunks_for_worker(self, worker_id: str, count: int = 1) -> List[ShardChunk]:
+        """Get available chunks for a worker."""
+        assigned = []
+
+        with self.lock:
+            while len(assigned) < count and self.pending_chunks:
+                chunk_id = self.pending_chunks.popleft()
+                chunk = self.chunks[chunk_id]
+
+                chunk.assigned_to = worker_id
+                chunk.status = "assigned"
+                chunk.assigned_at = datetime.utcnow()
+
+                self.assigned_chunks[worker_id].add(chunk_id)
+                assigned.append(chunk)
+
+        return assigned
+
+    def complete_chunk(self, chunk_id: str, worker_id: str) -> bool:
+        """Mark a chunk as completed."""
+        with self.lock:
+            if chunk_id in self.chunks:
+                chunk = self.chunks[chunk_id]
+                if chunk.assigned_to == worker_id and chunk.status == "assigned":
+                    chunk.status = "completed"
+                    chunk.completed_at = datetime.utcnow()
+                    self.assigned_chunks[worker_id].discard(chunk_id)
+                    return True
+        return False
+
+    def fail_chunk(self, chunk_id: str, worker_id: str) -> bool:
+        """Mark a chunk as failed and requeue it."""
+        with self.lock:
+            if chunk_id in self.chunks:
+                chunk = self.chunks[chunk_id]
+                if chunk.assigned_to == worker_id:
+                    chunk.status = "pending"
+                    chunk.assigned_to = None
+                    chunk.assigned_at = None
+                    self.assigned_chunks[worker_id].discard(chunk_id)
+                    self.pending_chunks.append(chunk_id)
+                    return True
+        return False
+
+    def release_worker_chunks(self, worker_id: str):
+        """Release all chunks assigned to a worker."""
+        with self.lock:
+            chunk_ids = list(self.assigned_chunks[worker_id])
+            for chunk_id in chunk_ids:
+                if chunk_id in self.chunks:
+                    chunk = self.chunks[chunk_id]
+                    if chunk.status == "assigned":
+                        chunk.status = "pending"
+                        chunk.assigned_to = None
+                        chunk.assigned_at = None
+                        self.pending_chunks.append(chunk_id)
+
+            del self.assigned_chunks[worker_id]
+
+    def get_stats(self) -> Dict[str, int]:
+        """Get chunk statistics."""
+        with self.lock:
+            stats = {
+                "total": len(self.chunks),
+                "pending": len(self.pending_chunks),
+                "assigned": sum(len(chunks) for chunks in self.assigned_chunks.values()),
+                "completed": sum(1 for c in self.chunks.values() if c.status == "completed"),
+                "failed": sum(1 for c in self.chunks.values() if c.status == "failed"),
+            }
+        return stats
 
 
 class Orchestrator:
-    """Orchestrator with configurable chunk sizing and caption list support."""
+    """Enhanced orchestrator for vLLM-based distributed captioning with chunk assignment."""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.host = config.get("host", "0.0.0.0")
         self.port = config.get("port", 8765)
 
-        # Dataset configuration with sensible defaults
+        # Dataset configuration
         self.dataset_config = config.get("dataset", {})
         self.dataset_path = self.dataset_config.get("path")
         self.dataset_type = self.dataset_config.get("type", "huggingface")
 
-        # Chunk configuration - CRITICAL for performance
-        self.chunk_size = self.dataset_config.get("chunk_size", 100)  # Default to small chunks
-        self.items_per_shard = self.dataset_config.get("items_per_shard", 3900)  # Estimated
-        self.readahead_chunks = self.dataset_config.get("readahead_chunks", 3)
-        self.chunk_timeout_minutes = self.dataset_config.get("chunk_timeout_minutes", 15)
+        # Chunk configuration
+        self.chunk_size = config.get("chunk_size", 1000)
+        self.chunks_per_request = config.get("chunks_per_request", 2)
 
-        logger.info(
-            f"Chunk configuration: size={self.chunk_size}, timeout={self.chunk_timeout_minutes}min"
-        )
-        logger.info(f"Expected chunks per shard: {self.items_per_shard // self.chunk_size}")
-
-        # Storage
+        # Initialize components
         storage_config = config.get("storage", {})
         self.storage = StorageManager(
             Path(storage_config.get("data_dir", "./caption_data")),
-            caption_buffer_size=storage_config.get("caption_buffer_size", 100),
+            caption_buffer_size=storage_config.get("caption_buffer_size", 1000),
+            job_buffer_size=storage_config.get("job_buffer_size", 100),
+            contributor_buffer_size=storage_config.get("contributor_buffer_size", 10),
         )
-
-        # Auth
         self.auth = AuthManager(config.get("auth", {}))
+        self.chunk_manager = ChunkManager(self.chunk_size)
 
-        # Shard management
-        self.all_shards: List[str] = []
-        self.shard_queue: deque = deque()
-        self.active_chunks: Dict[str, ShardChunk] = {}
-        self.completed_shards: Set[str] = set()
-        self.shard_progress: Dict[str, Dict] = {}  # Track per-shard progress
+        # Dataset components
+        self.dataset_loader = None
+        self.shard_tracker = None
+        if self.dataset_path:
+            self.dataset_loader = DatasetLoader(self.dataset_path, self.dataset_type)
+            checkpoint_dir = Path(config.get("storage", {}).get("checkpoint_dir", "./checkpoints"))
+            self.shard_tracker = ShardTracker(checkpoint_dir / "shards.json")
 
-        # Worker management
+        # Track connections
         self.workers: Dict[str, WebSocketServerProtocol] = {}
-        self.worker_assignments: Dict[str, ShardAssignment] = {}
         self.monitors: Set[WebSocketServerProtocol] = set()
+
+        # SSL configuration
+        self.ssl_context = self._setup_ssl()
 
         # Statistics
         self.stats = {
+            "total_chunks": 0,
+            "completed_chunks": 0,
+            "failed_chunks": 0,
+            "total_captions": 0,
+            "connected_workers": 0,
             "total_shards": 0,
             "completed_shards": 0,
-            "active_chunks": 0,
-            "pending_chunks": 0,
-            "total_items_processed": 0,
-            "total_captions": 0,
-            "total_unique_images": 0,  # Track unique images
-            "avg_captions_per_image": 0,  # Track average captions per image
-            "connected_workers": 0,
-            "avg_processing_time_ms": 0,
-            "items_per_minute": 0,
-            "captions_per_minute": 0,  # Track caption generation rate
-            "estimated_completion_hours": 0,
+            "current_shard": None,
+            "buffer_size": 0,
+            "total_written": 0,
+            "last_checkpoint": None,
         }
 
-        # Performance tracking
-        self.processing_start_time = None
-        self.last_stats_time = datetime.utcnow()
-        self.last_items_count = 0
-        self.last_captions_count = 0
+        # Shard processing state
+        self.all_shards = []
+        self.current_shard_index = 0
+        self.shard_lock = threading.Lock()
 
-    async def initialize(self):
-        """Initialize orchestrator and create chunks."""
-        await self.storage.initialize()
+        # Background chunk creation
+        self.chunk_creation_thread = None
+        self.stop_chunk_creation = threading.Event()
 
-        if self.dataset_path:
-            self.all_shards = await self._get_shard_urls()
-            self.stats["total_shards"] = len(self.all_shards)
+    def _setup_ssl(self) -> Optional[ssl.SSLContext]:
+        """Configure SSL if certificates are provided."""
+        ssl_config = self.config.get("ssl", {})
+        if not ssl_config.get("cert") or not ssl_config.get("key"):
+            return None
 
-            # Create chunks for all shards
-            await self._create_all_chunks()
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_cert_chain(ssl_config["cert"], ssl_config["key"])
+        return context
 
-            # Estimate completion time
-            total_items = len(self.all_shards) * self.items_per_shard
-            self.stats["total_estimated_items"] = total_items
+    def _create_chunks_from_dataset(self):
+        """Background thread to create chunks from dataset shards."""
+        if not self.dataset_loader:
+            logger.warning("No dataset configured, skipping chunk creation")
+            return
 
-            logger.info(
-                f"Initialized: {len(self.all_shards)} shards, "
-                f"~{total_items:,} items, "
-                f"{len(self.shard_queue)} chunks"
-            )
+        logger.info("Starting chunk creation thread")
 
-    async def _get_shard_urls(self) -> List[str]:
-        """Get list of shard URLs without opening them."""
-        if self.dataset_type == "huggingface":
-            from huggingface_hub import HfFileSystem, hf_hub_url
+        # Get all shards
+        self.all_shards = self.dataset_loader.get_shard_list()
+        remaining_shards = self.shard_tracker.get_remaining_shards(self.all_shards)
 
-            fs = HfFileSystem()
-            files = [
-                fs.resolve_path(p) for p in fs.glob(f"hf://datasets/{self.dataset_path}/**/*.tar")
-            ]
+        self.stats["total_shards"] = len(self.all_shards)
+        self.stats["completed_shards"] = len(self.all_shards) - len(remaining_shards)
 
-            urls = [hf_hub_url(f.repo_id, f.path_in_repo, repo_type="dataset") for f in files]
-            return sorted(urls)
+        logger.info(f"Total shards: {len(self.all_shards)}, " f"Remaining: {len(remaining_shards)}")
 
-        elif self.dataset_type == "local":
-            path = Path(self.dataset_path)
-            shards = list(path.glob("*.tar"))
-            return [str(s) for s in sorted(shards)]
+        for shard_url in remaining_shards:
+            if self.stop_chunk_creation.is_set():
+                break
 
-        return []
-
-    async def _create_all_chunks(self):
-        """Create all chunks for all shards upfront."""
-        for shard_url in self.all_shards:
             shard_name = Path(shard_url).stem
+            self.stats["current_shard"] = shard_name
 
-            if shard_name in self.completed_shards:
-                continue
+            try:
+                # Count items in shard
+                item_count = 0
+                for _ in self.dataset_loader.iterate_shard(shard_url):
+                    item_count += 1
 
-            # Create multiple chunks per shard based on estimated size
-            num_chunks = max(1, self.items_per_shard // self.chunk_size)
+                logger.info(f"Shard {shard_name} has {item_count} items")
 
-            self.shard_progress[shard_name] = {
-                "total_chunks": num_chunks,
-                "completed_chunks": 0,
-                "total_items": 0,
-                "completed_items": 0,
-            }
-
-            for chunk_idx in range(num_chunks):
-                chunk = ShardChunk(
-                    chunk_id=f"{shard_name}_chunk_{chunk_idx}",
-                    dataset=self.dataset_path,
-                    shard_url=shard_url,
-                    shard_name=shard_name,
-                    start_index=chunk_idx * self.chunk_size,
-                    chunk_size=self.chunk_size,
-                    status="pending",
+                # Create chunks
+                chunks = self.chunk_manager.create_chunks_from_shard(
+                    shard_url, shard_name, item_count
                 )
 
-                self.shard_queue.append(chunk)
+                self.stats["total_chunks"] += len(chunks)
+                logger.info(f"Created {len(chunks)} chunks from shard {shard_name}")
 
-            logger.debug(f"Created {num_chunks} chunks for shard {shard_name}")
+            except Exception as e:
+                logger.error(f"Error processing shard {shard_name}: {e}")
 
-        self.stats["pending_chunks"] = len(self.shard_queue)
-        self.stats["total_chunks"] = len(self.shard_queue)
+        logger.info("Chunk creation thread finished")
 
     async def start(self):
         """Start the orchestrator server."""
-        logger.info(f"Starting orchestrator on {self.host}:{self.port}")
+        logger.info(f"Starting vLLM orchestrator on {self.host}:{self.port}")
 
-        await self.initialize()
+        # Load existing state
+        await self.storage.initialize()
+        await self._restore_state()
 
-        self.processing_start_time = datetime.utcnow()
+        # Start chunk creation thread if dataset is configured
+        if self.dataset_loader:
+            self.chunk_creation_thread = threading.Thread(
+                target=self._create_chunks_from_dataset, daemon=True
+            )
+            self.chunk_creation_thread.start()
 
         # Start background tasks
-        asyncio.create_task(self._stats_reporter())
+        asyncio.create_task(self._heartbeat_loop())
         asyncio.create_task(self._checkpoint_loop())
-        asyncio.create_task(self._reassignment_checker())
-        asyncio.create_task(self._performance_monitor())
+        asyncio.create_task(self._stats_update_loop())
 
         # Start WebSocket server
-        async with websockets.serve(self.handle_connection, self.host, self.port):
-            logger.info("Orchestrator ready for connections")
-            await asyncio.Future()
+        async with websockets.serve(
+            self.handle_connection, self.host, self.port, ssl=self.ssl_context
+        ):
+            logger.info("vLLM Orchestrator ready for connections")
+            await asyncio.Future()  # Run forever
 
     async def handle_connection(self, websocket: WebSocketServerProtocol):
         """Handle new WebSocket connection."""
         try:
+            # Authenticate
             auth_msg = await websocket.recv()
             auth_data = json.loads(auth_msg)
 
-            user_auth = self.auth.authenticate(auth_data.get("token"))
-            role = user_auth.role
-            if not role:
-                await websocket.send(json.dumps({"error": "Invalid token"}))
+            auth_ticket = self.auth.authenticate(auth_data.get("token"))
+            if not auth_ticket:
+                await websocket.send(safe_json_dumps({"error": "Invalid token"}))
                 return
 
-            if role == "worker":
+            # Route by role
+            if auth_ticket.role == "worker":
                 await self._handle_worker(websocket, auth_data)
-            elif role == "monitor":
+            elif auth_ticket.role == "monitor":
                 await self._handle_monitor(websocket)
             else:
-                await websocket.send(json.dumps({"error": "Unauthorized role"}))
-                await websocket.close()
-                return
+                await websocket.send(safe_json_dumps({"error": "Unknown role"}))
 
         except Exception as e:
             logger.error(f"Connection error: {e}")
             await websocket.close()
 
     async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_data: Dict):
-        """Handle worker connection."""
+        """Handle worker connection lifecycle."""
         worker_id = auth_data.get("name", str(uuid.uuid4()))
         self.workers[worker_id] = websocket
-        self.worker_assignments[worker_id] = ShardAssignment(worker_id=worker_id)
         self.stats["connected_workers"] = len(self.workers)
 
+        # Register contributor
+        contributor = Contributor(
+            contributor_id=worker_id, name=worker_id, total_captions=0, trust_level=1
+        )
+        await self.storage.save_contributor(contributor)
+
         logger.info(f"Worker {worker_id} connected")
+        await self._broadcast_stats()
 
         try:
-            # Send welcome with configuration
-            await websocket.send(
-                json.dumps(
-                    {
-                        "type": "welcome",
-                        "worker_id": worker_id,
-                        "config": {
-                            "chunk_size": self.chunk_size,
-                            "dataset_type": self.dataset_type,
-                            "timeout_minutes": self.chunk_timeout_minutes,
-                        },
-                    }
-                )
-            )
+            # Send welcome message with dataset configuration
+            welcome_message = {
+                "type": "welcome",
+                "worker_id": worker_id,
+                "dataset_config": {
+                    "dataset_path": self.dataset_path,
+                    "dataset_type": self.dataset_type,
+                    "path": self.dataset_path,  # For compatibility
+                    "type": self.dataset_type,  # For compatibility
+                },
+            }
+            await websocket.send(safe_json_dumps(welcome_message))
 
-            # Immediately assign chunks
-            await self._assign_chunks_to_worker(worker_id)
-
-            # Process messages
             async for message in websocket:
                 data = json.loads(message)
                 await self._process_worker_message(worker_id, data)
@@ -273,331 +363,135 @@ class Orchestrator:
             logger.info(f"Worker {worker_id} disconnected")
         finally:
             del self.workers[worker_id]
-            await self._handle_worker_disconnect(worker_id)
             self.stats["connected_workers"] = len(self.workers)
-
-    async def _assign_chunks_to_worker(self, worker_id: str):
-        """Assign chunks to worker."""
-        assignment = self.worker_assignments.get(worker_id)
-        if not assignment:
-            return
-
-        # Count active chunks
-        active_chunks = len([c for c in assignment.chunks if c.status == "processing"])
-
-        # Assign up to readahead_chunks
-        chunks_to_assign = min(self.readahead_chunks - active_chunks, len(self.shard_queue))
-
-        if chunks_to_assign <= 0:
-            return
-
-        assigned = []
-        for _ in range(chunks_to_assign):
-            if not self.shard_queue:
-                break
-
-            chunk = self.shard_queue.popleft()
-            chunk.assigned_to = worker_id
-            chunk.assigned_at = datetime.utcnow()
-            chunk.status = "processing"
-
-            assignment.chunks.append(chunk)
-            self.active_chunks[chunk.chunk_id] = chunk
-            assigned.append(chunk)
-
-        if assigned:
-            # Send assignment
-            await self.workers[worker_id].send(
-                json.dumps(
-                    {
-                        "type": "shard_assignment",
-                        "chunks": [
-                            {
-                                "chunk_id": c.chunk_id,
-                                "shard_url": c.shard_url,
-                                "shard_name": c.shard_name,
-                                "start_index": c.start_index,
-                                "chunk_size": c.chunk_size,
-                            }
-                            for c in assigned
-                        ],
-                    }
-                )
-            )
-
-            logger.info(f"Assigned {len(assigned)} chunks to {worker_id}")
-            self.stats["active_chunks"] = len(self.active_chunks)
-            self.stats["pending_chunks"] = len(self.shard_queue)
+            self.chunk_manager.release_worker_chunks(worker_id)
+            await self._broadcast_stats()
 
     async def _process_worker_message(self, worker_id: str, data: Dict):
         """Process message from worker."""
         msg_type = data.get("type")
 
         if msg_type == "request_chunks":
-            await self._assign_chunks_to_worker(worker_id)
+            count = data.get("count", self.chunks_per_request)
+            chunks = self.chunk_manager.get_chunks_for_worker(worker_id, count)
 
-        elif msg_type == "submit_captions":  # Changed from submit_caption to handle lists
-            # Process multiple captions submission
-            captions = data.get("captions", [])
-            if isinstance(captions, str):
-                # unpack json?
-                try:
-                    captions = json.loads(captions)
-                except json.JSONDecodeError:
-                    logger.error(f"Invalid JSON in captions for worker {worker_id}")
-                    return
+            if chunks:
+                # Only send the fields that worker expects
+                # Worker's ShardChunk doesn't need tracking fields like assigned_to, status, etc.
+                chunk_data = []
+                for chunk in chunks:
+                    chunk_data.append(
+                        {
+                            "chunk_id": chunk.chunk_id,
+                            "shard_url": chunk.shard_url,
+                            "shard_name": chunk.shard_name,
+                            "start_index": chunk.start_index,
+                            "chunk_size": chunk.chunk_size,
+                        }
+                    )
 
-            if not isinstance(captions, list):
-                logger.error(
-                    f"Expected list of captions, got {type(captions)} for worker {worker_id}"
+                await self.workers[worker_id].send(
+                    safe_json_dumps({"type": "shard_assignment", "chunks": chunk_data})
                 )
-                return
-            caption_count = data.get("caption_count", len(captions))
-
-            if not captions:
-                logger.warning(f"Received empty captions list for item {data.get('item_key')}")
-                return
-
-            # Create a single caption entry with list of captions
-            caption_data = {
-                "job_id": f"{data['shard']}_{data['item_key']}",
-                "dataset": data["dataset"],
-                "shard": data["shard"],
-                "item_key": data["item_key"],
-                "captions": captions,  # Store as list
-                "caption_count": caption_count,
-                "contributor_id": worker_id,
-                "timestamp": datetime.utcnow(),
-                "quality_scores": None,  # Could be populated if we have quality metrics
-                "image_width": data.get("image_width"),
-                "image_height": data.get("image_height"),
-                "image_format": data.get("image_format"),
-                "file_size": data.get("file_size"),
-                "processing_time_ms": data.get("processing_time_ms"),
-            }
-
-            # logger.info(f"Received caption data: {caption_data}")
-            await self.storage.save_captions(caption_data)
-
-            # Update statistics
-            self.stats["total_items_processed"] += 1
-            self.stats["total_captions"] += caption_count  # Add all captions in the list
-            self.stats["total_unique_images"] = self.stats["total_items_processed"]
-
-            # Calculate average captions per image
-            if self.stats["total_unique_images"] > 0:
-                self.stats["avg_captions_per_image"] = (
-                    self.stats["total_captions"] / self.stats["total_unique_images"]
-                )
-
-            # Update chunk progress
-            chunk_id = data.get("chunk_id")
-            if chunk_id in self.active_chunks:
-                chunk = self.active_chunks[chunk_id]
-                chunk.completed_items += 1
-
-                # Update shard progress
-                if chunk.shard_name in self.shard_progress:
-                    self.shard_progress[chunk.shard_name]["completed_items"] += 1
-
-                # Check if chunk is complete
-                if chunk.completed_items >= chunk.chunk_size:
-                    await self._complete_chunk(chunk_id)
-
-            # Update processing rate
-            self._update_processing_rate()
-
-            # Log progress periodically
-            if self.stats["total_items_processed"] % 100 == 0:
-                logger.info(
-                    f"Progress: {self.stats['total_items_processed']} images, "
-                    f"{self.stats['total_captions']} captions "
-                    f"(avg {self.stats['avg_captions_per_image']:.1f} captions/image)"
-                )
+                logger.info(f"Assigned {len(chunks)} chunks to worker {worker_id}")
+            else:
+                await self.workers[worker_id].send(safe_json_dumps({"type": "no_chunks"}))
 
         elif msg_type == "chunk_complete":
-            await self._complete_chunk(data["chunk_id"])
+            chunk_id = data["chunk_id"]
+            if self.chunk_manager.complete_chunk(chunk_id, worker_id):
+                self.stats["completed_chunks"] += 1
+                logger.info(f"Chunk {chunk_id} completed by worker {worker_id}")
+                await self._check_shard_completion(chunk_id)
 
         elif msg_type == "chunk_failed":
-            await self._handle_chunk_failure(data["chunk_id"], data.get("error", "Unknown"))
+            chunk_id = data["chunk_id"]
+            error = data.get("error", "Unknown error")
+            if self.chunk_manager.fail_chunk(chunk_id, worker_id):
+                self.stats["failed_chunks"] += 1
+                logger.warning(f"Chunk {chunk_id} failed on worker {worker_id}: {error}")
+
+        elif msg_type == "submit_captions":
+            await self._handle_captions_submission(worker_id, data)
 
         elif msg_type == "heartbeat":
-            assignment = self.worker_assignments.get(worker_id)
-            if assignment:
-                assignment.items_processed = data.get("processed", 0)
-                assignment.items_failed = data.get("failed", 0)
+            # Update worker stats
+            logger.debug(f"Heartbeat from {worker_id}: {data}")
 
-    async def _complete_chunk(self, chunk_id: str):
-        """Mark chunk as complete."""
-        if chunk_id not in self.active_chunks:
-            return
+    async def _handle_captions_submission(self, worker_id: str, data: Dict):
+        """Process multiple captions submission from worker."""
+        chunk_id = data.get("chunk_id")
+        item_key = data["item_key"]
+        captions_list = data["captions"]
 
-        chunk = self.active_chunks[chunk_id]
-        chunk.status = "completed"
+        logger.debug(
+            f"Received {len(captions_list)} captions for item {item_key} from worker {worker_id}"
+        )
 
-        # Update shard progress
-        if chunk.shard_name in self.shard_progress:
-            progress = self.shard_progress[chunk.shard_name]
-            progress["completed_chunks"] += 1
-
-            # Check if shard is complete
-            if progress["completed_chunks"] >= progress["total_chunks"]:
-                self.completed_shards.add(chunk.shard_name)
-                self.stats["completed_shards"] += 1
-                logger.info(f"Shard {chunk.shard_name} fully completed!")
-
-        logger.info(f"Chunk {chunk_id} completed ({chunk.completed_items} items)")
-
-        del self.active_chunks[chunk_id]
-        self.stats["active_chunks"] = len(self.active_chunks)
-
-        # Assign new chunk
-        if chunk.assigned_to in self.workers:
-            await self._assign_chunks_to_worker(chunk.assigned_to)
-
-    async def _handle_chunk_failure(self, chunk_id: str, error: str):
-        """Handle chunk failure."""
-        logger.error(f"Chunk {chunk_id} failed: {error}")
-
-        if chunk_id in self.active_chunks:
-            chunk = self.active_chunks[chunk_id]
-
-            # Reset and requeue
-            chunk.status = "pending"
-            chunk.assigned_to = None
-            chunk.assigned_at = None
-            chunk.completed_items = 0
-
-            self.shard_queue.append(chunk)
-            del self.active_chunks[chunk_id]
-
-            self.stats["active_chunks"] = len(self.active_chunks)
-            self.stats["pending_chunks"] = len(self.shard_queue)
-
-    async def _handle_worker_disconnect(self, worker_id: str):
-        """Handle worker disconnection."""
-        assignment = self.worker_assignments.get(worker_id)
-        if not assignment:
-            return
-
-        # Requeue active chunks
-        for chunk in assignment.chunks:
-            if chunk.status == "processing" and chunk.chunk_id in self.active_chunks:
-                logger.info(f"Requeuing chunk {chunk.chunk_id}")
-                await self._handle_chunk_failure(chunk.chunk_id, "Worker disconnected")
-
-        del self.worker_assignments[worker_id]
-
-    async def _reassignment_checker(self):
-        """Check for stuck chunks and reassign."""
-        while True:
-            await asyncio.sleep(60)
-
-            now = datetime.utcnow()
-            timeout = timedelta(minutes=self.chunk_timeout_minutes)
-
-            for chunk_id, chunk in list(self.active_chunks.items()):
-                if chunk.assigned_at:
-                    age = now - chunk.assigned_at
-                    if age > timeout and chunk.status == "processing":
-                        logger.warning(
-                            f"Chunk {chunk_id} timed out after {age.total_seconds()/60:.1f} minutes"
-                        )
-                        await self._handle_chunk_failure(chunk_id, "Timeout")
-
-    def _update_processing_rate(self):
-        """Update items and captions per minute calculation."""
-        now = datetime.utcnow()
-        time_delta = (now - self.last_stats_time).total_seconds()
-
-        if time_delta > 10:  # Update every 10 seconds
-            items_delta = self.stats["total_items_processed"] - self.last_items_count
-            captions_delta = self.stats["total_captions"] - self.last_captions_count
-
-            items_per_second = items_delta / time_delta if time_delta > 0 else 0
-            captions_per_second = captions_delta / time_delta if time_delta > 0 else 0
-
-            self.stats["items_per_minute"] = round(items_per_second * 60, 1)
-            self.stats["captions_per_minute"] = round(captions_per_second * 60, 1)
-
-            # Estimate completion time
-            remaining_items = (
-                self.stats.get("total_estimated_items", 0) - self.stats["total_items_processed"]
+        # Create caption records for each caption
+        for idx, caption_text in enumerate(captions_list):
+            caption = Caption(
+                job_id=f"{chunk_id}_{item_key}_{idx}",  # Unique ID for each caption
+                dataset=data.get("dataset"),
+                shard=data.get("shard"),
+                item_key=item_key,
+                caption=caption_text,
+                contributor_id=worker_id,
+                timestamp=datetime.utcnow(),
+                quality_score=None,
+                # Image metadata
+                image_width=data.get("image_width"),
+                image_height=data.get("image_height"),
+                image_format=data.get("image_format"),
+                file_size=data.get("file_size"),
+                # Processing metadata
+                caption_index=idx,
+                total_captions=len(captions_list),
+                processing_time_ms=data.get("processing_time_ms"),
+                chunk_id=chunk_id,
             )
-            if items_per_second > 0:
-                remaining_hours = remaining_items / (items_per_second * 3600)
-                self.stats["estimated_completion_hours"] = round(remaining_hours, 1)
 
-            self.last_stats_time = now
-            self.last_items_count = self.stats["total_items_processed"]
-            self.last_captions_count = self.stats["total_captions"]
+            # Add to central storage buffer
+            await self.storage.save_caption(caption)
 
-    async def _performance_monitor(self):
-        """Monitor performance and alert on issues."""
-        while True:
-            await asyncio.sleep(60)
+        # Update statistics
+        self.stats["total_captions"] += len(captions_list)
+        self.stats["buffer_size"] = len(self.storage.caption_buffer)
 
-            # Check processing rate
-            min_rate = self.config.get("monitoring", {}).get("min_items_per_minute", 20)
-            if self.stats["items_per_minute"] < min_rate and self.stats["connected_workers"] > 0:
-                logger.warning(
-                    f"Processing rate low: {self.stats['items_per_minute']:.1f} items/min "
-                    f"(expected > {min_rate})"
-                )
+        # Update contributor stats
+        contributor = await self.storage.get_contributor(worker_id)
+        if contributor:
+            contributor.total_captions += len(captions_list)
+            await self.storage.save_contributor(contributor)
 
-            # Log progress
-            if self.stats["total_chunks"] > 0:
-                progress = (
-                    (
-                        self.stats["total_chunks"]
-                        - self.stats["pending_chunks"]
-                        - self.stats["active_chunks"]
-                    )
-                    / self.stats["total_chunks"]
-                    * 100
-                )
-                logger.info(
-                    f"Progress: {progress:.1f}%, "
-                    f"Images: {self.stats['items_per_minute']:.1f}/min, "
-                    f"Captions: {self.stats['captions_per_minute']:.1f}/min, "
-                    f"Avg captions/image: {self.stats['avg_captions_per_image']:.1f}, "
-                    f"ETA: {self.stats['estimated_completion_hours']:.1f} hours"
-                )
+        # Broadcast updated stats
+        await self._broadcast_stats()
 
-    async def _checkpoint_loop(self):
-        """Periodic checkpointing."""
-        while True:
-            await asyncio.sleep(60)
+        # Log progress periodically
+        if self.stats["total_captions"] % 100 == 0:
+            logger.info(f"Collected {self.stats['total_captions']} captions centrally")
 
-            if self.storage.caption_buffer:
-                await self.storage.checkpoint()
-                stats = await self.storage.get_caption_stats()
-                logger.info(
-                    f"Checkpoint: {stats['total_rows']} images, "
-                    f"{stats['total_captions']} captions "
-                    f"(avg {stats['avg_captions_per_image']:.1f} per image)"
-                )
+    async def _check_shard_completion(self, chunk_id: str):
+        """Check if a shard is complete after chunk completion."""
+        # Extract shard name from chunk_id
+        shard_name = chunk_id.rsplit("_chunk_", 1)[0]
 
-    async def _stats_reporter(self):
-        """Report statistics."""
-        while True:
-            await asyncio.sleep(30)
+        # Check if all chunks for this shard are complete
+        chunk_stats = self.chunk_manager.get_stats()
+        shard_chunks = [
+            cid
+            for cid, chunk in self.chunk_manager.chunks.items()
+            if chunk.shard_name == shard_name
+        ]
 
-            if self.monitors:
-                await self._broadcast_stats()
+        completed_chunks = [
+            cid for cid in shard_chunks if self.chunk_manager.chunks[cid].status == "completed"
+        ]
 
-    async def _broadcast_stats(self):
-        """Broadcast stats to monitors."""
-        message = json.dumps({"type": "stats", "data": self.stats})
-
-        disconnected = set()
-        for monitor in self.monitors:
-            try:
-                await monitor.send(message)
-            except:
-                disconnected.add(monitor)
-
-        self.monitors -= disconnected
+        if len(completed_chunks) == len(shard_chunks):
+            logger.info(f"Shard {shard_name} complete!")
+            self.shard_tracker.mark_complete(shard_name)
+            self.stats["completed_shards"] += 1
 
     async def _handle_monitor(self, websocket: WebSocketServerProtocol):
         """Handle monitor connection."""
@@ -605,8 +499,22 @@ class Orchestrator:
         logger.info("Monitor connected")
 
         try:
-            await websocket.send(json.dumps({"type": "stats", "data": self.stats}))
+            # Send initial stats
+            await websocket.send(safe_json_dumps({"type": "stats", "data": self.stats}))
 
+            # Send chunk stats
+            chunk_stats = self.chunk_manager.get_stats()
+            await websocket.send(safe_json_dumps({"type": "chunk_stats", "data": chunk_stats}))
+
+            # Send contributor leaderboard
+            contributors = await self.storage.get_top_contributors(10)
+            await websocket.send(
+                safe_json_dumps(
+                    {"type": "leaderboard", "data": [safe_dict(c) for c in contributors]}
+                )
+            )
+
+            # Keep connection alive
             async for _ in websocket:
                 pass
 
@@ -615,26 +523,111 @@ class Orchestrator:
         finally:
             self.monitors.discard(websocket)
 
+    async def _broadcast_stats(self):
+        """Broadcast statistics to all monitors."""
+        if not self.monitors:
+            return
+
+        # Include chunk stats
+        chunk_stats = self.chunk_manager.get_stats()
+        self.stats.update({f"chunks_{k}": v for k, v in chunk_stats.items()})
+
+        message = safe_json_dumps({"type": "stats", "data": self.stats})
+
+        # Send to all monitors
+        disconnected = set()
+        for monitor in self.monitors:
+            try:
+                await monitor.send(message)
+            except websockets.exceptions.ConnectionClosed:
+                disconnected.add(monitor)
+
+        # Clean up disconnected monitors
+        self.monitors -= disconnected
+
+    async def _heartbeat_loop(self):
+        """Send periodic heartbeats to maintain connections."""
+        while True:
+            await asyncio.sleep(30)
+
+            # Ping workers
+            disconnected = []
+            for worker_id, ws in self.workers.items():
+                try:
+                    await ws.ping()
+                except:
+                    disconnected.append(worker_id)
+
+            # Clean up disconnected workers
+            for worker_id in disconnected:
+                if worker_id in self.workers:
+                    del self.workers[worker_id]
+                    self.chunk_manager.release_worker_chunks(worker_id)
+
+    async def _checkpoint_loop(self):
+        """Periodically checkpoint storage."""
+        interval = self.config.get("storage", {}).get("checkpoint_interval", 1000)
+
+        while True:
+            await asyncio.sleep(60)
+
+            # Force checkpoint at regular intervals
+            if self.stats["total_captions"] > 0 and self.stats["total_captions"] % interval == 0:
+                logger.info(f"Triggering checkpoint at {self.stats['total_captions']} captions")
+                await self.storage.checkpoint()
+
+                # Update stats
+                self.stats["last_checkpoint"] = datetime.utcnow().isoformat()
+                self.stats["total_written"] = self.storage.total_captions_written
+                self.stats["buffer_size"] = len(self.storage.caption_buffer)
+
+                await self._broadcast_stats()
+                logger.info(
+                    f"Checkpoint complete. Total written to disk: {self.stats['total_written']}"
+                )
+
+    async def _stats_update_loop(self):
+        """Periodically update and broadcast stats."""
+        while True:
+            await asyncio.sleep(10)
+
+            # Update chunk stats
+            chunk_stats = self.chunk_manager.get_stats()
+            self.stats["total_chunks"] = chunk_stats["total"]
+            self.stats["completed_chunks"] = chunk_stats["completed"]
+            self.stats["failed_chunks"] = chunk_stats["failed"]
+
+            await self._broadcast_stats()
+
+    async def _restore_state(self):
+        """Restore state from storage on startup."""
+        # Update statistics
+        self.stats["total_captions"] = await self.storage.count_captions()
+
+        logger.info(f"Restored state: {self.stats['total_captions']} captions")
+
     async def shutdown(self):
-        """Shutdown orchestrator."""
+        """Graceful shutdown."""
         logger.info("Shutting down orchestrator...")
 
-        # Close all worker connections
-        for worker in self.workers.values():
-            await worker.close()
+        # Stop chunk creation
+        self.stop_chunk_creation.set()
+        if self.chunk_creation_thread:
+            self.chunk_creation_thread.join(timeout=5)
 
-        # Close monitors
-        for monitor in self.monitors:
-            await monitor.close()
+        # Close all connections
+        for ws in list(self.workers.values()):
+            await ws.close()
+        for ws in list(self.monitors):
+            await ws.close()
 
         # Final checkpoint
+        logger.info(f"Final flush: {len(self.storage.caption_buffer)} captions in buffer")
         await self.storage.checkpoint()
-        stats = await self.storage.get_caption_stats()
+
+        # Log final statistics
         logger.info(
-            f"Final checkpoint: {stats['total_rows']} images with "
-            f"{stats['total_captions']} total captions "
-            f"(avg {stats['avg_captions_per_image']:.1f} captions per image)"
+            f"Shutdown complete. Total captions collected: {self.storage.total_captions_written}"
         )
 
-        logger.info("Orchestrator shutdown complete.")
-        await asyncio.sleep(1)  # Allow time for cleanup
+        await self.storage.close()

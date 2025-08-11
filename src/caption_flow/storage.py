@@ -46,6 +46,7 @@ class StorageManager:
         self.contributor_buffer_size = contributor_buffer_size
 
         # Track existing job_ids to prevent duplicates
+        self.existing_contributor_ids: Set[str] = set()
         self.existing_caption_job_ids: Set[str] = set()
         self.existing_job_ids: Set[str] = set()
 
@@ -209,6 +210,27 @@ class StorageManager:
         # Log buffer status
         logger.debug(f"Caption buffer size: {len(self.caption_buffer)}/{self.caption_buffer_size}")
         logger.debug(f"  Added captions for {job_id}: {len(captions)} captions")
+
+        # Flush if buffer is large enough
+        if len(self.caption_buffer) >= self.caption_buffer_size:
+            await self._flush_captions()
+
+    async def save_caption(self, caption: Caption):
+        """Save a single caption entry."""
+        # Convert to dict and ensure it's a list of captions
+        caption_dict = asdict(caption)
+        if "captions" in caption_dict and not isinstance(caption_dict["captions"], list):
+            caption_dict["captions"] = [caption_dict["captions"]]
+        elif "caption" in caption_dict and isinstance(caption_dict["caption"], str):
+            # If it's a single caption string, wrap it in a list
+            caption_dict["captions"] = [caption_dict["caption"]]
+            del caption_dict["caption"]
+
+        # Add to buffer
+        self.caption_buffer.append(caption_dict)
+
+        # Log buffer status
+        logger.debug(f"Caption buffer size: {len(self.caption_buffer)}/{self.caption_buffer_size}")
 
         # Flush if buffer is large enough
         if len(self.caption_buffer) >= self.caption_buffer_size:
@@ -568,6 +590,97 @@ class StorageManager:
 
         table = pq.read_table(self.captions_path)
         return len(table)
+
+    async def get_contributor(self, contributor_id: str) -> Optional[Contributor]:
+        """Retrieve a contributor by ID."""
+        # Check buffer first
+        for buffered in self.contributor_buffer:
+            if buffered["contributor_id"] == contributor_id:
+                return Contributor(**buffered)
+
+        if not self.contributors_path.exists():
+            return None
+
+        table = pq.read_table(self.contributors_path)
+        df = table.to_pandas()
+
+        row = df[df["contributor_id"] == contributor_id]
+        if row.empty:
+            return None
+
+        return Contributor(
+            contributor_id=row.iloc[0]["contributor_id"],
+            name=row.iloc[0]["name"],
+            total_captions=int(row.iloc[0]["total_captions"]),
+            trust_level=int(row.iloc[0]["trust_level"]),
+        )
+
+    async def get_top_contributors(self, limit: int = 10) -> List[Contributor]:
+        """Get top contributors by caption count."""
+        contributors = []
+
+        if self.contributors_path.exists():
+            table = pq.read_table(self.contributors_path)
+            df = table.to_pandas()
+
+            # Sort by total_captions descending
+            df = df.sort_values("total_captions", ascending=False).head(limit)
+
+            for _, row in df.iterrows():
+                contributors.append(
+                    Contributor(
+                        contributor_id=row["contributor_id"],
+                        name=row["name"],
+                        total_captions=int(row["total_captions"]),
+                        trust_level=int(row["trust_level"]),
+                    )
+                )
+
+        return contributors
+
+    async def get_pending_jobs(self) -> List[Job]:
+        """Get all pending jobs for restoration on startup."""
+        if not self.jobs_path.exists():
+            return []
+
+        table = pq.read_table(self.jobs_path)
+        df = table.to_pandas()
+
+        # Get jobs with PENDING or PROCESSING status
+        pending_df = df[df["status"].isin([JobStatus.PENDING.value, JobStatus.PROCESSING.value])]
+
+        jobs = []
+        for _, row in pending_df.iterrows():
+            jobs.append(
+                Job(
+                    job_id=row["job_id"],
+                    dataset=row["dataset"],
+                    shard=row["shard"],
+                    item_key=row["item_key"],
+                    status=JobStatus(row["status"]),
+                    assigned_to=row.get("assigned_to"),
+                    created_at=row["created_at"],
+                )
+            )
+
+        return jobs
+
+    async def count_jobs(self) -> int:
+        """Count total jobs."""
+        if not self.jobs_path.exists():
+            return 0
+
+        table = pq.read_table(self.jobs_path)
+        return len(table)
+
+    async def count_completed_jobs(self) -> int:
+        """Count completed jobs."""
+        if not self.jobs_path.exists():
+            return 0
+
+        table = pq.read_table(self.jobs_path)
+        df = table.to_pandas()
+        return len(df[df["status"] == JobStatus.COMPLETED.value])
 
     async def close(self):
         """Close storage and flush buffers."""
