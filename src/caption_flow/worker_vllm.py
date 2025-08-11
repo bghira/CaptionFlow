@@ -75,19 +75,6 @@ class ProcessedResult:
     processing_time_ms: float
 
 
-@dataclass
-class InferenceConfig:
-    """Configuration for vLLM inference."""
-
-    gpu_id: int = 0
-    precision: str = "fp16"
-    batch_size: int = 8
-    coalesce_ms: int = 30
-    max_retries: int = 3
-    model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
-    temperature: float = 0.7
-
-
 class VLLMWorker:
     """Worker that processes shard chunks directly with proper reconnection."""
 
@@ -103,16 +90,12 @@ class VLLMWorker:
         self.dataset_type = None
         self.hf_token = get_token()
 
-        # vLLM configuration
-        self.inference_config = InferenceConfig(
-            gpu_id=config.get("gpu_id", 0),
-            precision=config.get("precision", "fp16"),
-            batch_size=config.get("batch_size", 8),
-            coalesce_ms=config.get("coalesce_ms", 30),
-            max_retries=config.get("max_retries", 3),
-            model_name=config.get("model", "Qwen/Qwen2.5-VL-3B-Instruct"),
-            temperature=config.get("temperature", 0.7),
-        )
+        # vLLM configuration will be received from orchestrator
+        self.vllm_config = None
+        self.inference_prompts = None
+
+        # Backward compatibility: local config for GPU selection
+        self.gpu_id = config.get("gpu_id", 0)
 
         # SSL configuration
         self.ssl_context = self._setup_ssl()
@@ -180,40 +163,46 @@ class VLLMWorker:
 
     def _setup_vllm(self):
         """Initialize vLLM components."""
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.inference_config.gpu_id)
+        if not self.vllm_config:
+            raise RuntimeError("vLLM config not received from orchestrator")
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
 
         from vllm import LLM, SamplingParams
         from transformers import AutoTokenizer, AutoProcessor
 
-        logger.info(
-            f"Loading {self.inference_config.model_name} on GPU {self.inference_config.gpu_id}"
-        )
+        model_name = self.vllm_config["model"]
+        logger.info(f"Loading {model_name} on GPU {self.gpu_id}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.inference_config.model_name, trust_remote_code=True, use_fast=True
+            model_name, trust_remote_code=True, use_fast=True
         )
-        self.processor = AutoProcessor.from_pretrained(self.inference_config.model_name)
+        self.processor = AutoProcessor.from_pretrained(model_name)
 
-        # Initialize LLM with optimized settings
+        # Initialize LLM with settings from orchestrator
         self.llm = LLM(
-            model=self.inference_config.model_name,
+            model=model_name,
             trust_remote_code=True,
-            tensor_parallel_size=1,
-            max_model_len=16384,
-            enforce_eager=True,
-            gpu_memory_utilization=0.92,
-            dtype="float16",
-            limit_mm_per_prompt={"image": 1},
-            disable_mm_preprocessor_cache=True,
+            tensor_parallel_size=self.vllm_config.get("tensor_parallel_size", 1),
+            max_model_len=self.vllm_config.get("max_model_len", 16384),
+            enforce_eager=self.vllm_config.get("enforce_eager", True),
+            gpu_memory_utilization=self.vllm_config.get("gpu_memory_utilization", 0.92),
+            dtype=self.vllm_config.get("dtype", "float16"),
+            limit_mm_per_prompt=self.vllm_config.get("limit_mm_per_prompt", {"image": 1}),
+            disable_mm_preprocessor_cache=self.vllm_config.get(
+                "disable_mm_preprocessor_cache", True
+            ),
         )
 
+        # Create sampling params from orchestrator config
+        sampling_config = self.vllm_config.get("sampling", {})
         self.sampling_params = SamplingParams(
-            temperature=self.inference_config.temperature,
-            top_p=0.95,
-            max_tokens=256,
-            stop=["<|end|>", "<|endoftext|>", "<|im_end|>"],
-            repetition_penalty=1.05,
-            skip_special_tokens=True,
+            temperature=sampling_config.get("temperature", 0.7),
+            top_p=sampling_config.get("top_p", 0.95),
+            max_tokens=sampling_config.get("max_tokens", 256),
+            stop=sampling_config.get("stop", ["<|end|>", "<|endoftext|>", "<|im_end|>"]),
+            repetition_penalty=sampling_config.get("repetition_penalty", 1.05),
+            skip_special_tokens=sampling_config.get("skip_special_tokens", True),
         )
 
         logger.info("vLLM initialization complete")
@@ -248,14 +237,26 @@ class VLLMWorker:
 
     async def start(self):
         """Start the worker with automatic reconnection."""
-        # Initialize vLLM once
+        self.running = True
+
+        # Wait for initial connection to get vLLM config
+        logger.info("Connecting to orchestrator for configuration...")
+
+        # Try initial connection to get config
+        config_received = False
+        while not config_received and self.running:
+            try:
+                await self._initial_connect_for_config()
+                config_received = True
+            except Exception as e:
+                logger.error(f"Failed to get config: {e}")
+                await asyncio.sleep(5)
+
+        # Initialize vLLM once we have config
         self._setup_vllm()
 
         # Capture the main event loop for use in background threads
         self.main_loop = asyncio.get_running_loop()
-
-        # Start background threads
-        self.running = True
 
         # Start shard reader thread
         reader_thread = Thread(target=self._shard_reader_thread, daemon=True)
@@ -294,6 +295,41 @@ class VLLMWorker:
                 # Exponential backoff
                 reconnect_delay = min(reconnect_delay * 2, max_delay)
 
+    async def _initial_connect_for_config(self):
+        """Connect initially just to get configuration."""
+        async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
+            # Authenticate
+            await websocket.send(json.dumps({"token": self.token, "name": self.name}))
+
+            # Wait for welcome message with config
+            welcome = await websocket.recv()
+            welcome_data = json.loads(welcome)
+
+            if "error" in welcome_data:
+                raise RuntimeError(f"Authentication failed: {welcome_data['error']}")
+
+            # Extract vLLM configuration
+            self.vllm_config = welcome_data.get("vllm_config")
+            if not self.vllm_config:
+                raise RuntimeError("No vLLM configuration received from orchestrator")
+
+            self.inference_prompts = self.vllm_config.get(
+                "inference_prompts",
+                [
+                    "describe this image in detail",
+                    "provide a comprehensive description of the visual content",
+                    "what are the key elements in this image?",
+                ],
+            )
+
+            # Extract dataset configuration
+            dataset_config = welcome_data.get("dataset_config", {})
+            if dataset_config:
+                self._setup_dataset_loader(dataset_config)
+
+            logger.info("Received configuration from orchestrator")
+            # Disconnect after getting config
+
     async def _connect_and_run(self):
         """Connect to orchestrator and process chunks."""
         logger.info(f"Connecting to {self.server_url}")
@@ -327,6 +363,15 @@ class VLLMWorker:
                 logger.info(f"Received dataset config: {dataset_config}")
             else:
                 logger.warning("No dataset configuration received from orchestrator")
+
+            # Update vLLM config if provided (in case it changed)
+            new_vllm_config = welcome_data.get("vllm_config")
+            if new_vllm_config and new_vllm_config != self.vllm_config:
+                logger.info("Received updated vLLM configuration")
+                self.vllm_config = new_vllm_config
+                self.inference_prompts = self.vllm_config.get(
+                    "inference_prompts", self.inference_prompts
+                )
 
             # Request initial chunks
             await websocket.send(json.dumps({"type": "request_chunks", "count": 2}))
@@ -577,7 +622,8 @@ class VLLMWorker:
                 self.current_chunk_progress = items_processed
 
                 # Batch items for inference
-                if self.readahead_queue.qsize() >= self.inference_config.batch_size:
+                batch_size = self.vllm_config.get("batch_size", 8)
+                if self.readahead_queue.qsize() >= batch_size:
                     self._batch_for_inference()
 
             except Exception as e:
@@ -595,9 +641,10 @@ class VLLMWorker:
     def _batch_for_inference(self):
         """Batch items from readahead queue for inference."""
         batch = []
+        batch_size = self.vllm_config.get("batch_size", 8)
 
         try:
-            while len(batch) < self.inference_config.batch_size:
+            while len(batch) < batch_size:
                 item = self.readahead_queue.get_nowait()
                 batch.append(item)
         except Empty:
@@ -609,12 +656,6 @@ class VLLMWorker:
     def _inference_thread(self):
         """Background thread for vLLM inference."""
         logger.info("Starting inference thread")
-
-        prompts = [
-            "describe this image in detail",
-            "provide a comprehensive description of the visual content",
-            "what are the key elements in this image?",
-        ]
 
         while self.running:
             try:
@@ -637,7 +678,7 @@ class VLLMWorker:
                     # Resize for consistency
                     item.image.thumbnail((512, 512), Image.BILINEAR)
 
-                    for prompt in prompts:
+                    for prompt in self.inference_prompts:
                         req = self._build_vllm_input(item.image, prompt)
                         requests.append(req)
 
@@ -648,10 +689,10 @@ class VLLMWorker:
                 if not self.should_stop_processing.is_set():
                     for i, item in enumerate(batch):
                         # Get all prompt outputs as a list
-                        idx = i * len(prompts)
+                        idx = i * len(self.inference_prompts)
                         captions = []
 
-                        for j in range(len(prompts)):
+                        for j in range(len(self.inference_prompts)):
                             if idx + j < len(outputs) and outputs[idx + j].outputs:
                                 caption_text = self._clean_output(outputs[idx + j].outputs[0].text)
                                 if caption_text:  # Only add non-empty captions
