@@ -71,3 +71,4 @@ datasets/
 .test_runner_state.json
 caption_data/
 checkpoints/
+config/
