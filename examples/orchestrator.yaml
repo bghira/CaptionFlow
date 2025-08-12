@@ -74,6 +74,8 @@ orchestrator:
         name: "NVIDIA 4090 2"
       - token: "worker-kappa-2024"
         name: "NVIDIA 4090 3"
+      - token: "example-worker-token"
+        name: "Example Worker Token"
     monitor_tokens:
       - token: "letmein"
         name: "Default demo Monitor user"
