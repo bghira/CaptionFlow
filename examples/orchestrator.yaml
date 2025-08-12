@@ -9,6 +9,10 @@ orchestrator:
   #  key: /etc/letsencrypt/live/caption.example.com/privkey.pem      # From generate-cert output
 
   # Dataset configuration - centrally managed by orchestrator
+  chunk_size: 1000 # Items per chunk
+  chunks_per_request: 2 # Chunks sent to worker at once
+  chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
+  min_chunk_buffer: 10 # Minimum chunks to keep ready
   dataset:
     type: "huggingface" # or "local"
     path: "NebulaeWis/e621-2024-webp-4Mpixel" # HF dataset path or local directory
@@ -18,7 +22,7 @@ orchestrator:
   # vLLM configuration - distributed to all workers
   vllm:
     # Model settings
-    model: "Qwen/Qwen2.5-VL-3B-Instruct"
+    model: "Qwen/Qwen2.5-VL-7B-Instruct"
     tensor_parallel_size: 1
     max_model_len: 16384
     dtype: "float16" # or "float32", "bfloat16"
@@ -59,12 +63,6 @@ orchestrator:
     job_buffer_size: 100
     contributor_buffer_size: 10
     checkpoint_dir: ./checkpoints
-
-  # Chunk processing settings
-  chunk_size: 1000 # Items per chunk
-  chunks_per_request: 2 # Chunks sent to worker at once
-  chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
-  min_chunk_buffer: 10 # Minimum chunks to keep ready
 
   auth:
     worker_tokens:
