@@ -1,11 +1,12 @@
-"""Command-line interface for CaptionFlow."""
+"""Command-line interface for CaptionFlow with smart configuration handling."""
 
 import asyncio
-import logging
 import json
+import logging
+import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 import click
 import yaml
@@ -21,6 +22,104 @@ from .utils.certificates import CertificateManager
 console = Console()
 
 
+class ConfigManager:
+    """Smart configuration discovery and management following XDG Base Directory spec."""
+
+    CONFIG_NAMES = {
+        "orchestrator": "orchestrator.yaml",
+        "worker": "worker.yaml",
+        "monitor": "monitor.yaml",
+    }
+
+    @classmethod
+    def get_xdg_config_home(cls) -> Path:
+        """Get XDG_CONFIG_HOME or default."""
+        xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        if xdg_config:
+            return Path(xdg_config)
+        return Path.home() / ".config"
+
+    @classmethod
+    def get_xdg_config_dirs(cls) -> List[Path]:
+        """Get XDG_CONFIG_DIRS or defaults."""
+        xdg_dirs = os.environ.get("XDG_CONFIG_DIRS", "/etc/xdg").split(":")
+        return [Path(d) for d in xdg_dirs]
+
+    @classmethod
+    def find_config(
+        cls, component: str, explicit_path: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find and load configuration for a component.
+
+        Search order:
+        1. Explicit path if provided
+        2. Current directory
+        3. ~/.caption-flow/<component_config>.yaml
+        4. $XDG_CONFIG_HOME/caption-flow/<component_config>.yaml
+        5. /etc/caption-flow/<component_config>.yaml (system-wide)
+        6. $XDG_CONFIG_DIRS/caption-flow/<component_config>.yaml
+        7. ./examples/<component_config>.yaml (fallback)
+        """
+        config_name = cls.CONFIG_NAMES.get(component, "config.yaml")
+
+        # If explicit path provided, use only that
+        if explicit_path:
+            path = Path(explicit_path)
+            if path.exists():
+                console.print(f"[dim]Using config: {path}[/dim]")
+                return cls.load_yaml(path)
+            console.print(f"[yellow]Config not found: {path}[/yellow]")
+            return None
+
+        # Search paths in order
+        search_paths = [
+            Path.cwd() / config_name,  # Current directory
+            Path.cwd() / "config" / config_name,  # Current directory / config subdir
+            Path.home() / ".caption-flow" / config_name,  # Home directory
+            cls.get_xdg_config_home() / "caption-flow" / config_name,  # XDG config home
+            Path("/etc/caption-flow") / config_name,  # System-wide
+        ]
+
+        # Add XDG config dirs
+        for xdg_dir in cls.get_xdg_config_dirs():
+            search_paths.append(xdg_dir / "caption-flow" / config_name)
+
+        # Fallback to examples
+        search_paths.append(Path("examples") / config_name)
+
+        # Try each path
+        for path in search_paths:
+            if path.exists():
+                console.print(f"[dim]Found config: {path}[/dim]")
+                return cls.load_yaml(path)
+
+        return None
+
+    @classmethod
+    def load_yaml(cls, path: Path) -> Optional[Dict[str, Any]]:
+        """Load and parse YAML config file."""
+        try:
+            with open(path) as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            console.print(f"[red]Error loading {path}: {e}[/red]")
+            return None
+
+    @classmethod
+    def merge_configs(cls, base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        """Deep merge override config into base config."""
+        result = base.copy()
+
+        for key, value in override.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = cls.merge_configs(result[key], value)
+            else:
+                result[key] = value
+
+        return result
+
+
 def setup_logging(verbose: bool = False):
     """Configure logging with rich handler."""
     level = logging.DEBUG if verbose else logging.INFO
@@ -33,143 +132,270 @@ def setup_logging(verbose: bool = False):
     )
 
 
+def apply_cli_overrides(config: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    """Apply CLI arguments as overrides to config, filtering out None values."""
+    overrides = {k: v for k, v in kwargs.items() if v is not None}
+    return ConfigManager.merge_configs(config, overrides)
+
+
 @click.group()
-@click.option("--config", type=click.Path(exists=True), help="Configuration file")
 @click.option("--verbose", is_flag=True, help="Enable verbose logging")
 @click.pass_context
-def main(ctx, config: Optional[str], verbose: bool):
+def main(ctx, verbose: bool):
     """CaptionFlow - Distributed community captioning system."""
     setup_logging(verbose)
-
-    if config:
-        with open(config) as f:
-            ctx.obj = yaml.safe_load(f)
-    else:
-        ctx.obj = {}
+    ctx.obj = {"verbose": verbose}
 
 
 @main.command()
-@click.option("--port", default=8765, help="WebSocket server port")
-@click.option("--host", default="0.0.0.0", help="Bind address")
-@click.option("--data-dir", default="./caption_data", help="Storage directory")
+@click.option("--config", type=click.Path(exists=True), help="Configuration file")
+@click.option("--port", type=int, help="WebSocket server port")
+@click.option("--host", help="Bind address")
+@click.option("--data-dir", help="Storage directory")
 @click.option("--cert", help="SSL certificate path")
 @click.option("--key", help="SSL key path")
 @click.option("--no-ssl", is_flag=True, help="Disable SSL (development only)")
 @click.option("--vllm", is_flag=True, help="Use vLLM orchestrator for WebDataset/HF datasets")
 @click.pass_context
-def orchestrator(
-    ctx,
-    port: int,
-    host: str,
-    data_dir: str,
-    cert: Optional[str],
-    key: Optional[str],
-    no_ssl: bool,
-    vllm: bool,
-):
+def orchestrator(ctx, config: Optional[str], **kwargs):
     """Start the orchestrator server."""
-    config = ctx.obj.get("orchestrator", {})
+    # Load configuration
+    base_config = ConfigManager.find_config("orchestrator", config) or {}
 
-    # Override with CLI arguments
-    if port:
-        config["port"] = port
-    if host:
-        config["host"] = host
-    if data_dir:
-        config.setdefault("storage", {})["data_dir"] = data_dir
+    # Extract orchestrator section if it exists
+    if "orchestrator" in base_config:
+        config_data = base_config["orchestrator"]
+    else:
+        config_data = base_config
 
-    if not no_ssl:
-        if cert and key:
-            config.setdefault("ssl", {})["cert"] = cert
-            config["ssl"]["key"] = key
-        elif not config.get("ssl"):
+    console.print(f"Config contents: {config_data}")
+
+    # Apply CLI overrides
+    if kwargs.get("port"):
+        config_data["port"] = kwargs["port"]
+    if kwargs.get("host"):
+        config_data["host"] = kwargs["host"]
+    if kwargs.get("data_dir"):
+        config_data.setdefault("storage", {})["data_dir"] = kwargs["data_dir"]
+
+    # Handle SSL configuration
+    if not kwargs.get("no_ssl"):
+        if kwargs.get("cert") and kwargs.get("key"):
+            config_data.setdefault("ssl", {})
+            config_data["ssl"]["cert"] = kwargs["cert"]
+            config_data["ssl"]["key"] = kwargs["key"]
+        elif not config_data.get("ssl"):
             console.print(
                 "[yellow]Warning: Running without SSL. Use --cert and --key for production.[/yellow]"
             )
 
-    orchestrator = Orchestrator(config)
+    if kwargs.get("vllm") and "vllm" not in config_data:
+        raise ValueError("Must provide vLLM config.")
+
+    orchestrator_instance = Orchestrator(config_data)
 
     try:
-        asyncio.run(orchestrator.start())
+        asyncio.run(orchestrator_instance.start())
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down orchestrator...[/yellow]")
-        asyncio.run(orchestrator.shutdown())
+        asyncio.run(orchestrator_instance.shutdown())
 
 
 @main.command()
-@click.option("--server", required=True, help="Orchestrator WebSocket URL")
-@click.option("--token", required=True, help="Worker authentication token")
+@click.option("--config", type=click.Path(exists=True), help="Configuration file")
+@click.option("--server", help="Orchestrator WebSocket URL")
+@click.option("--token", help="Worker authentication token")
 @click.option("--name", help="Worker display name")
-@click.option("--batch-size", default=32, help="Inference batch size")
+@click.option("--batch-size", type=int, help="Inference batch size")
 @click.option("--no-verify-ssl", is_flag=True, help="Skip SSL verification")
 @click.option("--vllm", is_flag=True, help="Use vLLM worker for GPU inference")
-@click.option("--gpu-id", type=int, default=0, help="GPU device ID (for vLLM)")
-@click.option("--precision", default="fp16", help="Model precision (for vLLM)")
-@click.option("--model", default="Qwen/Qwen2.5-VL-3B-Instruct", help="Model name (for vLLM)")
+@click.option("--gpu-id", type=int, help="GPU device ID (for vLLM)")
+@click.option("--precision", help="Model precision (for vLLM)")
+@click.option("--model", help="Model name (for vLLM)")
 @click.pass_context
-def worker(
-    ctx,
-    server: str,
-    token: str,
-    name: Optional[str],
-    batch_size: int,
-    no_verify_ssl: bool,
-    vllm: bool,
-    gpu_id: int,
-    precision: str,
-    model: str,
-):
+def worker(ctx, config: Optional[str], **kwargs):
     """Start a worker node."""
-    config = ctx.obj.get("worker", {})
+    # Load configuration
+    base_config = ConfigManager.find_config("worker", config) or {}
 
-    # Override with CLI arguments
-    config["server"] = server
-    config["token"] = token
-    if name:
-        config["name"] = name
-    config["batch_size"] = batch_size
-    config["verify_ssl"] = not no_verify_ssl
+    # Extract worker section if it exists
+    if "worker" in base_config:
+        config_data = base_config["worker"]
+    else:
+        config_data = base_config
 
-    if vllm:
-        # Use vLLM worker for GPU inference
+    # Apply CLI overrides (only non-None values)
+    for key in ["server", "token", "name", "batch_size", "gpu_id", "precision", "model"]:
+        if kwargs.get(key) is not None:
+            config_data[key] = kwargs[key]
+
+    if kwargs.get("no_verify_ssl"):
+        config_data["verify_ssl"] = False
+
+    # Validate required fields
+    if not config_data.get("server"):
+        console.print("[red]Error: --server required (or set in config)[/red]")
+        sys.exit(1)
+    if not config_data.get("token"):
+        console.print("[red]Error: --token required (or set in config)[/red]")
+        sys.exit(1)
+
+    # Choose worker type
+    if kwargs.get("vllm") or config_data.get("vllm"):
         from .worker_vllm import VLLMWorker
 
-        config["gpu_id"] = gpu_id
-        config["precision"] = precision
-        config["model"] = model
-        worker = VLLMWorker(config)
+        worker_instance = VLLMWorker(config_data)
     else:
-        # Use standard worker
-        worker = Worker(config)
+        worker_instance = Worker(config_data)
 
     try:
-        asyncio.run(worker.start())
+        asyncio.run(worker_instance.start())
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down worker...[/yellow]")
-        asyncio.run(worker.shutdown())
+        asyncio.run(worker_instance.shutdown())
 
 
 @main.command()
-@click.option("--server", required=True, help="Orchestrator WebSocket URL")
-@click.option("--token", required=True, help="Admin authentication token")
+@click.option("--config", type=click.Path(exists=True), help="Configuration file")
+@click.option("--server", help="Orchestrator WebSocket URL")
+@click.option("--token", help="Authentication token")
+@click.option("--no-verify-ssl", is_flag=True, help="Skip SSL verification")
+@click.option("--debug", is_flag=True, help="Enable debug output")
+@click.pass_context
+def monitor(ctx, config: Optional[str], server: Optional[str], token: Optional[str], 
+           no_verify_ssl: bool, debug: bool):
+    """Start the monitoring TUI."""
+    
+    # Enable debug logging if requested
+    if debug:
+        setup_logging(verbose=True)
+        console.print("[yellow]Debug mode enabled[/yellow]")
+    
+    # Load configuration
+    base_config = ConfigManager.find_config('monitor', config)
+    
+    if not base_config:
+        # Try to find monitor config in orchestrator config as fallback
+        orch_config = ConfigManager.find_config('orchestrator')
+        if orch_config and 'monitor' in orch_config:
+            base_config = {'monitor': orch_config['monitor']}
+            console.print("[dim]Using monitor config from orchestrator.yaml[/dim]")
+        else:
+            base_config = {}
+            if not server or not token:
+                console.print("[yellow]No monitor config found, using CLI args[/yellow]")
+    
+    # Handle different config structures
+    # Case 1: Config has top-level 'monitor' section
+    if 'monitor' in base_config:
+        config_data = base_config['monitor']
+    # Case 2: Config IS the monitor config (no wrapper)
+    else:
+        config_data = base_config
+    
+    # Apply CLI overrides (CLI always wins)
+    if server:
+        config_data['server'] = server
+    if token:
+        config_data['token'] = token
+    if no_verify_ssl:
+        config_data['verify_ssl'] = False
+    
+    # Debug output
+    if debug:
+        console.print("\n[cyan]Final monitor configuration:[/cyan]")
+        console.print(f"  Server: {config_data.get('server', 'NOT SET')}")
+        console.print(f"  Token: {'***' + config_data.get('token', '')[-4:] if config_data.get('token') else 'NOT SET'}")
+        console.print(f"  Verify SSL: {config_data.get('verify_ssl', True)}")
+        console.print()
+    
+    # Validate required fields
+    if not config_data.get('server'):
+        console.print("[red]Error: --server required (or set 'server' in monitor.yaml)[/red]")
+        console.print("\n[dim]Example monitor.yaml:[/dim]")
+        console.print("server: wss://localhost:8765")
+        console.print("token: your-token-here")
+        sys.exit(1)
+        
+    if not config_data.get('token'):
+        console.print("[red]Error: --token required (or set 'token' in monitor.yaml)[/red]")
+        console.print("\n[dim]Example monitor.yaml:[/dim]")
+        console.print("server: wss://localhost:8765")
+        console.print("token: your-token-here")
+        sys.exit(1)
+    
+    # Set defaults for optional settings
+    config_data.setdefault('refresh_interval', 1.0)
+    config_data.setdefault('show_inactive_workers', False)
+    config_data.setdefault('max_log_lines', 100)
+    
+    # Create and start monitor
+    try:
+        monitor_instance = Monitor(config_data)
+        
+        if debug:
+            console.print("[green]Starting monitor...[/green]")
+            console.print(f"[dim]Connecting to: {config_data['server']}[/dim]")
+            sys.exit(1)
+        
+        asyncio.run(monitor_instance.start())
+        
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Closing monitor...[/yellow]")
+    except ConnectionRefusedError:
+        console.print(f"\n[red]Error: Cannot connect to {config_data['server']}[/red]")
+        console.print("[yellow]Check that the orchestrator is running and accessible[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"\n[red]Error starting monitor: {e}[/red]")
+        if debug:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+@main.command()
+@click.option("--config", type=click.Path(exists=True), help="Configuration file")
+@click.option("--server", help="Orchestrator WebSocket URL")
+@click.option("--token", help="Admin authentication token")
 @click.option(
-    "--config", type=click.Path(exists=True), required=True, help="New configuration file"
+    "--new-config", type=click.Path(exists=True), required=True, help="New configuration file"
 )
 @click.option("--no-verify-ssl", is_flag=True, help="Skip SSL verification")
-def reload_config(server: str, token: str, config: str, no_verify_ssl: bool):
+def reload_config(
+    config: Optional[str],
+    server: Optional[str],
+    token: Optional[str],
+    new_config: str,
+    no_verify_ssl: bool,
+):
     """Reload orchestrator configuration via admin connection."""
     import websockets
     import ssl
 
-    console.print(f"[cyan]Loading configuration from {config}...[/cyan]")
+    # Load base config to get server/token if not provided via CLI
+    if not server or not token:
+        base_config = ConfigManager.find_config("orchestrator", config) or {}
+        admin_config = base_config.get("admin", {})
+
+        if not server:
+            server = admin_config.get("server")
+        if not token:
+            token = admin_config.get("token")
+
+    if not server:
+        console.print("[red]Error: --server required (or set in config)[/red]")
+        sys.exit(1)
+    if not token:
+        console.print("[red]Error: --token required (or set in config)[/red]")
+        sys.exit(1)
+
+    console.print(f"[cyan]Loading configuration from {new_config}...[/cyan]")
 
     # Load the new configuration
-    try:
-        with open(config) as f:
-            new_config = yaml.safe_load(f)
-    except Exception as e:
-        console.print(f"[red]Failed to load configuration: {e}[/red]")
-        return
+    new_cfg = ConfigManager.load_yaml(Path(new_config))
+    if not new_cfg:
+        console.print("[red]Failed to load configuration[/red]")
+        sys.exit(1)
 
     # Setup SSL
     ssl_context = None
@@ -185,11 +411,8 @@ def reload_config(server: str, token: str, config: str, no_verify_ssl: bool):
         try:
             async with websockets.connect(server, ssl=ssl_context) as websocket:
                 # Authenticate as admin
-                await websocket.send(
-                    json.dumps({"token": token, "role": "admin"})  # Special admin role
-                )
+                await websocket.send(json.dumps({"token": token, "role": "admin"}))
 
-                # Wait for response
                 response = await websocket.recv()
                 auth_response = json.loads(response)
 
@@ -200,74 +423,40 @@ def reload_config(server: str, token: str, config: str, no_verify_ssl: bool):
                 console.print("[green]✓ Authenticated as admin[/green]")
 
                 # Send reload command
-                await websocket.send(json.dumps({"type": "reload_config", "config": new_config}))
+                await websocket.send(json.dumps({"type": "reload_config", "config": new_cfg}))
 
-                # Wait for reload response
                 response = await websocket.recv()
                 reload_response = json.loads(response)
 
-                # In the reload_config command, update the response handling:
                 if reload_response.get("type") == "reload_complete":
                     if "message" in reload_response and "No changes" in reload_response["message"]:
                         console.print(f"[yellow]{reload_response['message']}[/yellow]")
                     else:
                         console.print("[green]✓ Configuration reloaded successfully![/green]")
 
-                        # Show what was updated
                         if "updated" in reload_response and reload_response["updated"]:
                             console.print("\n[cyan]Updated sections:[/cyan]")
                             for section in reload_response["updated"]:
                                 console.print(f"  • {section}")
 
-                        # Show warnings if any
                         if "warnings" in reload_response and reload_response["warnings"]:
                             console.print("\n[yellow]Warnings:[/yellow]")
                             for warning in reload_response["warnings"]:
                                 console.print(f"  ⚠ {warning}")
 
                     return True
-
                 else:
                     error = reload_response.get("error", "Unknown error")
                     console.print(f"[red]Reload failed: {error}[/red]")
                     return False
 
-        except websockets.exceptions.ConnectionClosed as e:
-            console.print(f"[red]Connection closed: {e}[/red]")
-            return False
         except Exception as e:
             console.print(f"[red]Error: {e}[/red]")
-            import traceback
-
-            traceback.print_exc()
             return False
 
-    # Run the async function
     success = asyncio.run(send_reload())
-
     if not success:
         sys.exit(1)
-
-
-@main.command()
-@click.option("--server", required=True, help="Orchestrator WebSocket URL")
-@click.option("--token", required=True, help="Admin authentication token")
-@click.option("--no-verify-ssl", is_flag=True, help="Skip SSL verification")
-@click.pass_context
-def monitor(ctx, server: str, token: str, no_verify_ssl: bool):
-    """Start the monitoring TUI."""
-    config = ctx.obj.get("monitor", {})
-
-    config["server"] = server
-    config["token"] = token
-    config["verify_ssl"] = not no_verify_ssl
-
-    monitor = Monitor(config)
-
-    try:
-        asyncio.run(monitor.start())
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Closing monitor...[/yellow]")
 
 
 @main.command()
@@ -283,7 +472,6 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
 
     console.print("[bold cyan]Scanning for sparse/abandoned chunks...[/bold cyan]\n")
 
-    # Load chunk tracker
     checkpoint_path = Path(checkpoint_dir) / "chunks.json"
     if not checkpoint_path.exists():
         console.print("[red]No chunk checkpoint found![/red]")
@@ -292,7 +480,7 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
     tracker = ChunkTracker(checkpoint_path)
     storage = StorageManager(Path(data_dir))
 
-    # Get chunk statistics
+    # Get and display stats
     stats = tracker.get_stats()
     console.print(f"[green]Total chunks:[/green] {stats['total']}")
     console.print(f"[green]Completed:[/green] {stats['completed']}")
@@ -300,7 +488,7 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
     console.print(f"[yellow]Assigned:[/yellow] {stats['assigned']}")
     console.print(f"[red]Failed:[/red] {stats['failed']}\n")
 
-    # Find abandoned chunks (assigned for too long)
+    # Find abandoned chunks
     abandoned_chunks = []
     stale_threshold = 3600  # 1 hour
     current_time = datetime.utcnow()
@@ -313,7 +501,7 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
 
     if abandoned_chunks:
         console.print(f"[red]Found {len(abandoned_chunks)} abandoned chunks:[/red]")
-        for chunk_id, chunk_state, age in abandoned_chunks[:10]:  # Show first 10
+        for chunk_id, chunk_state, age in abandoned_chunks[:10]:
             age_str = f"{age/3600:.1f} hours" if age > 3600 else f"{age/60:.1f} minutes"
             console.print(f"  • {chunk_id} (assigned to {chunk_state.assigned_to} {age_str} ago)")
 
@@ -322,11 +510,11 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
 
         if fix:
             console.print("\n[yellow]Resetting abandoned chunks to pending...[/yellow]")
-            for chunk_id, chunk_state, _ in abandoned_chunks:
-                tracker.mark_failed(chunk_id)  # This resets to pending
+            for chunk_id, _, _ in abandoned_chunks:
+                tracker.mark_failed(chunk_id)
             console.print(f"[green]✓ Reset {len(abandoned_chunks)} chunks[/green]")
 
-    # Check for sparse shards (shards with gaps in chunk coverage)
+    # Check for sparse shards
     console.print("\n[bold cyan]Checking for sparse shards...[/bold cyan]")
 
     shards_summary = tracker.get_shards_summary()
@@ -334,7 +522,6 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
 
     for shard_name, shard_info in shards_summary.items():
         if not shard_info["is_complete"]:
-            # Check if chunks have gaps
             chunks = sorted(shard_info["chunks"], key=lambda c: c.start_index)
             expected_index = 0
             has_gaps = False
@@ -369,16 +556,14 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
         if len(sparse_shards) > 5:
             console.print(f"  ... and {len(sparse_shards) - 5} more")
 
-    # Cross-check with actual stored data
+    # Cross-check with storage if verbose
     if storage.captions_path.exists() and verbose:
         console.print("\n[bold cyan]Cross-checking with stored captions...[/bold cyan]")
 
         try:
-            # Read chunk_ids from storage
             table = pq.read_table(storage.captions_path, columns=["chunk_id"])
             stored_chunk_ids = set(c for c in table["chunk_id"].to_pylist() if c)
 
-            # Find discrepancies
             tracker_completed = set(c for c, s in tracker.chunks.items() if s.status == "completed")
 
             missing_in_storage = tracker_completed - stored_chunk_ids
@@ -391,7 +576,7 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
                 for chunk_id in list(missing_in_storage)[:5]:
                     console.print(f"  • {chunk_id}")
 
-                if fix and missing_in_storage:
+                if fix:
                     console.print("[yellow]Resetting these chunks to pending...[/yellow]")
                     for chunk_id in missing_in_storage:
                         tracker.mark_failed(chunk_id)
@@ -401,12 +586,11 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
                 console.print(
                     f"\n[yellow]Chunks in storage but not tracked:[/yellow] {len(missing_in_tracker)}"
                 )
-                # These are likely from before chunk tracking was implemented
 
         except Exception as e:
             console.print(f"[red]Error reading storage: {e}[/red]")
 
-    # Summary and recommendations
+    # Summary
     console.print("\n[bold cyan]Summary:[/bold cyan]")
 
     total_issues = len(abandoned_chunks) + len(sparse_shards)
@@ -424,7 +608,6 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
                 "\n[green]✓ Issues have been fixed. Restart orchestrator to reprocess.[/green]"
             )
 
-    # Save any changes
     if fix:
         tracker.save_checkpoint()
 
@@ -456,7 +639,6 @@ def generate_cert(
             f"[yellow]Requesting Let's Encrypt {mode} certificate for {domain}...[/yellow]"
         )
 
-        # For Let's Encrypt, allow custom output dir but default to system location
         le_output = Path(output_dir) if output_dir != "./certs" else None
 
         try:
@@ -507,19 +689,16 @@ def inspect_cert(cert_path: str):
         if info["is_self_signed"]:
             console.print("[yellow]⚠ This is a self-signed certificate[/yellow]")
 
-        # Check expiration
         from datetime import datetime
 
         if info["not_after"] < datetime.utcnow():
             console.print("[red]✗ Certificate has expired![/red]")
         elif (info["not_after"] - datetime.utcnow()).days < 30:
-            console.print(
-                f"[yellow]⚠ Certificate expires in {(info['not_after'] - datetime.utcnow()).days} days[/yellow]"
-            )
+            days_left = (info["not_after"] - datetime.utcnow()).days
+            console.print(f"[yellow]⚠ Certificate expires in {days_left} days[/yellow]")
         else:
-            console.print(
-                f"[green]✓ Certificate valid for {(info['not_after'] - datetime.utcnow()).days} more days[/green]"
-            )
+            days_left = (info["not_after"] - datetime.utcnow()).days
+            console.print(f"[green]✓ Certificate valid for {days_left} more days[/green]")
 
     except Exception as e:
         console.print(f"[red]Error reading certificate: {e}[/red]")
