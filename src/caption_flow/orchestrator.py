@@ -659,7 +659,11 @@ class Orchestrator:
                 updated_sections.append("chunks_per_request")
 
             # Recreate auth manager
-            self.auth = AuthManager(config=new_config)
+            try:
+                self.auth = AuthManager(config=new_config)
+            except Exception as e:
+                logger.error(f"Failed to create AuthManager: {e}")
+                return
 
             # Update buffer settings
             if (

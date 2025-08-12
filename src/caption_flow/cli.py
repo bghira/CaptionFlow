@@ -168,8 +168,6 @@ def orchestrator(ctx, config: Optional[str], **kwargs):
     else:
         config_data = base_config
 
-    console.print(f"Config contents: {config_data}")
-
     # Apply CLI overrides
     if kwargs.get("port"):
         config_data["port"] = kwargs["port"]
@@ -376,11 +374,21 @@ def reload_config(
     if not server or not token:
         base_config = ConfigManager.find_config("orchestrator", config) or {}
         admin_config = base_config.get("admin", {})
+        admin_tokens = base_config.get("orchestrator", {}).get("auth", {}).get("admin_tokens", [])
+        has_admin_tokens = False
+        if len(admin_tokens) > 0:
+            has_admin_tokens = True
+            first_admin_token = admin_tokens[0].get("token", None)
+        console.print(f"{first_admin_token=}")
 
         if not server:
-            server = admin_config.get("server")
+            server = admin_config.get("server", "ws://localhost:8765")
         if not token:
-            token = admin_config.get("token")
+            token = admin_config.get("token", None)
+            if token is None and has_admin_tokens:
+                # grab the first one, we'll just assume we're localhost.
+                console.print("Using first admin token.")
+                token = first_admin_token
 
     if not server:
         console.print("[red]Error: --server required (or set in config)[/red]")
@@ -447,7 +455,7 @@ def reload_config(
                     return True
                 else:
                     error = reload_response.get("error", "Unknown error")
-                    console.print(f"[red]Reload failed: {error}[/red]")
+                    console.print(f"[red]Reload failed: {error} ({reload_response=})[/red]")
                     return False
 
         except Exception as e:
