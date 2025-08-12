@@ -1,0 +1,11 @@
+monitor:
+  server: "ws://localhost:8765" # or wss:// for SSL
+  token: "letmein"
+  refresh_rate: 1.0
+  show_contributors: true
+  show_quality_metrics: true
+  max_activity_items: 20
+  # Display options
+  show_chunk_progress: true
+  show_worker_queues: true
+  show_throughput_graph: true

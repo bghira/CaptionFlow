@@ -1,0 +1,11 @@
+worker:
+  # Connection settings
+  server: "ws://localhost:8765" # or wss:// for SSL
+  token: "letmein"
+
+  # Local GPU selection
+  gpu_id: 0 # Which GPU to use on this machine
+
+  # Local queue settings
+  readahead_size: 256 # Maximum items in readahead queue
+  inference_queue_size: 128 # Maximum batches in inference queue

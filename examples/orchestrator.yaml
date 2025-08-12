@@ -69,31 +69,14 @@ orchestrator:
   auth:
     worker_tokens:
       - token: "worker-alpha-2024"
-        name: "GPU-Cluster-1"
+        name: "NVIDIA 4090 1"
       - token: "worker-beta-2024"
-        name: "Community-Worker-1"
+        name: "NVIDIA 4090 2"
+      - token: "worker-kappa-2024"
+        name: "NVIDIA 4090 3"
+    monitor_tokens:
+      - token: "letmein"
+        name: "Default demo Monitor user"
     admin_tokens:
-      - "admin-secret-2024"
-
-# Worker configuration (minimal - most config comes from orchestrator)
-worker:
-  # Connection settings
-  server: "ws://localhost:8765" # or wss:// for SSL
-  token: "worker-alpha-2024"
-
-  # Local GPU selection
-  gpu_id: 0 # Which GPU to use on this machine
-
-  # Local queue settings
-  readahead_size: 256 # Maximum items in readahead queue
-  inference_queue_size: 128 # Maximum batches in inference queue
-
-monitor:
-  refresh_rate: 1.0
-  show_contributors: true
-  show_quality_metrics: true
-  max_activity_items: 20
-  # Display options
-  show_chunk_progress: true
-  show_worker_queues: true
-  show_throughput_graph: true
+      - token: "admin-secret-2024"
+        name: "Default admin user, misconfigured system"
