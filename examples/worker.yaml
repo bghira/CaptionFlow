@@ -1,0 +1,11 @@
+worker:
+  # Connection settings
+  server: "ws://localhost:8765" # or wss:// for SSL
+  token: "example-worker-token"
+
+  gpu_id: 0 # if you want the second GPU, set to 1, etc.
+  vllm: true
+
+  # Local queue settings
+  readahead_size: 256 # Maximum items in readahead queue
+  inference_queue_size: 128 # Maximum batches in inference queue
