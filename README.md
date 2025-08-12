@@ -1,4 +1,10 @@
 # captionflow
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/67eae1b1-7545-4ade-a0b1-31484ba57af9" />
+
+```bash
+$ pip install caption-flow
+$ caption-flow orchestrator|worker|monitor
+```
 
 scalable, fault-tolerant **vllm-powered image captioning**. this "first round" focuses on a blazing fast websocket orchestrator plus lightweight gpu workers that batch requests through vllm. 
 
