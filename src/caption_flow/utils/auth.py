@@ -17,8 +17,36 @@ class AuthManager:
     """Manages authentication tokens."""
 
     def __init__(self, config: Dict[str, Any]):
+        self.reload_config(config=config)
+
+    def authenticate(self, token: str) -> Optional[str]:
+        """Authenticate token and return role."""
+        role = None
+        for worker_token in self.worker_tokens:
+            if token == worker_token:
+                role = "worker"
+                break
+        if role is None:
+            for admin_token in self.admin_tokens:
+                if token == admin_token:
+                    role = "admin"
+                    break
+        if role is None:
+            for monitor_token in self.monitor_tokens:
+                if token == monitor_token:
+                    role = "monitor"
+                    break
+
+        worker_auth_details = WorkerAuthenticationDetails(
+            role=role, name=self.worker_tokens.get(token, f"Anonymous {role}"), token=token
+        )
+        return worker_auth_details
+
+    def reload_config(self, config: dict) -> None:
+        """Reload configuration from file."""
         self.worker_tokens = {}
-        self.admin_tokens = set()
+        self.admin_tokens = {}
+        self.monitor_tokens = {}
 
         # Load worker tokens
         for worker in config.get("worker_tokens", []):
@@ -27,24 +55,13 @@ class AuthManager:
             self.worker_tokens[worker["token"]] = worker_name
 
         # Load admin tokens
-        self.admin_tokens = set(config.get("admin_tokens", []))
-        if isinstance(self.admin_tokens, str):
-            self.admin_tokens = [self.admin_tokens]
+        for admin in config.get("admin_tokens", []):
+            admin_name = admin.get("name", None)
+            assert admin_name is not None, "Admin token must have a name"
+            self.admin_tokens[admin["token"]] = admin_name
 
-    def authenticate(self, token: str) -> Optional[str]:
-        """Authenticate token and return role."""
-        role = None
-        if token in self.worker_tokens:
-            role = "worker"
-        elif token in self.admin_tokens:
-            role = "monitor"
-
-        # Check if it's an admin token
-
-        if token in self.admin_tokens:
-            role = "admin"
-
-        worker_auth_details = WorkerAuthenticationDetails(
-            role=role, name=self.worker_tokens.get(token, "Unknown Worker"), token=token
-        )
-        return worker_auth_details
+        # Load monitor tokens
+        for monitor in config.get("monitor_tokens", []):
+            monitor_name = monitor.get("name", None)
+            assert monitor_name is not None, "Monitor token must have a name"
+            self.monitor_tokens[monitor["token"]] = monitor_name
