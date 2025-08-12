@@ -545,7 +545,7 @@ class Orchestrator:
             auth_data = json.loads(auth_msg)
 
             auth_ticket = self.auth.authenticate(auth_data.get("token"))
-            if not auth_ticket:
+            if not auth_ticket.role:
                 await websocket.send(safe_json_dumps({"error": "Invalid token"}))
                 return
 
@@ -558,7 +558,7 @@ class Orchestrator:
             elif auth_ticket.role == "admin":
                 await self._handle_admin(websocket, auth_ticket)
             else:
-                await websocket.send(safe_json_dumps({"error": "Unknown role"}))
+                await websocket.send(safe_json_dumps({"error": f"Unknown role: {auth_ticket.role}"}))
 
         except Exception as e:
             logger.error(f"Connection error: {e}")
@@ -657,6 +657,9 @@ class Orchestrator:
             ):
                 self.chunks_per_request = new_config["chunks_per_request"]
                 updated_sections.append("chunks_per_request")
+
+            # Recreate auth manager
+            self.auth = AuthManager(config=new_config)
 
             # Update buffer settings
             if (
