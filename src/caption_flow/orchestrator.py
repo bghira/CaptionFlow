@@ -549,13 +549,14 @@ class Orchestrator:
                 await websocket.send(safe_json_dumps({"error": "Invalid token"}))
                 return
 
-            # Route by role
             if auth_ticket.role == "worker":
                 await self._handle_worker(websocket, auth_ticket)
-            elif auth_ticket.role == "monitor":
-                await self._handle_monitor(websocket)
             elif auth_ticket.role == "data_worker":
                 await self._handle_data_worker(websocket, auth_ticket)
+            elif auth_ticket.role == "monitor":
+                await self._handle_monitor(websocket)
+            elif auth_ticket.role == "admin":
+                await self._handle_admin(websocket, auth_ticket)
             else:
                 await websocket.send(safe_json_dumps({"error": "Unknown role"}))
 
@@ -565,6 +566,226 @@ class Orchestrator:
 
             logger.error(traceback.format_exc())
             await websocket.close()
+
+    async def _handle_admin(self, websocket: WebSocketServerProtocol, auth_ticket):
+        """Handle admin connection for configuration updates."""
+        admin_id = getattr(auth_ticket, "name", "admin")
+        logger.info(f"Admin {admin_id} connected")
+
+        try:
+            # Send welcome
+            await websocket.send(safe_json_dumps({"type": "welcome", "role": "admin"}))
+
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type")
+
+                    if msg_type == "reload_config":
+                        await self._handle_config_reload(websocket, data.get("config", {}))
+
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid admin message: {e}")
+                    await websocket.send(
+                        safe_json_dumps({"type": "error", "error": "Invalid message format"})
+                    )
+
+        except websockets.exceptions.ConnectionClosed:
+            logger.info(f"Admin {admin_id} disconnected")
+
+    async def _handle_config_reload(
+        self, websocket: WebSocketServerProtocol, new_config: Dict[str, Any]
+    ):
+        """Handle configuration reload request."""
+        logger.info("Processing configuration reload request")
+
+        updated_sections = []
+        warnings = []
+        requires_worker_restart = False
+
+        try:
+            # Update vLLM configuration
+            if "vllm" in new_config:
+                old_vllm = self.vllm_config.copy()
+
+                # Check each field for actual changes
+                vllm_changed = False
+                for key, value in new_config["vllm"].items():
+                    if self.vllm_config.get(key) != value:
+                        self.vllm_config[key] = value
+                        vllm_changed = True
+
+                if vllm_changed:
+                    updated_sections.append("vllm")
+
+                    # Check if critical changes require worker restart
+                    if (
+                        old_vllm.get("model") != self.vllm_config.get("model")
+                        or old_vllm.get("gpu_memory_utilization")
+                        != self.vllm_config.get("gpu_memory_utilization")
+                        or old_vllm.get("tensor_parallel_size")
+                        != self.vllm_config.get("tensor_parallel_size")
+                    ):
+                        requires_worker_restart = True
+                        warnings.append(
+                            "Critical vLLM changes detected - workers will be disconnected to reload"
+                        )
+
+            # Update dataset configuration
+            if "dataset" in new_config:
+                dataset_changed = False
+                for key, value in new_config["dataset"].items():
+                    if self.dataset_config.get(key) != value:
+                        self.dataset_config[key] = value
+                        dataset_changed = True
+
+                if dataset_changed:
+                    self.dataset_path = self.dataset_config.get("path")
+                    self.dataset_type = self.dataset_config.get("type", "huggingface")
+                    updated_sections.append("dataset")
+                    warnings.append("Dataset changes will apply to new chunks only")
+
+            # Update chunk settings
+            if "chunk_size" in new_config and self.chunk_size != new_config["chunk_size"]:
+                self.chunk_size = new_config["chunk_size"]
+                self.chunk_manager.chunk_size = self.chunk_size
+                updated_sections.append("chunk_size")
+
+            if (
+                "chunks_per_request" in new_config
+                and self.chunks_per_request != new_config["chunks_per_request"]
+            ):
+                self.chunks_per_request = new_config["chunks_per_request"]
+                updated_sections.append("chunks_per_request")
+
+            # Update buffer settings
+            if (
+                "chunk_buffer_multiplier" in new_config
+                and self.chunk_buffer_multiplier != new_config["chunk_buffer_multiplier"]
+            ):
+                self.chunk_buffer_multiplier = new_config["chunk_buffer_multiplier"]
+                updated_sections.append("chunk_buffer_multiplier")
+
+            if (
+                "min_chunk_buffer" in new_config
+                and self.min_chunk_buffer != new_config["min_chunk_buffer"]
+            ):
+                self.min_chunk_buffer = new_config["min_chunk_buffer"]
+                updated_sections.append("min_chunk_buffer")
+
+            # Update storage settings
+            if "storage" in new_config:
+                storage_config = new_config["storage"]
+                storage_changed = False
+
+                if (
+                    "caption_buffer_size" in storage_config
+                    and self.storage.caption_buffer_size != storage_config["caption_buffer_size"]
+                ):
+                    self.storage.caption_buffer_size = storage_config["caption_buffer_size"]
+                    storage_changed = True
+
+                if "checkpoint_interval" in storage_config:
+                    current_interval = self.config.get("storage", {}).get(
+                        "checkpoint_interval", 1000
+                    )
+                    if current_interval != storage_config["checkpoint_interval"]:
+                        self.config.setdefault("storage", {})["checkpoint_interval"] = (
+                            storage_config["checkpoint_interval"]
+                        )
+                        storage_changed = True
+
+                if storage_changed:
+                    updated_sections.append("storage")
+
+            # Update data worker storage config
+            if "data_worker_storage" in new_config:
+                current_dw_storage = self.config.get("data_worker_storage", {})
+                if current_dw_storage != new_config["data_worker_storage"]:
+                    self.config["data_worker_storage"] = new_config["data_worker_storage"]
+                    updated_sections.append("data_worker_storage")
+                    warnings.append("Data worker storage config will apply to new connections only")
+
+            # Update backpressure threshold
+            if "backpressure_threshold" in new_config:
+                current_threshold = getattr(self, "backpressure_threshold", 800)
+                if current_threshold != new_config["backpressure_threshold"]:
+                    self.backpressure_threshold = new_config["backpressure_threshold"]
+                    updated_sections.append("backpressure_threshold")
+
+            # Check if any changes were made
+            if not updated_sections:
+                await websocket.send(
+                    safe_json_dumps(
+                        {
+                            "type": "reload_complete",
+                            "message": "No changes applied - configuration is identical",
+                        }
+                    )
+                )
+                logger.info("Configuration reload requested but no changes detected")
+                return
+
+            # Update the main config for any other fields
+            self.config.update(new_config)
+
+            # Handle worker restart if needed
+            if requires_worker_restart:
+                logger.info("Disconnecting all workers for configuration reload...")
+
+                # Disconnect all workers
+                worker_ids = list(self.workers.keys())
+                for worker_id in worker_ids:
+                    try:
+                        await self.workers[worker_id].close(
+                            code=1012, reason="Configuration reload"
+                        )
+                    except:
+                        pass
+
+                warnings.append(
+                    f"Disconnected {len(worker_ids)} workers - they will reconnect with new config"
+                )
+            else:
+                # Just notify workers about config changes
+                reload_msg = safe_json_dumps(
+                    {
+                        "type": "config_update",
+                        "vllm_config": self.vllm_config if "vllm" in updated_sections else None,
+                        "dataset_config": (
+                            self.dataset_config if "dataset" in updated_sections else None
+                        ),
+                    }
+                )
+
+                disconnected = []
+                for worker_id, ws in self.workers.items():
+                    try:
+                        await ws.send(reload_msg)
+                    except:
+                        disconnected.append(worker_id)
+
+                for worker_id in disconnected:
+                    del self.workers[worker_id]
+
+            # Send success response
+            await websocket.send(
+                safe_json_dumps(
+                    {"type": "reload_complete", "updated": updated_sections, "warnings": warnings}
+                )
+            )
+
+            logger.info(f"Configuration reloaded. Updated sections: {', '.join(updated_sections)}")
+
+            # Broadcast stats update to monitors
+            await self._broadcast_stats()
+            await self._send_activity(
+                f"Configuration reloaded by admin: {', '.join(updated_sections)}"
+            )
+
+        except Exception as e:
+            logger.error(f"Configuration reload failed: {e}")
+            await websocket.send(safe_json_dumps({"type": "reload_failed", "error": str(e)}))
 
     async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_ticket):
         """Handle worker connection lifecycle."""
@@ -965,6 +1186,10 @@ class Orchestrator:
 
     async def _stats_update_loop(self):
         """Periodically update and broadcast stats."""
+        # Track session start values
+        session_start_captions = self.stats["total_captions"]
+        session_start_time = time.time()
+
         while True:
             await asyncio.sleep(10)
 
@@ -998,12 +1223,11 @@ class Orchestrator:
                 )
                 self.rate_tracker["current_rate"] = (caption_diff / elapsed_since_update) * 60
 
-                # Calculate average rate since start
-                total_elapsed = current_time - self.rate_tracker["start_time"]
-                if total_elapsed > 0:
-                    self.rate_tracker["average_rate"] = (
-                        self.stats["total_captions"] / total_elapsed
-                    ) * 60
+                # Calculate average rate since THIS SESSION started
+                session_elapsed = current_time - session_start_time
+                if session_elapsed > 0:
+                    session_captions = self.stats["total_captions"] - session_start_captions
+                    self.rate_tracker["average_rate"] = (session_captions / session_elapsed) * 60
 
                 # Calculate expected rate based on workers
                 # Assume each worker processes batch_size images every ~2 seconds with 3 captions each

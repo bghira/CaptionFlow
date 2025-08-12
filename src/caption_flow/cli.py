@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -10,6 +11,7 @@ import click
 import yaml
 from rich.console import Console
 from rich.logging import RichHandler
+from datetime import datetime
 
 from .orchestrator import Orchestrator
 from .worker import Worker
@@ -150,6 +152,106 @@ def worker(
 @main.command()
 @click.option("--server", required=True, help="Orchestrator WebSocket URL")
 @click.option("--token", required=True, help="Admin authentication token")
+@click.option(
+    "--config", type=click.Path(exists=True), required=True, help="New configuration file"
+)
+@click.option("--no-verify-ssl", is_flag=True, help="Skip SSL verification")
+def reload_config(server: str, token: str, config: str, no_verify_ssl: bool):
+    """Reload orchestrator configuration via admin connection."""
+    import websockets
+    import ssl
+
+    console.print(f"[cyan]Loading configuration from {config}...[/cyan]")
+
+    # Load the new configuration
+    try:
+        with open(config) as f:
+            new_config = yaml.safe_load(f)
+    except Exception as e:
+        console.print(f"[red]Failed to load configuration: {e}[/red]")
+        return
+
+    # Setup SSL
+    ssl_context = None
+    if server.startswith("wss://"):
+        if no_verify_ssl:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        else:
+            ssl_context = ssl.create_default_context()
+
+    async def send_reload():
+        try:
+            async with websockets.connect(server, ssl=ssl_context) as websocket:
+                # Authenticate as admin
+                await websocket.send(
+                    json.dumps({"token": token, "role": "admin"})  # Special admin role
+                )
+
+                # Wait for response
+                response = await websocket.recv()
+                auth_response = json.loads(response)
+
+                if "error" in auth_response:
+                    console.print(f"[red]Authentication failed: {auth_response['error']}[/red]")
+                    return False
+
+                console.print("[green]✓ Authenticated as admin[/green]")
+
+                # Send reload command
+                await websocket.send(json.dumps({"type": "reload_config", "config": new_config}))
+
+                # Wait for reload response
+                response = await websocket.recv()
+                reload_response = json.loads(response)
+
+                # In the reload_config command, update the response handling:
+                if reload_response.get("type") == "reload_complete":
+                    if "message" in reload_response and "No changes" in reload_response["message"]:
+                        console.print(f"[yellow]{reload_response['message']}[/yellow]")
+                    else:
+                        console.print("[green]✓ Configuration reloaded successfully![/green]")
+
+                        # Show what was updated
+                        if "updated" in reload_response and reload_response["updated"]:
+                            console.print("\n[cyan]Updated sections:[/cyan]")
+                            for section in reload_response["updated"]:
+                                console.print(f"  • {section}")
+
+                        # Show warnings if any
+                        if "warnings" in reload_response and reload_response["warnings"]:
+                            console.print("\n[yellow]Warnings:[/yellow]")
+                            for warning in reload_response["warnings"]:
+                                console.print(f"  ⚠ {warning}")
+
+                    return True
+
+                else:
+                    error = reload_response.get("error", "Unknown error")
+                    console.print(f"[red]Reload failed: {error}[/red]")
+                    return False
+
+        except websockets.exceptions.ConnectionClosed as e:
+            console.print(f"[red]Connection closed: {e}[/red]")
+            return False
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    # Run the async function
+    success = asyncio.run(send_reload())
+
+    if not success:
+        sys.exit(1)
+
+
+@main.command()
+@click.option("--server", required=True, help="Orchestrator WebSocket URL")
+@click.option("--token", required=True, help="Admin authentication token")
 @click.option("--no-verify-ssl", is_flag=True, help="Skip SSL verification")
 @click.pass_context
 def monitor(ctx, server: str, token: str, no_verify_ssl: bool):
@@ -166,6 +268,165 @@ def monitor(ctx, server: str, token: str, no_verify_ssl: bool):
         asyncio.run(monitor.start())
     except KeyboardInterrupt:
         console.print("\n[yellow]Closing monitor...[/yellow]")
+
+
+@main.command()
+@click.option("--data-dir", default="./caption_data", help="Storage directory")
+@click.option("--checkpoint-dir", default="./checkpoints", help="Checkpoint directory")
+@click.option("--fix", is_flag=True, help="Fix issues by resetting abandoned chunks")
+@click.option("--verbose", is_flag=True, help="Show detailed information")
+def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
+    """Scan for sparse or abandoned chunks and optionally fix them."""
+    from .utils.chunk_tracker import ChunkTracker
+    from .storage import StorageManager
+    import pyarrow.parquet as pq
+
+    console.print("[bold cyan]Scanning for sparse/abandoned chunks...[/bold cyan]\n")
+
+    # Load chunk tracker
+    checkpoint_path = Path(checkpoint_dir) / "chunks.json"
+    if not checkpoint_path.exists():
+        console.print("[red]No chunk checkpoint found![/red]")
+        return
+
+    tracker = ChunkTracker(checkpoint_path)
+    storage = StorageManager(Path(data_dir))
+
+    # Get chunk statistics
+    stats = tracker.get_stats()
+    console.print(f"[green]Total chunks:[/green] {stats['total']}")
+    console.print(f"[green]Completed:[/green] {stats['completed']}")
+    console.print(f"[yellow]Pending:[/yellow] {stats['pending']}")
+    console.print(f"[yellow]Assigned:[/yellow] {stats['assigned']}")
+    console.print(f"[red]Failed:[/red] {stats['failed']}\n")
+
+    # Find abandoned chunks (assigned for too long)
+    abandoned_chunks = []
+    stale_threshold = 3600  # 1 hour
+    current_time = datetime.utcnow()
+
+    for chunk_id, chunk_state in tracker.chunks.items():
+        if chunk_state.status == "assigned" and chunk_state.assigned_at:
+            age = (current_time - chunk_state.assigned_at).total_seconds()
+            if age > stale_threshold:
+                abandoned_chunks.append((chunk_id, chunk_state, age))
+
+    if abandoned_chunks:
+        console.print(f"[red]Found {len(abandoned_chunks)} abandoned chunks:[/red]")
+        for chunk_id, chunk_state, age in abandoned_chunks[:10]:  # Show first 10
+            age_str = f"{age/3600:.1f} hours" if age > 3600 else f"{age/60:.1f} minutes"
+            console.print(f"  • {chunk_id} (assigned to {chunk_state.assigned_to} {age_str} ago)")
+
+        if len(abandoned_chunks) > 10:
+            console.print(f"  ... and {len(abandoned_chunks) - 10} more")
+
+        if fix:
+            console.print("\n[yellow]Resetting abandoned chunks to pending...[/yellow]")
+            for chunk_id, chunk_state, _ in abandoned_chunks:
+                tracker.mark_failed(chunk_id)  # This resets to pending
+            console.print(f"[green]✓ Reset {len(abandoned_chunks)} chunks[/green]")
+
+    # Check for sparse shards (shards with gaps in chunk coverage)
+    console.print("\n[bold cyan]Checking for sparse shards...[/bold cyan]")
+
+    shards_summary = tracker.get_shards_summary()
+    sparse_shards = []
+
+    for shard_name, shard_info in shards_summary.items():
+        if not shard_info["is_complete"]:
+            # Check if chunks have gaps
+            chunks = sorted(shard_info["chunks"], key=lambda c: c.start_index)
+            expected_index = 0
+            has_gaps = False
+
+            for chunk in chunks:
+                if chunk.start_index != expected_index:
+                    has_gaps = True
+                    break
+                expected_index = chunk.start_index + chunk.chunk_size
+
+            if has_gaps or shard_info["failed_chunks"] > 0:
+                sparse_shards.append((shard_name, shard_info, has_gaps))
+
+    if sparse_shards:
+        console.print(f"\n[yellow]Found {len(sparse_shards)} sparse/incomplete shards:[/yellow]")
+        for shard_name, shard_info, has_gaps in sparse_shards[:5]:
+            status = []
+            if shard_info["pending_chunks"] > 0:
+                status.append(f"{shard_info['pending_chunks']} pending")
+            if shard_info["assigned_chunks"] > 0:
+                status.append(f"{shard_info['assigned_chunks']} assigned")
+            if shard_info["failed_chunks"] > 0:
+                status.append(f"{shard_info['failed_chunks']} failed")
+            if has_gaps:
+                status.append("has gaps")
+
+            console.print(f"  • {shard_name}: {', '.join(status)}")
+            console.print(
+                f"    Progress: {shard_info['completed_chunks']}/{shard_info['total_chunks']} chunks"
+            )
+
+        if len(sparse_shards) > 5:
+            console.print(f"  ... and {len(sparse_shards) - 5} more")
+
+    # Cross-check with actual stored data
+    if storage.captions_path.exists() and verbose:
+        console.print("\n[bold cyan]Cross-checking with stored captions...[/bold cyan]")
+
+        try:
+            # Read chunk_ids from storage
+            table = pq.read_table(storage.captions_path, columns=["chunk_id"])
+            stored_chunk_ids = set(c for c in table["chunk_id"].to_pylist() if c)
+
+            # Find discrepancies
+            tracker_completed = set(c for c, s in tracker.chunks.items() if s.status == "completed")
+
+            missing_in_storage = tracker_completed - stored_chunk_ids
+            missing_in_tracker = stored_chunk_ids - set(tracker.chunks.keys())
+
+            if missing_in_storage:
+                console.print(
+                    f"\n[red]Chunks marked complete but missing from storage:[/red] {len(missing_in_storage)}"
+                )
+                for chunk_id in list(missing_in_storage)[:5]:
+                    console.print(f"  • {chunk_id}")
+
+                if fix and missing_in_storage:
+                    console.print("[yellow]Resetting these chunks to pending...[/yellow]")
+                    for chunk_id in missing_in_storage:
+                        tracker.mark_failed(chunk_id)
+                    console.print(f"[green]✓ Reset {len(missing_in_storage)} chunks[/green]")
+
+            if missing_in_tracker:
+                console.print(
+                    f"\n[yellow]Chunks in storage but not tracked:[/yellow] {len(missing_in_tracker)}"
+                )
+                # These are likely from before chunk tracking was implemented
+
+        except Exception as e:
+            console.print(f"[red]Error reading storage: {e}[/red]")
+
+    # Summary and recommendations
+    console.print("\n[bold cyan]Summary:[/bold cyan]")
+
+    total_issues = len(abandoned_chunks) + len(sparse_shards)
+    if total_issues == 0:
+        console.print("[green]✓ No issues found![/green]")
+    else:
+        console.print(f"[yellow]Found {total_issues} total issues[/yellow]")
+
+        if not fix:
+            console.print(
+                "\n[cyan]Run with --fix flag to automatically reset abandoned chunks[/cyan]"
+            )
+        else:
+            console.print(
+                "\n[green]✓ Issues have been fixed. Restart orchestrator to reprocess.[/green]"
+            )
+
+    # Save any changes
+    if fix:
+        tracker.save_checkpoint()
 
 
 @main.command()

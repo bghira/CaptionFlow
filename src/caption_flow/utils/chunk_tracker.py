@@ -165,6 +165,15 @@ class ChunkTracker:
             chunk.assigned_at = None
             self.save_checkpoint()
 
+    def mark_pending(self, chunk_id: str):
+        """Mark chunk as pending (for manual reset)."""
+        if chunk_id in self.chunks:
+            chunk = self.chunks[chunk_id]
+            chunk.status = "pending"
+            chunk.assigned_to = None
+            chunk.assigned_at = None
+            self.save_checkpoint()
+
     def release_worker_chunks(self, worker_id: str):
         """Release all chunks assigned to a worker."""
         released_chunks = []

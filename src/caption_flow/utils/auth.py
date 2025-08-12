@@ -28,6 +28,8 @@ class AuthManager:
 
         # Load admin tokens
         self.admin_tokens = set(config.get("admin_tokens", []))
+        if isinstance(self.admin_tokens, str):
+            self.admin_tokens = [self.admin_tokens]
 
     def authenticate(self, token: str) -> Optional[str]:
         """Authenticate token and return role."""
@@ -36,6 +38,12 @@ class AuthManager:
             role = "worker"
         elif token in self.admin_tokens:
             role = "monitor"
+
+        # Check if it's an admin token
+
+        if token in self.admin_tokens:
+            role = "admin"
+
         worker_auth_details = WorkerAuthenticationDetails(
             role=role, name=self.worker_tokens.get(token, "Unknown Worker"), token=token
         )
