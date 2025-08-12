@@ -1,4 +1,5 @@
 # captionflow
+
 <img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/67eae1b1-7545-4ade-a0b1-31484ba57af9" />
 
 ```bash
@@ -7,6 +8,8 @@ $ caption-flow orchestrator|worker|monitor
 ```
 
 scalable, fault-tolerant **vllm-powered image captioning**. this "first round" focuses on a blazing fast websocket orchestrator plus lightweight gpu workers that batch requests through vllm. 
+
+allows communities to caption large datasets together, as members can join or leave the cluster without issue.
 
 **performance**: consumer 4090s often outpace h100s on smaller models (3b-7b) due to higher clock speeds and lower overhead. we've seen 150+ images/sec on a single 4090 with qwen2.5-vl-3b.
 
@@ -76,54 +79,56 @@ caption-flow scan_chunks --data-dir ./caption_data --checkpoint-dir ./checkpoint
 
 ### orchestrator
 
+```bash
+$ caption-flow orchestrator --help
+```
+
 * **websocket server** (default `0.0.0.0:8765`) with four client roles: workers, dataworkers, monitors, and admin.
 * **blazing fast**: handles 10,000+ chunks/sec, 100k+ concurrent connections. the bottleneck is always gpu inference, never the orchestrator.
 * **dataset control**: the orchestrator centrally defines the dataset (`huggingface` or `local`) and version/name. it chunk-slices shards and assigns work.
-* **vllm config broadcast**: model, tp size, dtype, max seq len, memory targets, batching, sampling params, and **inference prompts** are all pushed to workers; workers can apply many changes without a model reload.
+* **worker config distribution**: most vLLM parameters, **inference prompts** and dataset details are all pushed from the orchestrator to workers when they join the cluster.
 * **storage + checkpoints**: captions buffer to disk with periodic checkpoints. chunk state is tracked so restarts don't double-work.
 * **auth**: token lists for `worker`, `dataworker`, `monitor`, and `admin` roles.
 
-start flags you'll likely use:
+### GPU worker
 
-```text
---config path                # yaml config for the orchestrator
---port int, --host str       # bind controls
---data-dir path              # overrides storage.data_dir
---cert path, --key path      # enable tls (or use --no-ssl for ws:// in dev)
---vllm                       # use the vllm-style orchestrator (webdataset/hf)
+```bash
+$ caption-flow worker --help
 ```
 
-### vllm worker
-
+* **uses vLLM for robust captioning**. hugging face transformers has major performance and reliability issues.
 * **one process per gpu**. select the device with `--gpu-id` (or `worker.gpu_id` in yaml).
 * **gets its marching orders** from the orchestrator: dataset info, model, prompts, batch size, and sampling.
-* **resilient**: detects disconnects, abandons the current chunk cleanly, clears queues, reconnects, and resumes.
-* **batched generate()**: images are resized down for consistent batching; each image can get multiple captions (one per prompt).
-* **optimized for consumer gpus**: 4090s often beat h100s on 3b-7b models. higher boost clocks + lower kernel overhead = faster tokens/sec.
+* **resilient**: detects worker/orchestrator disconnections and handles job resumption without wasting resources.
+* **batched generate()**: images can be resized down for consistent batching; each image can get multiple captions (one per prompt).
+* **optimized for consumer gpus**: 4090s often beat h100s on 3b-7b models due to higher CPU boost clocks + lower kernel overhead = faster tokens/sec.
 
-start flags you'll likely use:
+### dataworker
 
-```text
---config path                 # yaml for the worker
---server url                  # ws(s)://host:port
---token str                   # must match an allowed worker token on the orchestrator
---batch-size int              # override vllm batch size
---vllm                        # use the vllm worker implementation
---gpu-id int                  # which gpu to use
---precision str, --model str  # optional overrides for dtype/model
---no-verify-ssl               # accept self-signed certs in dev
+```bash
+$ caption-flow dataworker --help
 ```
-
-### dataworker (coming soon)
 
 * **cpu-only image fetching**: separate clients that handle dataset i/o, image loading, and preprocessing
 * **frees gpu workers**: gpu workers receive pre-loaded images, spending 100% of time on inference
 * **scales horizontally**: spin up dozens of dataworkers on cpu nodes to saturate gpu throughput
 * **smart prefetching**: predictive loading keeps gpu workers fed with zero wait time
 
-### (optional) monitor
+### status monitoring
 
-* a cli entry exists for a tui monitor; wire in a `monitor` module to enable it. config lives in `monitor.yaml` or inside `orchestrator.yaml` under `monitor:`.
+```bash
+$ caption-flow monitor
+```
+
+this command reveals a terminal user interface with cluster statistics, progress, and recent log activity.
+
+### dynamic reloading
+
+```bash
+$ caption-flow config-reload --new-config config.yaml
+```
+
+reload critical settings and adjust caption results on the fly; only reloads your caption models if you change vLLM settings.
 
 ---
 
@@ -367,17 +372,15 @@ your contributions will be tracked and attributed in the final dataset!
 
 in no particular order:
 
-* dataworker implementation for cpu-based data feeding
 * video captioning
-* hot config reload via the admin websocket path
-* richer monitor tui with real-time graphs
 * web interface
 * automatic huggingface hub dataset continuous exports
 * sequence-parallel inference for large vision models
 * discord interface
-* more in-depth integration for non-wds datasets
+* more in-depth integration for non-wds datasets (local folder captioning)
 * support chaining of workflows, for 2nd/3rd pass after use of initial tag model etc
 * distributed orchestrator clustering for planet-scale captioning
+* validation of community caption results randomly to boost the trust levels of contributors
 
 prs welcome. keep it simple and fast.
 
