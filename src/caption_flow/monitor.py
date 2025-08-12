@@ -24,6 +24,7 @@ class Monitor:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        print(f"Config loaded: {self.config}")
         self.server_url = config["server"]
         self.token = config["token"]
 
@@ -71,7 +72,7 @@ class Monitor:
             try:
                 async with websockets.connect(
                     self.server_url,
-                    # ssl=self.ssl_context
+                    ssl=self.ssl_context if self.server_url.startswith("wss://") else None,
                 ) as websocket:
                     # Authenticate
                     await websocket.send(json.dumps({"token": self.token}))
