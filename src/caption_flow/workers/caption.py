@@ -1,11 +1,4 @@
-"""Improved vLLM worker with proper connection recovery and chunk abandonment.
-
-Key improvements:
-1. Detects disconnection and stops current chunk processing
-2. Clears all queues and abandons current chunk on disconnect
-3. Maintains vLLM instance across reconnections
-4. Properly handles connection state in all threads
-"""
+"""Caption worker for vLLM-based distributed image captioning."""
 
 import os
 
@@ -15,8 +8,6 @@ import asyncio
 import io
 import json
 import logging
-import ssl
-import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,13 +16,11 @@ from queue import Queue, Empty
 from threading import Thread, Lock, Event
 from collections import deque
 
-import websockets
-from websockets.client import WebSocketClientProtocol
 from PIL import Image
 import numpy as np
-import webdataset as wds
 from huggingface_hub import get_token
 
+from .base_worker import BaseWorker
 from .models import JobStatus, Job
 from .utils import CaptionUtils
 from .utils.dataset_loader import DatasetLoader
@@ -78,20 +67,20 @@ class ProcessedResult:
     processing_time_ms: float
 
 
-class VLLMWorker:
-    """Worker that processes shard chunks directly with proper reconnection."""
+class CaptionWorker(BaseWorker):
+    """Worker that processes shard chunks for image captioning using vLLM."""
 
     def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.server_url = config["server"]
-        self.token = config["token"]
-        self.name = config.get("name", "worker")
+        super().__init__(config)
+
         batch_image_processing = config.get("batch_image_processing", False)
 
         # Dataset configuration will be received from orchestrator
         self.dataset_config = None
         self.dataset_loader = None
         self.dataset_type = None
+        self.dataset_split = None
+        self.dataset_image_column = None
         self.hf_token = get_token()
 
         # vLLM configuration will be received from orchestrator
@@ -102,17 +91,7 @@ class VLLMWorker:
         # Backward compatibility: local config for GPU selection
         self.gpu_id = config.get("gpu_id", 0)
 
-        # SSL configuration
-        self.ssl_context = self._setup_ssl()
-
-        # State
-        self.worker_id: Optional[str] = None
-        self.websocket: Optional[WebSocketClientProtocol] = None
-        self.running = False
-        self.main_loop: Optional[asyncio.AbstractEventLoop] = None  # Store main event loop
-
         # Connection state events
-        self.connected = Event()
         self.should_stop_processing = Event()
 
         # Inference components (initialized in setup)
@@ -121,7 +100,7 @@ class VLLMWorker:
         self.tokenizer = None
         self.sampling_params = None
         self.image_processor = None
-        # when we use batch processing for image processor, we'll have to use a persistent instance later.
+
         if batch_image_processing:
             self.image_processor = ImageProcessor()
 
@@ -134,33 +113,210 @@ class VLLMWorker:
         self.assigned_chunks = deque()
         self.current_chunk = None
         self.current_chunk_progress = 0
+
         # Batching queues - will be cleared on disconnect
         self.readahead_queue = Queue(maxsize=256)
         self.inference_queue = Queue(maxsize=128)
         self.result_queue = Queue()
 
-        # Metrics
+        # Job mode for shards vs jobs and job queue
+        self.job_mode = config.get("job_mode", False)
+        self.job_queue = Queue(maxsize=32)
+
+    def _init_metrics(self):
+        """Initialize worker metrics."""
         self.items_processed = 0
         self.items_failed = 0
         self.chunks_completed = 0
 
-        # Job mode for shards vs jobs and job queue.
-        self.job_mode = config.get("job_mode", False)
-        self.job_queue = Queue(maxsize=32)
+    def _get_auth_data(self) -> Dict[str, Any]:
+        """Get authentication data."""
+        return {"token": self.token, "name": self.name}
 
-    def _setup_ssl(self) -> Optional[ssl.SSLContext]:
-        """Configure SSL context."""
-        if self.server_url.startswith("ws://"):
-            logger.warning("Using insecure WebSocket connection")
-            return None
+    async def _pre_start(self):
+        """Initialize before starting connection loop."""
+        # Wait for initial connection to get vLLM config
+        logger.info("Connecting to orchestrator for configuration...")
 
-        if not self.config.get("verify_ssl", True):
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            return context
+        # Try initial connection to get config
+        config_received = False
+        while not config_received and self.running:
+            try:
+                await self._initial_connect_for_config()
+                config_received = True
+            except Exception as e:
+                logger.error(f"Failed to get config: {e}")
+                await asyncio.sleep(5)
 
-        return ssl.create_default_context()
+        # Initialize vLLM once we have config
+        self._setup_vllm()
+
+        # Start background threads
+        reader_thread = Thread(target=self._shard_reader_thread, daemon=True)
+        reader_thread.start()
+
+        inference_thread = Thread(target=self._inference_thread, daemon=True)
+        inference_thread.start()
+
+    async def _handle_welcome(self, welcome_data: Dict[str, Any]):
+        """Handle welcome message from orchestrator."""
+        # Extract and setup dataset configuration
+        dataset_config = welcome_data.get("dataset_config", {})
+        if dataset_config:
+            self._setup_dataset_loader(dataset_config)
+            logger.info(f"Received dataset config: {dataset_config}")
+        else:
+            logger.warning("No dataset configuration received from orchestrator")
+
+        # Update vLLM config if provided (in case it changed)
+        new_vllm_config = welcome_data.get("vllm_config")
+        if new_vllm_config and new_vllm_config != self.vllm_config:
+            logger.info("Received updated vLLM configuration")
+            if not self._handle_vllm_config_update(new_vllm_config):
+                logger.error("Failed to update vLLM configuration")
+
+        # Clear stop signal now that we're connected
+        self.should_stop_processing.clear()
+
+        # Request initial chunks if not in job mode
+        if not self.job_mode and self.websocket:
+            await self.websocket.send(json.dumps({"type": "request_chunks", "count": 2}))
+
+    async def _handle_message(self, data: Dict[str, Any]):
+        """Handle message from orchestrator."""
+        msg_type = data.get("type")
+
+        if msg_type == "shard_assignment":
+            chunks = data["chunks"]
+            for chunk_data in chunks:
+                chunk = ShardChunk(**chunk_data)
+                with self.chunk_lock:
+                    self.assigned_chunks.append(chunk)
+                logger.info(f"Received chunk assignment: {chunk.chunk_id}")
+
+        elif msg_type == "no_chunks":
+            reason = data.get("reason", "unknown")
+            logger.info(f"No chunks available from orchestrator (reason: {reason})")
+
+            wait_time = 2 if reason == "state_restoring" else 10
+            await asyncio.sleep(wait_time)
+
+            if self.websocket and self.connected.is_set():
+                await self.websocket.send(json.dumps({"type": "request_chunks", "count": 2}))
+
+        elif msg_type == "reload_vllm":
+            logger.info("Orchestrator requested vLLM reload")
+            new_config = data.get("vllm_config")
+            if new_config:
+                self._handle_vllm_config_update(new_config)
+
+        elif msg_type == "job_assignment":
+            await self._handle_job_assignment(data["job"])
+
+        elif msg_type == "no_jobs":
+            logger.debug("No jobs available")
+            await asyncio.sleep(2)
+
+    def _get_heartbeat_data(self) -> Dict[str, Any]:
+        """Get heartbeat data."""
+        return {
+            "type": "heartbeat",
+            "processed": self.items_processed,
+            "failed": self.items_failed,
+            "chunks_completed": self.chunks_completed,
+            "current_chunk": self.current_chunk.chunk_id if self.current_chunk else None,
+            "chunk_progress": self.current_chunk_progress,
+            "queue_sizes": {
+                "readahead": self.readahead_queue.qsize(),
+                "inference": self.inference_queue.qsize(),
+                "results": self.result_queue.qsize(),
+            },
+        }
+
+    async def _create_tasks(self) -> list:
+        """Create async tasks to run."""
+        tasks = [
+            asyncio.create_task(self._heartbeat_loop()),
+            asyncio.create_task(self._base_message_handler()),
+            asyncio.create_task(self._result_sender()),
+        ]
+
+        if self.job_mode:
+            tasks.append(asyncio.create_task(self._job_request_loop()))
+
+        return tasks
+
+    async def _on_disconnect(self):
+        """Handle disconnection."""
+        self._clear_state_on_disconnect()
+
+    async def _pre_shutdown(self):
+        """Cleanup before shutdown."""
+        # Stop processing threads by adding stop signals
+        self.readahead_queue.put(None)
+        self.inference_queue.put(None)
+
+        # Shutdown image processor
+        if self.image_processor is not None:
+            self.image_processor.shutdown()
+
+    async def _initial_connect_for_config(self):
+        """Connect initially just to get configuration."""
+        logger.info(f"Connecting to {self.server_url}")
+        async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
+            await websocket.send(json.dumps(self._get_auth_data()))
+
+            welcome = await websocket.recv()
+            welcome_data = json.loads(welcome)
+
+            if "error" in welcome_data:
+                raise RuntimeError(f"Authentication failed: {welcome_data['error']}")
+
+            self.vllm_config = welcome_data.get("vllm_config")
+            if not self.vllm_config:
+                raise RuntimeError("No vLLM configuration received from orchestrator")
+
+            self.inference_prompts = self.vllm_config.get(
+                "inference_prompts",
+                [
+                    "describe this image in detail",
+                    "provide a comprehensive description of the visual content",
+                    "what are the key elements in this image?",
+                ],
+            )
+
+            self.vllm_config_manager.current_config = self.vllm_config
+
+            dataset_config = welcome_data.get("dataset_config", {})
+            if dataset_config:
+                self._setup_dataset_loader(dataset_config)
+
+            logger.info("Received configuration from orchestrator")
+
+    def _clear_state_on_disconnect(self):
+        """Clear all processing state when disconnected."""
+        logger.info("Clearing state due to disconnection")
+
+        self.should_stop_processing.set()
+
+        with self.chunk_lock:
+            self.assigned_chunks.clear()
+            self.current_chunk = None
+            self.current_chunk_progress = 0
+
+        self._clear_queue(self.readahead_queue)
+        self._clear_queue(self.inference_queue)
+        self._clear_queue(self.result_queue)
+
+        logger.info("State cleared, ready for reconnection")
+
+    def _clear_queue(self, queue: Queue):
+        """Clear all items from a queue."""
+        try:
+            while True:
+                queue.get_nowait()
+        except Empty:
+            pass
 
     def _setup_dataset_loader(self, dataset_config: Dict[str, Any]):
         """Initialize dataset loader with config from orchestrator."""
@@ -218,40 +374,6 @@ class VLLMWorker:
 
         # Update config manager's tracking
         self.vllm_config_manager.current_config = self.vllm_config
-
-    async def _handle_job_assignment(self, job_data: Dict):
-        """Handle job assignment from orchestrator."""
-        try:
-            # Convert to processing item
-            image = Image.open(io.BytesIO(job_data["image_data"]))
-
-            item = ProcessingItem(
-                chunk_id=job_data["job_id"],
-                item_key=job_data["sample_id"],
-                image=image,
-                image_data=job_data["image_data"],
-            )
-
-            # Add to inference queue
-            self.readahead_queue.put(item)
-            logger.debug(f"Queued job {job_data['job_id']} for processing")
-
-        except Exception as e:
-            logger.error(f"Error handling job assignment: {e}")
-
-    async def _job_request_loop(self):
-        """Request jobs from orchestrator in job mode."""
-        while self.running and self.connected.is_set():
-            try:
-                # Check if we need more work
-                if self.readahead_queue.qsize() < self.vllm_config.get("batch_size", 8):
-                    await self.websocket.send(json.dumps({"type": "request_job"}))
-
-                await asyncio.sleep(1)
-
-            except Exception as e:
-                logger.error(f"Job request error: {e}")
-                await asyncio.sleep(5)
 
     def _handle_vllm_config_update(self, new_config: Dict[str, Any]) -> bool:
         """
@@ -330,264 +452,39 @@ class VLLMWorker:
             logger.info("vLLM configuration updated successfully without reload")
             return True
 
-    def _clear_state_on_disconnect(self):
-        """Clear all processing state when disconnected."""
-        logger.info("Clearing state due to disconnection")
-
-        # Signal threads to stop current processing
-        self.should_stop_processing.set()
-
-        with self.chunk_lock:
-            # Clear assigned chunks
-            self.assigned_chunks.clear()
-            self.current_chunk = None
-            self.current_chunk_progress = 0
-
-        # Clear all queues
-        self._clear_queue(self.readahead_queue)
-        self._clear_queue(self.inference_queue)
-        self._clear_queue(self.result_queue)
-
-        logger.info("State cleared, ready for reconnection")
-
-    def _clear_queue(self, queue: Queue):
-        """Clear all items from a queue."""
+    async def _handle_job_assignment(self, job_data: Dict):
+        """Handle job assignment from orchestrator."""
         try:
-            while True:
-                queue.get_nowait()
-        except Empty:
-            pass
+            # Convert to processing item
+            image = Image.open(io.BytesIO(job_data["image_data"]))
 
-    async def start(self):
-        """Start the worker with automatic reconnection."""
-        self.running = True
-
-        # Wait for initial connection to get vLLM config
-        logger.info("Connecting to orchestrator for configuration...")
-
-        # Try initial connection to get config
-        config_received = False
-        while not config_received and self.running:
-            try:
-                await self._initial_connect_for_config()
-                config_received = True
-            except Exception as e:
-                logger.error(f"Failed to get config: {e}")
-                await asyncio.sleep(5)
-
-        # Initialize vLLM once we have config
-        self._setup_vllm()
-
-        # Capture the main event loop for use in background threads
-        self.main_loop = asyncio.get_running_loop()
-
-        # Start shard reader thread
-        reader_thread = Thread(target=self._shard_reader_thread, daemon=True)
-        reader_thread.start()
-
-        # Start inference thread
-        inference_thread = Thread(target=self._inference_thread, daemon=True)
-        inference_thread.start()
-
-        # Reconnection with exponential backoff
-        reconnect_delay = 5
-        max_delay = 60
-
-        # Connect to orchestrator with retries
-        while self.running:
-            try:
-                await self._connect_and_run()
-
-                # Reset delay on successful connection
-                reconnect_delay = 5
-
-            except Exception as e:
-                logger.error(f"Connection error: {e}")
-
-                # Mark as disconnected
-                self.connected.clear()
-                self.websocket = None
-
-                # Clear all state on disconnect
-                self._clear_state_on_disconnect()
-
-            if self.running:
-                logger.info(f"Reconnecting in {reconnect_delay} seconds...")
-                await asyncio.sleep(reconnect_delay)
-
-                # Exponential backoff
-                reconnect_delay = min(reconnect_delay * 2, max_delay)
-
-    async def _initial_connect_for_config(self):
-        """Connect initially just to get configuration."""
-        logger.info(f"Connecting to {self.server_url}")
-        async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
-            # Authenticate
-            await websocket.send(json.dumps({"token": self.token, "name": self.name}))
-
-            # Wait for welcome message with config
-            welcome = await websocket.recv()
-            welcome_data = json.loads(welcome)
-
-            if "error" in welcome_data:
-                raise RuntimeError(f"Authentication failed: {welcome_data['error']}")
-
-            # Extract vLLM configuration
-            self.vllm_config = welcome_data.get("vllm_config")
-            if not self.vllm_config:
-                raise RuntimeError("No vLLM configuration received from orchestrator")
-
-            self.inference_prompts = self.vllm_config.get(
-                "inference_prompts",
-                [
-                    "describe this image in detail",
-                    "provide a comprehensive description of the visual content",
-                    "what are the key elements in this image?",
-                ],
+            item = ProcessingItem(
+                chunk_id=job_data["job_id"],
+                item_key=job_data["sample_id"],
+                image=image,
+                image_data=job_data["image_data"],
             )
 
-            # Store config in manager
-            self.vllm_config_manager.current_config = self.vllm_config
+            # Add to inference queue
+            self.readahead_queue.put(item)
+            logger.debug(f"Queued job {job_data['job_id']} for processing")
 
-            # Extract dataset configuration
-            dataset_config = welcome_data.get("dataset_config", {})
-            if dataset_config:
-                self._setup_dataset_loader(dataset_config)
-
-            logger.info("Received configuration from orchestrator")
-            # Disconnect after getting config
-
-    async def _connect_and_run(self):
-        """Connect to orchestrator and process chunks."""
-        logger.info(f"Connecting to {self.server_url}")
-
-        async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
-            self.websocket = websocket
-            self.connected.set()
-
-            # Clear stop signal now that we're connected
-            self.should_stop_processing.clear()
-
-            # Authenticate
-            await websocket.send(json.dumps({"token": self.token, "name": self.name}))
-
-            # Wait for welcome message with dataset config
-            welcome = await websocket.recv()
-            welcome_data = json.loads(welcome)
-
-            if "error" in welcome_data:
-                logger.error(f"Authentication failed: {welcome_data['error']}")
-                self.running = False
-                return
-
-            self.worker_id = welcome_data.get("worker_id")
-            logger.info(f"Connected as {self.worker_id}")
-
-            # Extract and setup dataset configuration from orchestrator
-            dataset_config = welcome_data.get("dataset_config", {})
-            if dataset_config:
-                self._setup_dataset_loader(dataset_config)
-                logger.info(f"Received dataset config: {dataset_config}")
-            else:
-                logger.warning("No dataset configuration received from orchestrator")
-
-            # Update vLLM config if provided (in case it changed)
-            new_vllm_config = welcome_data.get("vllm_config")
-            if new_vllm_config and new_vllm_config != self.vllm_config:
-                logger.info("Received updated vLLM configuration")
-
-                # Handle config update (may trigger reload)
-                if not self._handle_vllm_config_update(new_vllm_config):
-                    logger.error("Failed to update vLLM configuration")
-                    # Continue with existing config
-
-            if self.job_mode:
-                # In job mode, request individual jobs instead of chunks
-                tasks.append(asyncio.create_task(self._job_request_loop()))
-            else:
-                # Request initial chunks
-                await websocket.send(json.dumps({"type": "request_chunks", "count": 2}))
-
-            # Start processing
-            try:
-                # Create tasks
-                tasks = [
-                    asyncio.create_task(self._heartbeat_loop()),
-                    asyncio.create_task(self._message_handler()),
-                    asyncio.create_task(self._result_sender()),
-                ]
-
-                # Wait for any task to complete (likely due to disconnection)
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-                # Cancel remaining tasks
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-
-            finally:
-                # Ensure we mark as disconnected
-                self.connected.clear()
-                self.websocket = None
-
-    async def _message_handler(self):
-        """Handle messages from orchestrator."""
-        try:
-            async for message in self.websocket:
-                try:
-                    data = json.loads(message)
-                    msg_type = data.get("type")
-
-                    if msg_type == "shard_assignment":
-                        chunks = data["chunks"]
-                        for chunk_data in chunks:
-                            chunk = ShardChunk(**chunk_data)
-                            with self.chunk_lock:
-                                self.assigned_chunks.append(chunk)
-                            logger.info(f"Received chunk assignment: {chunk.chunk_id}")
-
-                    elif msg_type == "no_chunks":
-                        reason = data.get("reason", "unknown")
-                        logger.info(f"No chunks available from orchestrator (reason: {reason})")
-
-                        # Different wait times based on reason
-                        wait_time = 2 if reason == "state_restoring" else 10
-                        await asyncio.sleep(wait_time)
-
-                        # Request again after waiting
-                        if self.websocket and self.connected.is_set():
-                            await self.websocket.send(
-                                json.dumps({"type": "request_chunks", "count": 2})
-                            )
-
-                    elif msg_type == "reload_vllm":
-                        # Orchestrator requested vLLM reload
-                        logger.info("Orchestrator requested vLLM reload")
-                        new_config = data.get("vllm_config")
-                        if new_config:
-                            self._handle_vllm_config_update(new_config)
-
-                    elif msg_type == "job_assignment":
-                        await self._handle_job_assignment(data["job"])
-
-                    elif msg_type == "no_jobs":
-                        logger.debug("No jobs available")
-                        await asyncio.sleep(2)
-
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid message format: {e}")
-                except Exception as e:
-                    logger.error(f"Error handling message: {e}")
-
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.info(f"Connection closed by orchestrator: {e}")
-            raise  # Re-raise to trigger cleanup
         except Exception as e:
-            logger.error(f"Message handler error: {e}")
-            raise
+            logger.error(f"Error handling job assignment: {e}")
+
+    async def _job_request_loop(self):
+        """Request jobs from orchestrator in job mode."""
+        while self.running and self.connected.is_set():
+            try:
+                # Check if we need more work
+                if self.readahead_queue.qsize() < self.vllm_config.get("batch_size", 8):
+                    await self.websocket.send(json.dumps({"type": "request_job"}))
+
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Job request error: {e}")
+                await asyncio.sleep(5)
 
     def _shard_reader_thread(self):
         """Background thread that reads from WebDataset shards."""
@@ -1024,64 +921,3 @@ class VLLMWorker:
         except asyncio.CancelledError:
             logger.debug("Result sender cancelled")
             raise
-
-    async def _heartbeat_loop(self):
-        """Send periodic heartbeats with connection checking."""
-        try:
-            while self.running and self.connected.is_set():
-                try:
-                    if self.websocket:
-                        await self.websocket.send(
-                            json.dumps(
-                                {
-                                    "type": "heartbeat",
-                                    "processed": self.items_processed,
-                                    "failed": self.items_failed,
-                                    "chunks_completed": self.chunks_completed,
-                                    "current_chunk": (
-                                        self.current_chunk.chunk_id if self.current_chunk else None
-                                    ),
-                                    "chunk_progress": self.current_chunk_progress,
-                                    "queue_sizes": {
-                                        "readahead": self.readahead_queue.qsize(),
-                                        "inference": self.inference_queue.qsize(),
-                                        "results": self.result_queue.qsize(),
-                                    },
-                                }
-                            )
-                        )
-                    await asyncio.sleep(30)
-                except websockets.exceptions.ConnectionClosed as e:
-                    logger.info(f"Connection lost during heartbeat: {e}")
-                    raise  # Re-raise to trigger task completion
-                except Exception as e:
-                    logger.error(f"Heartbeat error: {e}")
-                    raise  # Re-raise to trigger task completion
-        except asyncio.CancelledError:
-            logger.debug("Heartbeat loop cancelled")
-            raise
-
-    async def shutdown(self):
-        """Graceful shutdown."""
-        logger.info("Shutting down worker...")
-        self.running = False
-        self.connected.clear()
-        self.should_stop_processing.set()
-
-        # Stop processing threads by adding stop signals
-        self.readahead_queue.put(None)
-        self.inference_queue.put(None)
-
-        # Shutdown image processor
-        if self.image_processor is not None:
-            self.image_processor.shutdown()
-
-        # Close websocket if connected
-        if self.websocket:
-            try:
-                await self.websocket.close()
-            except:
-                pass
-            self.websocket = None
-
-        logger.info("Worker shutdown complete")

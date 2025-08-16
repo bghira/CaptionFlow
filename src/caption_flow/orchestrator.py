@@ -283,7 +283,7 @@ class Orchestrator:
             "expected_rate": 0.0,
         }
 
-        # Data sample queue for VLLMWorkers
+        # Data sample queue for CaptionWorker
         self.data_sample_queue = asyncio.Queue(maxsize=1000)
         self.data_workers: Dict[str, WebSocketServerProtocol] = {}
 
@@ -1079,7 +1079,7 @@ class Orchestrator:
         elif msg_type == "submit_captions":
             await self._handle_captions_submission(worker_id, data)
         elif msg_type == "request_job":
-            # VLLMWorker requesting a job from data samples
+            # CaptionWorker requesting a job from data samples
             try:
                 job = await asyncio.wait_for(self.data_sample_queue.get(), timeout=5)
                 await self.workers[worker_id].send(

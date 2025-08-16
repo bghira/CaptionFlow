@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import ssl
 import io
 import time
 from dataclasses import dataclass
@@ -12,13 +11,13 @@ from typing import Dict, Any, Optional, List, AsyncIterator
 from queue import Queue, Empty
 from threading import Thread, Event
 
-import websockets
-from websockets.client import WebSocketClientProtocol
 import pandas as pd
 import pyarrow.parquet as pq
 from PIL import Image
 import boto3
 from botocore.config import Config
+
+from .base_worker import BaseWorker
 
 logger = logging.getLogger(__name__)
 
@@ -33,59 +32,94 @@ class DataSample:
     metadata: Optional[Dict[str, Any]] = None
 
 
-class DataWorker:
+class DataWorker(BaseWorker):
     """Worker that retrieves data from various sources and forwards to orchestrator/storage."""
 
     def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.server_url = config["server"]
-        self.token = config["token"]
-        self.name = config.get("name", "data_worker")
+        super().__init__(config)
 
         # Data source configuration
-        self.data_source = config.get(
-            "data_source"
-        )  # Path to .jsonl, .csv, .parquet, or HF dataset
-        self.source_type = config.get(
-            "source_type", "auto"
-        )  # auto, jsonl, csv, parquet, huggingface
+        self.data_source = config.get("data_source")
+        self.source_type = config.get("source_type", "auto")
         self.batch_size = config.get("batch_size", 10)
 
         # Storage configuration (will be updated from orchestrator)
         self.storage_config = None
         self.s3_client = None
 
-        # SSL configuration
-        self.ssl_context = self._setup_ssl()
-
-        # State
-        self.worker_id: Optional[str] = None
-        self.websocket: Optional[WebSocketClientProtocol] = None
-        self.running = False
-        self.connected = Event()
+        # State specific to data worker
         self.can_send = Event()  # For backpressure
 
         # Queues
         self.send_queue = Queue(maxsize=100)
 
-        # Metrics
+    def _init_metrics(self):
+        """Initialize data worker metrics."""
         self.samples_sent = 0
         self.samples_stored = 0
         self.samples_failed = 0
 
-    def _setup_ssl(self) -> Optional[ssl.SSLContext]:
-        """Configure SSL context."""
-        if self.server_url.startswith("ws://"):
-            logger.warning("Using insecure WebSocket connection")
-            return None
+    def _get_auth_data(self) -> Dict[str, Any]:
+        """Get authentication data."""
+        return {"token": self.token, "name": self.name, "role": "data_worker"}
 
-        if not self.config.get("verify_ssl", True):
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            return context
+    async def _handle_welcome(self, welcome_data: Dict[str, Any]):
+        """Handle welcome message from orchestrator."""
+        self.storage_config = welcome_data.get("storage_config", {})
 
-        return ssl.create_default_context()
+        # Setup S3 if configured
+        if self.storage_config.get("s3", {}).get("enabled"):
+            self._setup_s3_client(self.storage_config["s3"])
+
+        logger.info(f"Storage config: {self.storage_config}")
+
+        # Start with ability to send
+        self.can_send.set()
+
+    async def _handle_message(self, data: Dict[str, Any]):
+        """Handle message from orchestrator."""
+        msg_type = data.get("type")
+
+        if msg_type == "backpressure":
+            # Orchestrator is overwhelmed
+            self.can_send.clear()
+            logger.info("Received backpressure signal")
+
+        elif msg_type == "resume":
+            # Orchestrator ready for more
+            self.can_send.set()
+            logger.info("Received resume signal")
+
+    def _get_heartbeat_data(self) -> Dict[str, Any]:
+        """Get heartbeat data."""
+        return {
+            "type": "heartbeat",
+            "sent": self.samples_sent,
+            "stored": self.samples_stored,
+            "failed": self.samples_failed,
+            "queue_size": self.send_queue.qsize(),
+        }
+
+    async def _create_tasks(self) -> list:
+        """Create async tasks to run."""
+        return [
+            asyncio.create_task(self._heartbeat_loop()),
+            asyncio.create_task(self._base_message_handler()),
+            asyncio.create_task(self._data_processor()),
+            asyncio.create_task(self._send_loop()),
+        ]
+
+    async def _on_disconnect(self):
+        """Handle disconnection."""
+        # Clear send capability
+        self.can_send.clear()
+
+        # Clear send queue
+        try:
+            while True:
+                self.send_queue.get_nowait()
+        except Empty:
+            pass
 
     def _setup_s3_client(self, s3_config: Dict[str, Any]):
         """Setup S3 client from config."""
@@ -107,6 +141,98 @@ class DataWorker:
         except Exception as e:
             logger.error(f"Failed to setup S3 client: {e}")
             return None
+
+    async def _data_processor(self):
+        """Process data from source."""
+        try:
+            batch = []
+
+            async for sample in self._load_data_source():
+                # Get image data
+                if sample.image_data:
+                    image_data = sample.image_data
+                elif sample.image_url:
+                    image_data = await self._download_image(sample.image_url)
+                    if not image_data:
+                        self.samples_failed += 1
+                        continue
+                else:
+                    logger.warning(f"No image data for sample {sample.sample_id}")
+                    continue
+
+                # Store if configured
+                if self.storage_config.get("forward_to_orchestrator", True):
+                    # Add to send queue
+                    batch.append(
+                        {
+                            "sample_id": sample.sample_id,
+                            "image_data": image_data,
+                            "metadata": sample.metadata,
+                        }
+                    )
+
+                    if len(batch) >= self.batch_size:
+                        # Wait for backpressure clearance
+                        await asyncio.wait_for(self.can_send.wait(), timeout=300)
+
+                        # Add batch to send queue
+                        try:
+                            self.send_queue.put_nowait(batch)
+                            batch = []
+                        except:
+                            # Queue full, wait
+                            await asyncio.sleep(1)
+
+                # Store locally/S3 if configured
+                if self.storage_config.get("local", {}).get("enabled") or self.storage_config.get(
+                    "s3", {}
+                ).get("enabled"):
+                    if await self._store_sample(sample, image_data):
+                        self.samples_stored += 1
+
+            # Send remaining batch
+            if batch and self.storage_config.get("forward_to_orchestrator", True):
+                await asyncio.wait_for(self.can_send.wait(), timeout=300)
+                self.send_queue.put_nowait(batch)
+
+        except Exception as e:
+            logger.error(f"Data processing error: {e}")
+
+    async def _send_loop(self):
+        """Send data samples to orchestrator."""
+        while self.running and self.connected.is_set():
+            try:
+                # Get batch from queue
+                batch = await asyncio.get_event_loop().run_in_executor(
+                    None, self.send_queue.get, True, 1
+                )
+
+                if batch and self.websocket:
+                    # Send samples
+                    await self.websocket.send(
+                        json.dumps(
+                            {
+                                "type": "submit_samples",
+                                "samples": [
+                                    {"sample_id": s["sample_id"], "metadata": s["metadata"]}
+                                    for s in batch
+                                ],
+                                "batch_size": len(batch),
+                            }
+                        )
+                    )
+
+                    # Send actual image data separately
+                    for sample in batch:
+                        await self.websocket.send(sample["image_data"])
+
+                    self.samples_sent += len(batch)
+                    logger.info(f"Sent batch of {len(batch)} samples")
+
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Send error: {e}")
 
     async def _load_data_source(self) -> AsyncIterator[DataSample]:
         """Load data from configured source."""
@@ -282,201 +408,3 @@ class DataWorker:
                 logger.error(f"Failed to store to S3: {e}")
 
         return stored
-
-    async def start(self):
-        """Start the data worker."""
-        self.running = True
-
-        # Connect and get configuration
-        while self.running:
-            try:
-                await self._connect_and_run()
-            except Exception as e:
-                logger.error(f"Connection error: {e}")
-                await asyncio.sleep(5)
-
-    async def _connect_and_run(self):
-        """Connect to orchestrator and process data."""
-        logger.info(f"Connecting to {self.server_url}")
-
-        async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
-            self.websocket = websocket
-            self.connected.set()
-            self.can_send.set()  # Start with ability to send
-
-            # Authenticate
-            await websocket.send(
-                json.dumps({"token": self.token, "name": self.name, "role": "data_worker"})
-            )
-
-            # Wait for welcome message with storage config
-            welcome = await websocket.recv()
-            welcome_data = json.loads(welcome)
-
-            if "error" in welcome_data:
-                logger.error(f"Authentication failed: {welcome_data['error']}")
-                self.running = False
-                return
-
-            self.worker_id = welcome_data.get("worker_id")
-            self.storage_config = welcome_data.get("storage_config", {})
-
-            # Setup S3 if configured
-            if self.storage_config.get("s3", {}).get("enabled"):
-                self._setup_s3_client(self.storage_config["s3"])
-
-            logger.info(f"Connected as {self.worker_id}")
-            logger.info(f"Storage config: {self.storage_config}")
-
-            # Start processing
-            tasks = [
-                asyncio.create_task(self._message_handler()),
-                asyncio.create_task(self._data_processor()),
-                asyncio.create_task(self._send_loop()),
-                asyncio.create_task(self._heartbeat_loop()),
-            ]
-
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-            for task in pending:
-                task.cancel()
-
-    async def _message_handler(self):
-        """Handle messages from orchestrator."""
-        async for message in self.websocket:
-            try:
-                data = json.loads(message)
-                msg_type = data.get("type")
-
-                if msg_type == "backpressure":
-                    # Orchestrator is overwhelmed
-                    self.can_send.clear()
-                    logger.info("Received backpressure signal")
-
-                elif msg_type == "resume":
-                    # Orchestrator ready for more
-                    self.can_send.set()
-                    logger.info("Received resume signal")
-
-            except Exception as e:
-                logger.error(f"Error handling message: {e}")
-
-    async def _data_processor(self):
-        """Process data from source."""
-        try:
-            batch = []
-
-            async for sample in self._load_data_source():
-                # Get image data
-                if sample.image_data:
-                    image_data = sample.image_data
-                elif sample.image_url:
-                    image_data = await self._download_image(sample.image_url)
-                    if not image_data:
-                        self.samples_failed += 1
-                        continue
-                else:
-                    logger.warning(f"No image data for sample {sample.sample_id}")
-                    continue
-
-                # Store if configured
-                if self.storage_config.get("forward_to_orchestrator", True):
-                    # Add to send queue
-                    batch.append(
-                        {
-                            "sample_id": sample.sample_id,
-                            "image_data": image_data,
-                            "metadata": sample.metadata,
-                        }
-                    )
-
-                    if len(batch) >= self.batch_size:
-                        # Wait for backpressure clearance
-                        await asyncio.wait_for(self.can_send.wait(), timeout=300)
-
-                        # Add batch to send queue
-                        try:
-                            self.send_queue.put_nowait(batch)
-                            batch = []
-                        except:
-                            # Queue full, wait
-                            await asyncio.sleep(1)
-
-                # Store locally/S3 if configured
-                if self.storage_config.get("local", {}).get("enabled") or self.storage_config.get(
-                    "s3", {}
-                ).get("enabled"):
-                    if await self._store_sample(sample, image_data):
-                        self.samples_stored += 1
-
-            # Send remaining batch
-            if batch and self.storage_config.get("forward_to_orchestrator", True):
-                await asyncio.wait_for(self.can_send.wait(), timeout=300)
-                self.send_queue.put_nowait(batch)
-
-        except Exception as e:
-            logger.error(f"Data processing error: {e}")
-
-    async def _send_loop(self):
-        """Send data samples to orchestrator."""
-        while self.running and self.connected.is_set():
-            try:
-                # Get batch from queue
-                batch = await asyncio.get_event_loop().run_in_executor(
-                    None, self.send_queue.get, True, 1
-                )
-
-                if batch and self.websocket:
-                    # Send samples
-                    await self.websocket.send(
-                        json.dumps(
-                            {
-                                "type": "submit_samples",
-                                "samples": [
-                                    {"sample_id": s["sample_id"], "metadata": s["metadata"]}
-                                    for s in batch
-                                ],
-                                "batch_size": len(batch),
-                            }
-                        )
-                    )
-
-                    # Send actual image data separately
-                    for sample in batch:
-                        await self.websocket.send(sample["image_data"])
-
-                    self.samples_sent += len(batch)
-                    logger.info(f"Sent batch of {len(batch)} samples")
-
-            except Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Send error: {e}")
-
-    async def _heartbeat_loop(self):
-        """Send periodic heartbeats."""
-        while self.running and self.connected.is_set():
-            try:
-                await self.websocket.send(
-                    json.dumps(
-                        {
-                            "type": "heartbeat",
-                            "sent": self.samples_sent,
-                            "stored": self.samples_stored,
-                            "failed": self.samples_failed,
-                            "queue_size": self.send_queue.qsize(),
-                        }
-                    )
-                )
-                await asyncio.sleep(30)
-            except:
-                break
-
-    async def shutdown(self):
-        """Graceful shutdown."""
-        logger.info("Shutting down data worker...")
-        self.running = False
-        self.connected.clear()
-
-        if self.websocket:
-            await self.websocket.close()
