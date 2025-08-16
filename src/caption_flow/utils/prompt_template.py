@@ -116,7 +116,7 @@ class PromptTemplateManager:
                 prompt = template.format(item_data)
                 formatted.append(prompt)
             except Exception as e:
-                logger.error(f"Error formatting prompt template: {e}")
+                logger.error(f"Error formatting prompt template '{template.template}': {e}")
                 # Fall back to raw template
                 formatted.append(template.template)
 
