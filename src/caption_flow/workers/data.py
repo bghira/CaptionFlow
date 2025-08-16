@@ -17,7 +17,7 @@ from PIL import Image
 import boto3
 from botocore.config import Config
 
-from .base_worker import BaseWorker
+from .base import BaseWorker
 
 logger = logging.getLogger(__name__)
 

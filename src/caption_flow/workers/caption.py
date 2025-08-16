@@ -8,6 +8,7 @@ import asyncio
 import io
 import json
 import logging
+import websockets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,13 +21,13 @@ from PIL import Image
 import numpy as np
 from huggingface_hub import get_token
 
-from .base_worker import BaseWorker
-from .models import JobStatus, Job
-from .utils import CaptionUtils
-from .utils.dataset_loader import DatasetLoader
-from .utils.vllm_config import VLLMConfigManager
-from .utils.image_processor import ImageProcessor
-from .utils.shard_processor import HFDatasetShardProcessor, WebDatasetShardProcessor
+from .base import BaseWorker
+from ..models import JobStatus, Job
+from ..utils import CaptionUtils
+from ..utils.dataset_loader import DatasetLoader
+from ..utils.vllm_config import VLLMConfigManager
+from ..utils.image_processor import ImageProcessor
+from ..utils.shard_processor import HFDatasetShardProcessor, WebDatasetShardProcessor
 
 logger = logging.getLogger(__name__)
 
