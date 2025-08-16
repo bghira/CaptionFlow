@@ -15,7 +15,6 @@ from rich.logging import RichHandler
 from datetime import datetime
 
 from .orchestrator import Orchestrator
-from .worker import Worker
 from .monitor import Monitor
 from .utils.certificates import CertificateManager
 
@@ -240,11 +239,11 @@ def worker(ctx, config: Optional[str], **kwargs):
 
     # Choose worker type
     if kwargs.get("vllm") or config_data.get("vllm"):
-        from .worker_vllm import VLLMWorker
+        from .workers.caption import CaptionWorker
 
-        worker_instance = VLLMWorker(config_data)
+        worker_instance = CaptionWorker(config_data)
     else:
-        worker_instance = Worker(config_data)
+        raise ValueError(f"Not sure how to handle worker for {config_data.get('type')} type setup.")
 
     try:
         asyncio.run(worker_instance.start())

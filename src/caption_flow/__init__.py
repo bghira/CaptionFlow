@@ -3,7 +3,8 @@
 __version__ = "0.1.0"
 
 from .orchestrator import Orchestrator
-from .worker import Worker
+from .workers.data import DataWorker
+from .workers.caption import CaptionWorker
 from .monitor import Monitor
 
-__all__ = ["Orchestrator", "Worker", "Monitor"]
+__all__ = ["Orchestrator", "DataWorker", "CaptionWorker", "Monitor"]
