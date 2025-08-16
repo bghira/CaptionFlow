@@ -15,14 +15,14 @@ orchestrator:
   min_chunk_buffer: 10 # Minimum chunks to keep ready
   dataset:
     type: "huggingface" # or "local"
-    path: "NebulaeWis/e621-2024-webp-4Mpixel" # HF dataset path or local directory
-    name: "e621"
+    path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
+    name: "pixelvision"
     version: "1.0"
 
   # vLLM configuration - distributed to all workers
   vllm:
     # Model settings
-    model: "Qwen/Qwen2.5-VL-7B-Instruct"
+    model: "Qwen/Qwen2.5-VL-3B-Instruct"
     tensor_parallel_size: 1
     max_model_len: 16384
     dtype: "float16" # or "float32", "bfloat16"

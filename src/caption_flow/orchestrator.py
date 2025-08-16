@@ -173,6 +173,27 @@ class Orchestrator:
         self.dataset_config = config.get("dataset", {})
         self.dataset_path = self.dataset_config.get("path")
         self.dataset_type = self.dataset_config.get("type", "huggingface")
+        self.dataset_split = self.dataset_config.get("split", "train")  # Add split configuration
+        self.dataset_image_column = self.dataset_config.get(
+            "image_column", "image"
+        )  # Add image column config
+
+        # Dataset components
+        self.dataset_loader = None
+        self.shard_tracker = None
+        self.chunk_tracker = None
+
+        if self.dataset_path:
+            self.dataset_loader = DatasetLoader(
+                self.dataset_path,
+                self.dataset_type,
+                self.dataset_split,  # Pass split to DatasetLoader
+                self.dataset_image_column,  # Pass image column
+            )
+            checkpoint_dir = Path(config.get("storage", {}).get("checkpoint_dir", "./checkpoints"))
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self.shard_tracker = ShardTracker(checkpoint_dir / "shards.json")
+            self.chunk_tracker = ChunkTracker(checkpoint_dir / "chunks.json")
 
         # vLLM configuration to distribute to workers
         self.vllm_config = config.get(
@@ -310,9 +331,22 @@ class Orchestrator:
         # Mark state as not restored until we process checkpoints
         self.state_restored.clear()
 
+        # Get dataset info to check format
+        dataset_info = self.dataset_loader.get_dataset_info()
+        dataset_format = dataset_info.get("dataset_format", "unknown")
+        logger.info(f"Dataset format: {dataset_format}")
+
         # Get all shards
         self.all_shards = self.dataset_loader.get_shard_list()
         self.stats["total_shards"] = len(self.all_shards)
+
+        # For HuggingFace datasets, we might need to dynamically create more shards
+        if dataset_format == "huggingface_datasets":
+            self._is_hf_dataset = True
+            self._hf_chunk_size = 10000  # Items per virtual shard
+            self._next_hf_shard_index = len(self.all_shards)  # For creating new virtual shards
+        else:
+            self._is_hf_dataset = False
 
         # Get shard status from ChunkTracker
         shards_summary = self.chunk_tracker.get_shards_summary() if self.chunk_tracker else {}
@@ -336,7 +370,10 @@ class Orchestrator:
 
         # Filter out shards that already have chunks created
         remaining_shards = [
-            shard for shard in remaining_shards if Path(shard).stem not in shards_with_chunks
+            shard
+            for shard in remaining_shards
+            if (shard if shard.startswith("hf_dataset:") else Path(shard).stem)
+            not in shards_with_chunks
         ]
 
         self.stats["completed_shards"] = len(completed_shards)
@@ -359,7 +396,11 @@ class Orchestrator:
                         # Find shard URL
                         shard_url = None
                         for url in self.all_shards:
-                            if Path(url).stem == shard_name:
+                            if url.startswith("hf_dataset:"):
+                                if url == shard_name:  # For virtual shards, use full ID
+                                    shard_url = url
+                                    break
+                            elif Path(url).stem == shard_name:
                                 shard_url = url
                                 break
 
@@ -426,7 +467,13 @@ class Orchestrator:
                 if current_shard_url is None or current_shard_index >= current_shard_items:
                     try:
                         current_shard_url = next(shard_iter)
-                        current_shard_name = Path(current_shard_url).stem
+
+                        # Extract shard name based on type
+                        if current_shard_url.startswith("hf_dataset:"):
+                            current_shard_name = current_shard_url  # Use full ID for virtual shards
+                        else:
+                            current_shard_name = Path(current_shard_url).stem
+
                         self.stats["current_shard"] = current_shard_name
 
                         # Skip if we already have chunks from this shard
@@ -439,16 +486,74 @@ class Orchestrator:
 
                         # Count items in new shard
                         logger.info(f"Loading new shard {current_shard_name}")
-                        current_shard_items = sum(
-                            1 for _ in self.dataset_loader.iterate_shard(current_shard_url)
-                        )
+
+                        # For virtual HF dataset shards, use the chunk size directly
+                        if current_shard_url.startswith("hf_dataset:"):
+                            current_shard_items = self.dataset_loader.count_shard_items(
+                                current_shard_url
+                            )
+                            logger.info(
+                                f"Virtual shard {current_shard_name} has {current_shard_items} items"
+                            )
+                        else:
+                            # For WebDataset, actually count items
+                            current_shard_items = sum(
+                                1 for _ in self.dataset_loader.iterate_shard(current_shard_url)
+                            )
+                            logger.info(
+                                f"Shard {current_shard_name} has {current_shard_items} items"
+                            )
+
                         current_shard_index = 0
-                        logger.info(f"Shard {current_shard_name} has {current_shard_items} items")
 
                     except StopIteration:
-                        # No more shards
+                        # No more shards in the iterator
+                        if self._is_hf_dataset:
+                            # Before creating new virtual shards, check if we have pending chunks
+                            with self.chunk_manager.lock:
+                                pending_count = len(self.chunk_manager.pending_chunks)
+
+                            if pending_count > 0:
+                                # Don't create new shards if we have pending chunks
+                                logger.debug(
+                                    f"Have {pending_count} pending chunks, not creating new virtual shards yet"
+                                )
+                                current_shard_url = None
+                                time.sleep(2)
+                                continue
+
+                            # For HF datasets, we can create more virtual shards on demand
+                            logger.info(
+                                "Creating additional virtual shards for HuggingFace dataset"
+                            )
+
+                            # Create 10 more virtual shards
+                            new_shards = []
+                            for i in range(10):
+                                shard_id = f"hf_dataset:{self.dataset_path}:chunk:{self._next_hf_shard_index * self._hf_chunk_size}"
+                                new_shards.append(shard_id)
+                                self._next_hf_shard_index += 1
+
+                            # Add to all_shards and create new iterator
+                            self.all_shards.extend(new_shards)
+                            self.stats["total_shards"] = len(self.all_shards)
+
+                            # Filter for unprocessed shards
+                            remaining_new_shards = [
+                                s
+                                for s in new_shards
+                                if s not in shards_summary and s not in completed_shards
+                            ]
+
+                            if remaining_new_shards:
+                                shard_iter = iter(remaining_new_shards)
+                                logger.info(f"Added {len(remaining_new_shards)} new virtual shards")
+                                continue
+
+                        # No more shards to process
                         logger.info("No more shards to process")
                         break
+
                     except Exception as e:
                         logger.error(f"Error loading shard {current_shard_name}: {e}")
                         current_shard_url = None
@@ -456,7 +561,16 @@ class Orchestrator:
 
                 # Create a chunk from current shard
                 if current_shard_url and current_shard_index < current_shard_items:
-                    chunk_id = f"{current_shard_name}_chunk_{current_shard_index}"
+                    # For virtual shards, we need to handle the chunk_id differently
+                    if current_shard_url.startswith("hf_dataset:"):
+                        # Extract the base shard identifier without the start index
+                        # Format: hf_dataset:path:chunk:0 -> base is hf_dataset:path
+                        parts = current_shard_url.split(":")
+                        base_shard = ":".join(parts[:2])  # hf_dataset:path
+                        chunk_id = f"{base_shard}_chunk_{current_shard_index}"
+                    else:
+                        chunk_id = f"{current_shard_name}_chunk_{current_shard_index}"
+
                     chunk_size = min(self.chunk_size, current_shard_items - current_shard_index)
 
                     # Add to ChunkTracker
@@ -484,10 +598,14 @@ class Orchestrator:
             if chunks_created > 0:
                 logger.info(f"Created {chunks_created} chunks on demand")
 
-            # If we couldn't create any chunks and there are no more shards, we're done
+            # If we couldn't create any chunks and there are no more shards, check if it's HF dataset
             if chunks_created == 0 and current_shard_url is None:
-                logger.info("All shards processed, chunk creation complete")
-                break
+                if self._is_hf_dataset:
+                    # We can always create more virtual shards for HF datasets
+                    logger.debug("Will create more virtual shards on next iteration")
+                else:
+                    logger.info("All shards processed, chunk creation complete")
+                    break
 
             # Brief pause to avoid spinning
             time.sleep(1)
@@ -558,7 +676,9 @@ class Orchestrator:
             elif auth_ticket.role == "admin":
                 await self._handle_admin(websocket, auth_ticket)
             else:
-                await websocket.send(safe_json_dumps({"error": f"Unknown role: {auth_ticket.role}"}))
+                await websocket.send(
+                    safe_json_dumps({"error": f"Unknown role: {auth_ticket.role}"})
+                )
 
         except Exception as e:
             logger.error(f"Connection error: {e}")
@@ -604,81 +724,118 @@ class Orchestrator:
         requires_worker_restart = False
 
         try:
-            # Update vLLM configuration
-            if "vllm" in new_config:
-                old_vllm = self.vllm_config.copy()
+            # Extract orchestrator section if present
+            if "orchestrator" in new_config:
+                # Config has orchestrator wrapper, extract it
+                orchestrator_config = new_config["orchestrator"]
+            else:
+                # Config is already at orchestrator level
+                orchestrator_config = new_config
 
-                # Check each field for actual changes
-                vllm_changed = False
-                for key, value in new_config["vllm"].items():
-                    if self.vllm_config.get(key) != value:
-                        self.vllm_config[key] = value
-                        vllm_changed = True
+            # Helper function for deep comparison
+            def deep_equal(a, b):
+                """Deep comparison of two values including nested dicts and lists."""
+                if type(a) != type(b):
+                    return False
+                if isinstance(a, dict):
+                    if set(a.keys()) != set(b.keys()):
+                        return False
+                    return all(deep_equal(a[k], b[k]) for k in a.keys())
+                elif isinstance(a, (list, tuple)):
+                    if len(a) != len(b):
+                        return False
+                    return all(deep_equal(x, y) for x, y in zip(a, b))
+                else:
+                    return a == b
+
+            # Update vLLM configuration
+            if "vllm" in orchestrator_config:
+                old_vllm = self.vllm_config.copy()
+                new_vllm = orchestrator_config["vllm"]
+
+                # Check if vLLM config actually changed using deep comparison
+                vllm_changed = not deep_equal(old_vllm, new_vllm)
 
                 if vllm_changed:
+                    # Update the vLLM config
+                    self.vllm_config = new_vllm.copy()
                     updated_sections.append("vllm")
 
                     # Check if critical changes require worker restart
                     if (
-                        old_vllm.get("model") != self.vllm_config.get("model")
+                        old_vllm.get("model") != new_vllm.get("model")
                         or old_vllm.get("gpu_memory_utilization")
-                        != self.vllm_config.get("gpu_memory_utilization")
+                        != new_vllm.get("gpu_memory_utilization")
                         or old_vllm.get("tensor_parallel_size")
-                        != self.vllm_config.get("tensor_parallel_size")
+                        != new_vllm.get("tensor_parallel_size")
+                        or old_vllm.get("dtype") != new_vllm.get("dtype")
+                        or old_vllm.get("max_model_len") != new_vllm.get("max_model_len")
                     ):
                         requires_worker_restart = True
                         warnings.append(
                             "Critical vLLM changes detected - workers will be disconnected to reload"
                         )
+                        logger.info(
+                            f"Model change: {old_vllm.get('model')} -> {new_vllm.get('model')}"
+                        )
 
             # Update dataset configuration
-            if "dataset" in new_config:
-                dataset_changed = False
-                for key, value in new_config["dataset"].items():
-                    if self.dataset_config.get(key) != value:
-                        self.dataset_config[key] = value
-                        dataset_changed = True
+            if "dataset" in orchestrator_config:
+                old_dataset = self.dataset_config.copy()
+                new_dataset = orchestrator_config["dataset"]
+
+                dataset_changed = not deep_equal(old_dataset, new_dataset)
 
                 if dataset_changed:
+                    self.dataset_config = new_dataset.copy()
                     self.dataset_path = self.dataset_config.get("path")
                     self.dataset_type = self.dataset_config.get("type", "huggingface")
                     updated_sections.append("dataset")
                     warnings.append("Dataset changes will apply to new chunks only")
 
             # Update chunk settings
-            if "chunk_size" in new_config and self.chunk_size != new_config["chunk_size"]:
-                self.chunk_size = new_config["chunk_size"]
+            if (
+                "chunk_size" in orchestrator_config
+                and self.chunk_size != orchestrator_config["chunk_size"]
+            ):
+                self.chunk_size = orchestrator_config["chunk_size"]
                 self.chunk_manager.chunk_size = self.chunk_size
                 updated_sections.append("chunk_size")
 
             if (
-                "chunks_per_request" in new_config
-                and self.chunks_per_request != new_config["chunks_per_request"]
+                "chunks_per_request" in orchestrator_config
+                and self.chunks_per_request != orchestrator_config["chunks_per_request"]
             ):
-                self.chunks_per_request = new_config["chunks_per_request"]
+                self.chunks_per_request = orchestrator_config["chunks_per_request"]
                 updated_sections.append("chunks_per_request")
 
-            # Recreate auth manager
-            self.auth = AuthManager(config=new_config)
+            # Update auth configuration
+            if "auth" in orchestrator_config:
+                try:
+                    self.auth = AuthManager({"auth": orchestrator_config["auth"]})
+                    updated_sections.append("auth")
+                except Exception as e:
+                    logger.error(f"Failed to update AuthManager: {e}")
+                    warnings.append(f"Auth update failed: {e}")
 
             # Update buffer settings
             if (
-                "chunk_buffer_multiplier" in new_config
-                and self.chunk_buffer_multiplier != new_config["chunk_buffer_multiplier"]
+                "chunk_buffer_multiplier" in orchestrator_config
+                and self.chunk_buffer_multiplier != orchestrator_config["chunk_buffer_multiplier"]
             ):
-                self.chunk_buffer_multiplier = new_config["chunk_buffer_multiplier"]
+                self.chunk_buffer_multiplier = orchestrator_config["chunk_buffer_multiplier"]
                 updated_sections.append("chunk_buffer_multiplier")
 
             if (
-                "min_chunk_buffer" in new_config
-                and self.min_chunk_buffer != new_config["min_chunk_buffer"]
+                "min_chunk_buffer" in orchestrator_config
+                and self.min_chunk_buffer != orchestrator_config["min_chunk_buffer"]
             ):
-                self.min_chunk_buffer = new_config["min_chunk_buffer"]
+                self.min_chunk_buffer = orchestrator_config["min_chunk_buffer"]
                 updated_sections.append("min_chunk_buffer")
 
             # Update storage settings
-            if "storage" in new_config:
-                storage_config = new_config["storage"]
+            if "storage" in orchestrator_config:
+                storage_config = orchestrator_config["storage"]
                 storage_changed = False
 
                 if (
@@ -701,21 +858,6 @@ class Orchestrator:
                 if storage_changed:
                     updated_sections.append("storage")
 
-            # Update data worker storage config
-            if "data_worker_storage" in new_config:
-                current_dw_storage = self.config.get("data_worker_storage", {})
-                if current_dw_storage != new_config["data_worker_storage"]:
-                    self.config["data_worker_storage"] = new_config["data_worker_storage"]
-                    updated_sections.append("data_worker_storage")
-                    warnings.append("Data worker storage config will apply to new connections only")
-
-            # Update backpressure threshold
-            if "backpressure_threshold" in new_config:
-                current_threshold = getattr(self, "backpressure_threshold", 800)
-                if current_threshold != new_config["backpressure_threshold"]:
-                    self.backpressure_threshold = new_config["backpressure_threshold"]
-                    updated_sections.append("backpressure_threshold")
-
             # Check if any changes were made
             if not updated_sections:
                 await websocket.send(
@@ -729,29 +871,49 @@ class Orchestrator:
                 logger.info("Configuration reload requested but no changes detected")
                 return
 
-            # Update the main config for any other fields
-            self.config.update(new_config)
+            # Update the main config
+            if "orchestrator" in new_config:
+                self.config["orchestrator"] = orchestrator_config
+            else:
+                self.config.update(orchestrator_config)
 
             # Handle worker restart if needed
             if requires_worker_restart:
                 logger.info("Disconnecting all workers for configuration reload...")
 
-                # Disconnect all workers
-                worker_ids = list(self.workers.keys())
-                for worker_id in worker_ids:
+                # Send reload message to workers first
+                reload_msg = safe_json_dumps(
+                    {
+                        "type": "reload_vllm",
+                        "vllm_config": self.vllm_config,
+                    }
+                )
+
+                # Create a list of worker items to avoid modifying dict during iteration
+                worker_items = list(self.workers.items())
+                disconnected = []
+
+                for worker_id, ws in worker_items:
                     try:
-                        await self.workers[worker_id].close(
-                            code=1012, reason="Configuration reload"
-                        )
+                        await ws.send(reload_msg)
+                        # Give worker time to process before disconnect
+                        await asyncio.sleep(0.5)
+                        await ws.close(code=1012, reason="Configuration reload")
+                        disconnected.append(worker_id)
                     except:
-                        pass
+                        disconnected.append(worker_id)  # Still mark as disconnected if error
+
+                # Now safely clear workers dict
+                for worker_id in disconnected:
+                    if worker_id in self.workers:
+                        del self.workers[worker_id]
 
                 warnings.append(
-                    f"Disconnected {len(worker_ids)} workers - they will reconnect with new config"
+                    f"Sent reload message to {len(disconnected)} workers - they will reconnect with new config"
                 )
             else:
-                # Just notify workers about config changes
-                reload_msg = safe_json_dumps(
+                # Just notify workers about config changes without disconnecting
+                config_update_msg = safe_json_dumps(
                     {
                         "type": "config_update",
                         "vllm_config": self.vllm_config if "vllm" in updated_sections else None,
@@ -761,15 +923,21 @@ class Orchestrator:
                     }
                 )
 
+                # Create a list of worker items to avoid modifying dict during iteration
+                worker_items = list(self.workers.items())
                 disconnected = []
-                for worker_id, ws in self.workers.items():
+
+                for worker_id, ws in worker_items:
                     try:
-                        await ws.send(reload_msg)
+                        await ws.send(config_update_msg)
+                        logger.info(f"Sent config update to worker {worker_id}")
                     except:
                         disconnected.append(worker_id)
 
+                # Now safely remove disconnected workers
                 for worker_id in disconnected:
-                    del self.workers[worker_id]
+                    if worker_id in self.workers:
+                        del self.workers[worker_id]
 
             # Send success response
             await websocket.send(
@@ -788,6 +956,9 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"Configuration reload failed: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
             await websocket.send(safe_json_dumps({"type": "reload_failed", "error": str(e)}))
 
     async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_ticket):
@@ -814,8 +985,12 @@ class Orchestrator:
                 "dataset_config": {
                     "dataset_path": self.dataset_path,
                     "dataset_type": self.dataset_type,
+                    "dataset_split": self.dataset_split,  # Include split
+                    "dataset_image_column": self.dataset_image_column,  # Include image column
                     "path": self.dataset_path,  # For compatibility
                     "type": self.dataset_type,  # For compatibility
+                    "split": self.dataset_split,  # For compatibility
+                    "image_column": self.dataset_image_column,  # For compatibility
                 },
                 "vllm_config": self.vllm_config,
             }
@@ -828,7 +1003,8 @@ class Orchestrator:
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Worker {worker_id} disconnected")
         finally:
-            del self.workers[worker_id]
+            if worker_id in self.workers:
+                del self.workers[worker_id]
             self.stats["connected_workers"] = len(self.workers)
             # Release chunks in both managers
             self.chunk_manager.release_worker_chunks(worker_id)
@@ -974,23 +1150,48 @@ class Orchestrator:
     async def _check_shard_completion(self, chunk_id: str):
         """Check if a shard is complete after chunk completion."""
         # Extract shard name from chunk_id
-        shard_name = chunk_id.rsplit("_chunk_", 1)[0]
+        if chunk_id.startswith("hf_dataset:"):
+            # For virtual shards, extract the base dataset identifier
+            parts = chunk_id.split("_chunk_")
+            if len(parts) == 2:
+                # Extract base dataset from chunk prefix
+                prefix_parts = parts[0].split(":")
+                if len(prefix_parts) >= 2:
+                    shard_name = ":".join(prefix_parts[:2])  # hf_dataset:path
+                else:
+                    shard_name = parts[0]
+            else:
+                shard_name = chunk_id
+        else:
+            # Regular WebDataset shard
+            shard_name = chunk_id.rsplit("_chunk_", 1)[0]
 
         # Check if all chunks for this shard are complete
         chunk_stats = self.chunk_manager.get_stats()
-        shard_chunks = [
-            cid
-            for cid, chunk in self.chunk_manager.chunks.items()
-            if chunk.shard_name == shard_name
-        ]
+
+        # For virtual shards, we need to check chunks by normalized shard name
+        shard_chunks = []
+        for cid, chunk in self.chunk_manager.chunks.items():
+            chunk_shard_name = chunk.shard_name
+
+            # Normalize virtual shard names for comparison
+            if chunk_shard_name.startswith("hf_dataset:"):
+                parts = chunk_shard_name.split(":")
+                if len(parts) >= 4 and parts[2] == "chunk":
+                    chunk_shard_name = ":".join(parts[:2])
+
+            if chunk_shard_name == shard_name:
+                shard_chunks.append(cid)
 
         completed_chunks = [
             cid for cid in shard_chunks if self.chunk_manager.chunks[cid].status == "completed"
         ]
 
-        if len(completed_chunks) == len(shard_chunks):
+        if len(completed_chunks) == len(shard_chunks) and len(shard_chunks) > 0:
             logger.info(f"Shard {shard_name} complete!")
-            self.shard_tracker.mark_complete(shard_name)
+            # Don't mark virtual shards as complete in ShardTracker
+            if not shard_name.startswith("hf_dataset:"):
+                self.shard_tracker.mark_complete(shard_name)
             self.stats["completed_shards"] += 1
             await self._send_activity(f"Shard {shard_name} completed!")
 
@@ -1119,7 +1320,8 @@ class Orchestrator:
 
         # Send to all monitors
         disconnected = set()
-        for monitor in self.monitors:
+        _monitors = self.monitors.copy()
+        for monitor in _monitors:
             try:
                 await monitor.send(message)
             except websockets.exceptions.ConnectionClosed:
