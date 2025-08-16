@@ -7,7 +7,6 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Generator, Tuple, Optional
 from threading import Event
-from queue import Queue
 
 import webdataset as wds
 from PIL import Image
