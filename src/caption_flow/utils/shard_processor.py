@@ -5,7 +5,8 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Generator, Tuple, Optional
+from typing import Generator, Tuple, Optional, Dict, Any
+from dataclasses import dataclass
 from threading import Event
 import shlex
 
@@ -78,6 +79,51 @@ class HFDatasetShardProcessor(ShardProcessor):
             items_processed += 1
             yield key, url, image_data
 
+    def iterate_chunk_with_metadata(
+        self,
+        chunk,
+        dataset_loader: Optional[DatasetLoader],
+        should_stop: Event,
+        connected: Event,
+    ) -> Generator[Tuple[str, str, bytes, Dict[str, Any]], None, None]:
+        """
+        Process HuggingFace virtual shard chunk with metadata.
+
+        Yields:
+            Tuple of (key, url, image_data, metadata)
+        """
+        if not dataset_loader:
+            logger.error("No dataset loader configured for HuggingFace dataset shard")
+            return
+
+        items_processed = 0
+
+        # Construct proper virtual shard URL
+        parts = chunk.shard_url.split("_chunk_")
+        if len(parts) == 2:
+            base_path = parts[0]
+            virtual_shard_url = f"{base_path}:chunk:{chunk.start_index}"
+        else:
+            virtual_shard_url = chunk.shard_url
+
+        logger.debug(f"Using virtual shard URL: {virtual_shard_url}")
+
+        # Use the new iterate method that includes metadata
+        for key, url, image_data, metadata in dataset_loader.iterate_shard_with_metadata(
+            virtual_shard_url
+        ):
+            # Check if we should stop
+            if should_stop.is_set() or not connected.is_set():
+                logger.info(f"Stopping chunk processing early due to disconnect")
+                break
+
+            # Check if we've processed enough for this chunk
+            if items_processed >= chunk.chunk_size:
+                break
+
+            items_processed += 1
+            yield key, url, image_data, metadata
+
 
 class WebDatasetShardProcessor(ShardProcessor):
     """Processor for WebDataset tar shards."""
@@ -134,3 +180,27 @@ class WebDatasetShardProcessor(ShardProcessor):
             items_processed += 1
             # URL is the shard URL for WebDataset
             yield key, chunk.shard_url, image_data
+
+    def iterate_chunk_with_metadata(
+        self,
+        chunk,
+        dataset_loader: Optional[DatasetLoader],
+        should_stop: Event,
+        connected: Event,
+    ) -> Generator[Tuple[str, str, bytes, Dict[str, Any]], None, None]:
+        """
+        Process WebDataset shard chunk with metadata.
+
+        Note: WebDataset format doesn't inherently have column metadata,
+        so we return empty metadata dict unless custom handling is added.
+
+        Yields:
+            Tuple of (key, url, image_data, metadata)
+        """
+        # For WebDataset, we don't have column metadata by default
+        # You could extend this to parse .json sidecar files if your WebDataset has them
+
+        for key, url, image_data in self.iterate_chunk(
+            chunk, dataset_loader, should_stop, connected
+        ):
+            yield key, url, image_data, {}  # Empty metadata for now
