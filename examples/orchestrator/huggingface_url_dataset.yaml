@@ -18,6 +18,8 @@ orchestrator:
     path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
     name: "pixelvision"
     version: "1.0"
+    split: "images"
+    image_column: "full_image_url"
 
   # vLLM configuration - distributed to all workers
   vllm:
@@ -49,12 +51,9 @@ orchestrator:
 
     # Inference prompts - each image gets captions from all prompts
     inference_prompts:
-      - "describe this image in detail"
-      - "provide a comprehensive description of the visual content"
+      - "You're a caption bot, ONLY designed to output image descriptions. Describe what you see. DON'T explain anything else. ONLY output the description, or the application WILL CRASH."
+      - "provide a comprehensive description of the visual content. The original user provided a title ({column:title}) and a description: {column:description}"
       - "what are the key elements in this image?"
-      # Add more prompts for diverse captions
-      # - "describe the scene, including any notable objects, people, or activities"
-      # - "what story does this image tell?"
 
   storage:
     data_dir: ./caption_data
