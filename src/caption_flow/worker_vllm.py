@@ -85,6 +85,7 @@ class VLLMWorker:
         self.server_url = config["server"]
         self.token = config["token"]
         self.name = config.get("name", "worker")
+        batch_image_processing = config.get("batch_image_processing", False)
 
         # Dataset configuration will be received from orchestrator
         self.dataset_config = None
@@ -118,7 +119,10 @@ class VLLMWorker:
         self.processor = None
         self.tokenizer = None
         self.sampling_params = None
-        self.image_processor = ImageProcessor()
+        self.image_processor = None
+        # when we use batch processing for image processor, we'll have to use a persistent instance later.
+        if batch_image_processing:
+            self.image_processor = ImageProcessor()
 
         # Shard chunk processing
         self.chunk_lock = Lock()
