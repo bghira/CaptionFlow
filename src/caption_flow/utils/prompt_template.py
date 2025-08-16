@@ -11,7 +11,7 @@ class PromptTemplate:
     """Handles prompt templates with column substitution."""
 
     # Pattern to match {column:column_name} or {col:column_name}
-    COLUMN_PATTERN = re.compile(r"\{(?:column|col):(\w+)\}")
+    COLUMN_PATTERN = re.compile(r"\{(?:column|col):([\w-]+)\}")
 
     def __init__(self, template: str):
         """
