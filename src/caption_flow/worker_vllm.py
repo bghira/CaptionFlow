@@ -415,6 +415,7 @@ class VLLMWorker:
 
     async def _initial_connect_for_config(self):
         """Connect initially just to get configuration."""
+        logger.info(f"Connecting to {self.server_url}")
         async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
             # Authenticate
             await websocket.send(json.dumps({"token": self.token, "name": self.name}))
