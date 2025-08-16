@@ -10,6 +10,7 @@ import json
 import webdataset as wds
 from huggingface_hub import HfFileSystem, get_token, hf_hub_url
 from datasets import load_dataset, Dataset
+from .image_processor import ImageProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -286,67 +287,18 @@ class DatasetLoader:
                     if self.image_column in item:
                         img_data = item[self.image_column]
 
-                        # Handle different types of image data
-                        if isinstance(img_data, str):
-                            # It's a URL - download the image
-                            try:
-                                import requests
-                                from io import BytesIO
+                        # Delegate image processing to ImageProcessor
+                        image_bytes = ImageProcessor.process_image_data(img_data)
 
-                                # Download with timeout
-                                response = requests.get(
-                                    img_data,
-                                    timeout=30,
-                                    headers={
-                                        "User-Agent": "Mozilla/5.0 (captionflow-dataset-loader)"
-                                    },
-                                )
-                                response.raise_for_status()
-                                image_data = response.content
-
-                                # Verify it's an image by trying to open it
-                                from PIL import Image
-
-                                img = Image.open(BytesIO(image_data))
-                                img.verify()  # Verify it's a valid image
-
-                            except Exception as e:
-                                logger.error(f"Failed to download image from {img_data}: {e}")
-                                import traceback
-
-                                logger.error(traceback.format_exc())
-                                # Skip this item
-                                items_processed += 1
-                                continue
-
-                        elif hasattr(img_data, "__class__") and "Image" in str(img_data.__class__):
-                            # It's a PIL Image object
-                            import io
-                            from PIL import Image
-
-                            # Save as PNG bytes
-                            img_bytes = io.BytesIO()
-                            # Convert to RGB
-                            img_data = img_data.convert("RGB")
-                            img_data.save(img_bytes, format="PNG")
-                            image_data = img_bytes.getvalue()
-
-                        elif isinstance(img_data, bytes):
-                            # Already bytes
-                            image_data = img_data
-
+                        if image_bytes:
+                            # URL is virtual for HF datasets
+                            url = f"hf://{dataset_path}#{start_idx + items_processed}"
+                            items_processed += 1
+                            yield key, url, image_bytes
                         else:
-                            logger.warning(
-                                f"Unknown image data type for item {idx}: {type(img_data)}"
-                            )
+                            logger.warning(f"Failed to process image for item {idx}")
                             items_processed += 1
                             continue
-
-                        # URL is virtual for HF datasets
-                        url = f"hf://{dataset_path}#{start_idx + items_processed}"
-
-                        items_processed += 1
-                        yield key, url, image_data
 
                     else:
                         # Try common column names if configured one doesn't exist

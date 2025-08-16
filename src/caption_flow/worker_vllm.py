@@ -36,6 +36,7 @@ from .models import JobStatus, Job
 from .utils import CaptionUtils
 from .utils.dataset_loader import DatasetLoader
 from .utils.vllm_config import VLLMConfigManager
+from .utils.image_processor import ImageProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ class VLLMWorker:
         self.server_url = config["server"]
         self.token = config["token"]
         self.name = config.get("name", "worker")
+        batch_image_processing = config.get("batch_image_processing", False)
 
         # Dataset configuration will be received from orchestrator
         self.dataset_config = None
@@ -117,6 +119,10 @@ class VLLMWorker:
         self.processor = None
         self.tokenizer = None
         self.sampling_params = None
+        self.image_processor = None
+        # when we use batch processing for image processor, we'll have to use a persistent instance later.
+        if batch_image_processing:
+            self.image_processor = ImageProcessor()
 
         # Shard chunk processing
         self.chunk_lock = Lock()
@@ -893,7 +899,7 @@ class VLLMWorker:
                 current_indices.append(idx)
 
                 # Prepare image with background replacement if needed
-                converted_img = self._prepare_image_for_inference(item.image)
+                converted_img = ImageProcessor.prepare_for_inference(item.image)
 
                 # Build requests for all prompts
                 for prompt in self.inference_prompts:
@@ -961,45 +967,6 @@ class VLLMWorker:
                 logger.info(f"Retrying {len(items_to_process)} failed items")
 
         return results
-
-    def _prepare_image_for_inference(self, image: Image.Image) -> Image.Image:
-        """Prepare image for inference, handling transparency and mostly black/white images."""
-        # Convert to RGBA to handle transparency
-        img_rgba = image.convert("RGBA")
-        rgb_img = img_rgba.convert("RGB")
-        np_img = np.array(rgb_img)
-
-        # Calculate percentage of pixels that are (0,0,0) or (255,255,255)
-        total_pixels = np_img.shape[0] * np_img.shape[1]
-        black_pixels = np.all(np_img == [0, 0, 0], axis=-1).sum()
-        white_pixels = np.all(np_img == [255, 255, 255], axis=-1).sum()
-        black_pct = black_pixels / total_pixels
-        white_pct = white_pixels / total_pixels
-
-        threshold = 0.90  # 90% threshold
-
-        is_mostly_black = black_pct >= threshold
-        is_mostly_white = white_pct >= threshold
-
-        if is_mostly_black or is_mostly_white:
-            # Replace background with opposite color for better contrast
-            bg_color = (255, 255, 255) if is_mostly_black else (0, 0, 0)
-            background = Image.new("RGB", img_rgba.size, bg_color)
-            # Use alpha channel as mask if present
-            if img_rgba.mode == "RGBA":
-                background.paste(img_rgba.convert("RGB"), mask=img_rgba.split()[3])
-            else:
-                background.paste(img_rgba.convert("RGB"))
-
-            color_type = "black" if is_mostly_black else "white"
-            pct = black_pct if is_mostly_black else white_pct
-            logger.debug(
-                f"Image is {pct*100:.1f}% {color_type}; background replaced with {bg_color}"
-            )
-
-            return background
-        else:
-            return rgb_img
 
     def _inference_thread(self):
         """Background thread for vLLM inference."""
@@ -1211,6 +1178,10 @@ class VLLMWorker:
         # Stop processing threads by adding stop signals
         self.readahead_queue.put(None)
         self.inference_queue.put(None)
+
+        # Shutdown image processor
+        if self.image_processor is not None:
+            self.image_processor.shutdown()
 
         # Close websocket if connected
         if self.websocket:
