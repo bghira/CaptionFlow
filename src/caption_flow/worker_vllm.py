@@ -36,6 +36,7 @@ from .models import JobStatus, Job
 from .utils import CaptionUtils
 from .utils.dataset_loader import DatasetLoader
 from .utils.vllm_config import VLLMConfigManager
+from .utils.image_processor import ImageProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ class VLLMWorker:
         self.server_url = config["server"]
         self.token = config["token"]
         self.name = config.get("name", "worker")
+        batch_image_processing = config.get("batch_image_processing", False)
 
         # Dataset configuration will be received from orchestrator
         self.dataset_config = None
@@ -117,6 +119,10 @@ class VLLMWorker:
         self.processor = None
         self.tokenizer = None
         self.sampling_params = None
+        self.image_processor = None
+        # when we use batch processing for image processor, we'll have to use a persistent instance later.
+        if batch_image_processing:
+            self.image_processor = ImageProcessor()
 
         # Shard chunk processing
         self.chunk_lock = Lock()
@@ -157,12 +163,23 @@ class VLLMWorker:
         dataset_type = dataset_config.get("dataset_type") or dataset_config.get(
             "type", "huggingface"
         )
+        dataset_split = dataset_config.get("dataset_split") or dataset_config.get("split", "train")
+        dataset_image_column = dataset_config.get("dataset_image_column") or dataset_config.get(
+            "image_column", "image"
+        )
 
         if dataset_path:
-            logger.info(f"Initializing dataset loader for {dataset_type}: {dataset_path}")
-            self.dataset_loader = DatasetLoader(dataset_path, dataset_type)
+            logger.info(
+                f"Initializing dataset loader for {dataset_type}: {dataset_path} "
+                f"(split: {dataset_split}, image_column: {dataset_image_column})"
+            )
+            self.dataset_loader = DatasetLoader(
+                dataset_path, dataset_type, dataset_split, dataset_image_column
+            )
             self.dataset_config = dataset_config
             self.dataset_type = dataset_type
+            self.dataset_split = dataset_split
+            self.dataset_image_column = dataset_image_column
         else:
             logger.warning("No dataset path provided by orchestrator")
 
@@ -398,6 +415,7 @@ class VLLMWorker:
 
     async def _initial_connect_for_config(self):
         """Connect initially just to get configuration."""
+        logger.info(f"Connecting to {self.server_url}")
         async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
             # Authenticate
             await websocket.send(json.dumps({"token": self.token, "name": self.name}))
@@ -671,89 +689,173 @@ class VLLMWorker:
         """Process a single shard chunk."""
         logger.info(f"Processing shard {chunk.shard_name} from index {chunk.start_index}")
 
-        # Create WebDataset pipeline
-        if self.dataset_type == "huggingface":
-            # Use curl with auth for HuggingFace
-            url_cmd = f"pipe:curl -s -L -H 'Authorization:Bearer {shlex.quote(self.hf_token)}' {shlex.quote(chunk.shard_url)} || true"
-            ds = wds.DataPipeline(
-                wds.SimpleShardList(url_cmd),
-                wds.tarfile_to_samples(),
-                wds.to_tuple("__key__", "jpg;png;jpeg;webp"),
-            )
+        # Check if this is a virtual HuggingFace dataset shard
+        if chunk.shard_url.startswith("hf_dataset:"):
+            # Use dataset loader's iterate_shard method directly
+            # It knows how to handle virtual shards
+            if not self.dataset_loader:
+                logger.error("No dataset loader configured for HuggingFace dataset shard")
+                return
+
+            items_processed = 0
+
+            # For HF dataset chunks, we need to construct the proper virtual shard URL
+            # The chunk has the actual start index in its chunk.start_index field
+            # We need to create a virtual shard URL that includes this offset
+            parts = chunk.shard_url.split("_chunk_")
+            if len(parts) == 2:
+                base_path = parts[0]  # e.g., "hf_dataset:RareConcepts/pixelvision-670k"
+                # Construct virtual shard URL with the correct offset
+                virtual_shard_url = f"{base_path}:chunk:{chunk.start_index}"
+            else:
+                # Fallback to original URL
+                virtual_shard_url = chunk.shard_url
+
+            logger.debug(f"Using virtual shard URL: {virtual_shard_url}")
+
+            # Iterate through the virtual shard
+            for key, url, image_data in self.dataset_loader.iterate_shard(virtual_shard_url):
+                # Check if we should stop
+                if (
+                    not self.running
+                    or self.should_stop_processing.is_set()
+                    or not self.connected.is_set()
+                ):
+                    logger.info(f"Stopping chunk processing early due to disconnect")
+                    break
+
+                # Check if we've processed enough for this chunk
+                if items_processed >= chunk.chunk_size:
+                    break
+
+                try:
+                    # Load image
+                    img = Image.open(io.BytesIO(image_data))
+
+                    # Create processing item
+                    item = ProcessingItem(
+                        chunk_id=chunk.chunk_id, item_key=key, image=img, image_data=image_data
+                    )
+
+                    # Add to readahead queue
+                    timeout_end = time.time() + 30
+                    while (
+                        self.running
+                        and not self.should_stop_processing.is_set()
+                        and self.connected.is_set()
+                    ):
+                        try:
+                            self.readahead_queue.put(item, timeout=1)
+                            break
+                        except:
+                            if time.time() > timeout_end:
+                                raise TimeoutError("Queue put timeout")
+                            continue
+
+                    # If we couldn't queue due to disconnection, skip this item
+                    if not self.connected.is_set() or self.should_stop_processing.is_set():
+                        logger.debug(f"Skipping item {key} due to disconnection")
+                        break
+
+                    items_processed += 1
+                    self.current_chunk_progress = items_processed
+
+                    # Batch items for inference
+                    batch_size = self.vllm_config.get("batch_size", 8)
+                    if self.readahead_queue.qsize() >= batch_size:
+                        self._batch_for_inference()
+
+                except Exception as e:
+                    if self.should_stop_processing.is_set():
+                        break
+                    logger.error(f"Error processing item {key}: {e}")
+                    self.items_failed += 1
+
         else:
-            # Local file
-            ds = wds.DataPipeline(
-                wds.SimpleShardList(chunk.shard_url),
-                wds.tarfile_to_samples(),
-                wds.to_tuple("__key__", "jpg;png;jpeg;webp"),
-            )
-
-        # Process items with readahead
-        items_processed = 0
-        items_to_skip = chunk.start_index
-
-        for key, image_data in ds:
-            # Check if we should stop
-            if (
-                not self.running
-                or self.should_stop_processing.is_set()
-                or not self.connected.is_set()
-            ):
-                logger.info(f"Stopping chunk processing early due to disconnect")
-                break
-
-            # Skip to start index
-            if items_to_skip > 0:
-                items_to_skip -= 1
-                continue
-
-            # Check if we've processed enough
-            if items_processed >= chunk.chunk_size:
-                break
-
-            try:
-                # Load image
-                img = Image.open(io.BytesIO(image_data))
-
-                # Create processing item
-                item = ProcessingItem(
-                    chunk_id=chunk.chunk_id, item_key=key, image=img, image_data=image_data
+            # Regular WebDataset shard processing
+            # Create WebDataset pipeline
+            if self.dataset_type == "huggingface" and not chunk.shard_url.startswith("hf_dataset:"):
+                # Use curl with auth for HuggingFace WebDataset
+                url_cmd = f"pipe:curl -s -L -H 'Authorization:Bearer {shlex.quote(self.hf_token)}' {shlex.quote(chunk.shard_url)} || true"
+                ds = wds.DataPipeline(
+                    wds.SimpleShardList(url_cmd),
+                    wds.tarfile_to_samples(),
+                    wds.to_tuple("__key__", "jpg;png;jpeg;webp"),
+                )
+            else:
+                # Local file
+                ds = wds.DataPipeline(
+                    wds.SimpleShardList(chunk.shard_url),
+                    wds.tarfile_to_samples(),
+                    wds.to_tuple("__key__", "jpg;png;jpeg;webp"),
                 )
 
-                # Add to readahead queue (blocks if full - provides backpressure)
-                # Use timeout to allow checking for disconnection
-                timeout_end = time.time() + 30
-                while (
-                    self.running
-                    and not self.should_stop_processing.is_set()
-                    and self.connected.is_set()
+            # Process items with readahead
+            items_processed = 0
+            items_to_skip = chunk.start_index
+
+            for key, image_data in ds:
+                # Check if we should stop
+                if (
+                    not self.running
+                    or self.should_stop_processing.is_set()
+                    or not self.connected.is_set()
                 ):
-                    try:
-                        self.readahead_queue.put(item, timeout=1)
+                    logger.info(f"Stopping chunk processing early due to disconnect")
+                    break
+
+                # Skip to start index
+                if items_to_skip > 0:
+                    items_to_skip -= 1
+                    continue
+
+                # Check if we've processed enough
+                if items_processed >= chunk.chunk_size:
+                    break
+
+                try:
+                    # Load image
+                    img = Image.open(io.BytesIO(image_data))
+
+                    # Create processing item
+                    item = ProcessingItem(
+                        chunk_id=chunk.chunk_id, item_key=key, image=img, image_data=image_data
+                    )
+
+                    # Add to readahead queue (blocks if full - provides backpressure)
+                    # Use timeout to allow checking for disconnection
+                    timeout_end = time.time() + 30
+                    while (
+                        self.running
+                        and not self.should_stop_processing.is_set()
+                        and self.connected.is_set()
+                    ):
+                        try:
+                            self.readahead_queue.put(item, timeout=1)
+                            break
+                        except:
+                            if time.time() > timeout_end:
+                                raise TimeoutError("Queue put timeout")
+                            continue
+
+                    # If we couldn't queue due to disconnection, skip this item
+                    if not self.connected.is_set() or self.should_stop_processing.is_set():
+                        logger.debug(f"Skipping item {key} due to disconnection")
                         break
-                    except:
-                        if time.time() > timeout_end:
-                            raise TimeoutError("Queue put timeout")
-                        continue
 
-                # If we couldn't queue due to disconnection, skip this item
-                if not self.connected.is_set() or self.should_stop_processing.is_set():
-                    logger.debug(f"Skipping item {key} due to disconnection")
-                    break
+                    items_processed += 1
+                    self.current_chunk_progress = items_processed
 
-                items_processed += 1
-                self.current_chunk_progress = items_processed
+                    # Batch items for inference
+                    batch_size = self.vllm_config.get("batch_size", 8)
+                    if self.readahead_queue.qsize() >= batch_size:
+                        self._batch_for_inference()
 
-                # Batch items for inference
-                batch_size = self.vllm_config.get("batch_size", 8)
-                if self.readahead_queue.qsize() >= batch_size:
-                    self._batch_for_inference()
-
-            except Exception as e:
-                if self.should_stop_processing.is_set():
-                    break
-                logger.error(f"Error processing item {key}: {e}")
-                self.items_failed += 1
+                except Exception as e:
+                    if self.should_stop_processing.is_set():
+                        break
+                    logger.error(f"Error processing item {key}: {e}")
+                    self.items_failed += 1
 
         # Process remaining items only if still connected
         if not self.should_stop_processing.is_set():
@@ -776,6 +878,97 @@ class VLLMWorker:
         if batch:
             self.inference_queue.put(batch)
 
+    def _process_batch_with_retries(self, batch, max_attempts=3):
+        """Process a batch of items with per-item retry logic for failed captions.
+
+        Returns:
+            List of ProcessedResult objects for successful items
+        """
+        results = []
+
+        # Track which items need processing and their retry counts
+        items_to_process = [(i, item, 0) for i, item in enumerate(batch)]
+
+        while items_to_process:
+            # Build requests for current items
+            current_batch = []
+            current_indices = []
+            requests = []
+
+            for idx, (original_idx, item, attempt_count) in enumerate(items_to_process):
+                current_batch.append((original_idx, item, attempt_count))
+                current_indices.append(idx)
+
+                # Prepare image with background replacement if needed
+                converted_img = ImageProcessor.prepare_for_inference(item.image)
+
+                # Build requests for all prompts
+                for prompt in self.inference_prompts:
+                    req = self._build_vllm_input(converted_img, prompt)
+                    requests.append(req)
+
+            # Run inference
+            outputs = self.llm.generate(requests, self.sampling_params)
+
+            # Process outputs
+            successful_items = []
+            failed_items = []
+
+            for idx, (original_idx, item, attempt_count) in enumerate(current_batch):
+                # Check if we should stop
+                if self.should_stop_processing.is_set():
+                    return results
+
+                # Extract captions for this item
+                base_idx = idx * len(self.inference_prompts)
+                captions = []
+
+                for j in range(len(self.inference_prompts)):
+                    if base_idx + j < len(outputs) and outputs[base_idx + j].outputs:
+                        original_caption = outputs[base_idx + j].outputs[0].text
+                        caption_text = self._clean_output(original_caption)
+                        if caption_text:
+                            captions.append(caption_text)
+                        else:
+                            logger.warning(
+                                f"(item {item.item_key}) caption destroyed: {original_caption}"
+                            )
+
+                if captions:
+                    # Success - add to results
+                    result = ProcessedResult(
+                        chunk_id=item.chunk_id,
+                        shard_name=Path(item.chunk_id).stem.rsplit("_chunk_", 1)[0],
+                        item_key=item.item_key,
+                        captions=captions,
+                        image_width=item.image.width,
+                        image_height=item.image.height,
+                        image_format=item.image.format or "unknown",
+                        file_size=len(item.image_data),
+                        processing_time_ms=0,  # Will be calculated by caller
+                    )
+                    results.append(result)
+                    self.items_processed += 1
+                else:
+                    # Failed - check if we should retry
+                    if attempt_count + 1 < max_attempts:
+                        failed_items.append((original_idx, item, attempt_count + 1))
+                        logger.warning(
+                            f"Item {item.item_key} failed (attempt {attempt_count + 1}/{max_attempts}), will retry"
+                        )
+                    else:
+                        logger.error(f"Item {item.item_key} failed after {max_attempts} attempts")
+                        self.items_failed += 1
+
+            # Update items to process for next iteration
+            items_to_process = failed_items
+
+            # Log retry status if we have items to retry
+            if items_to_process:
+                logger.info(f"Retrying {len(items_to_process)} failed items")
+
+        return results
+
     def _inference_thread(self):
         """Background thread for vLLM inference."""
         logger.info("Starting inference thread")
@@ -795,58 +988,28 @@ class VLLMWorker:
                 logger.debug(f"Processing batch of {len(batch)} images")
                 start_time = time.time()
 
-                # Prepare vLLM inputs
-                requests = []
-                for item in batch:
-                    # Resize for consistency
-                    item.image.thumbnail((512, 512), Image.BILINEAR)
+                # Process batch with retries
+                results = self._process_batch_with_retries(batch)
 
-                    for prompt in self.inference_prompts:
-                        req = self._build_vllm_input(item.image, prompt)
-                        requests.append(req)
+                # Calculate processing time per item
+                if results:
+                    processing_time_per_item = (time.time() - start_time) * 1000 / len(batch)
 
-                # Run inference
-                outputs = self.llm.generate(requests, self.sampling_params)
+                    # Update processing time and queue results
+                    for result in results:
+                        result.processing_time_ms = processing_time_per_item
+                        self.result_queue.put(result)
 
-                # Process outputs only if still connected
-                if not self.should_stop_processing.is_set():
-                    for i, item in enumerate(batch):
-                        # Get all prompt outputs as a list
-                        idx = i * len(self.inference_prompts)
-                        captions = []
-
-                        for j in range(len(self.inference_prompts)):
-                            if idx + j < len(outputs) and outputs[idx + j].outputs:
-                                caption_text = self._clean_output(outputs[idx + j].outputs[0].text)
-                                if caption_text:  # Only add non-empty captions
-                                    captions.append(caption_text)
-
-                        # Only create result if we have at least one caption
-                        if captions:
-                            result = ProcessedResult(
-                                chunk_id=item.chunk_id,
-                                shard_name=Path(item.chunk_id).stem.rsplit("_chunk_", 1)[0],
-                                item_key=item.item_key,
-                                captions=captions,
-                                image_width=item.image.width,
-                                image_height=item.image.height,
-                                image_format=item.image.format or "unknown",
-                                file_size=len(item.image_data),
-                                processing_time_ms=(time.time() - start_time) * 1000 / len(batch),
-                            )
-
-                            self.result_queue.put(result)
-                            self.items_processed += 1
-                        else:
-                            logger.warning(f"No valid captions generated for item {item.item_key}")
-                            self.items_failed += 1
+                logger.debug(
+                    f"Batch processing complete: {len(results)} successful, {len(batch) - len(results)} failed"
+                )
 
             except Empty:
                 continue
             except Exception as e:
                 if self.should_stop_processing.is_set():
                     continue
-                logger.error(f"Inference error: {e}")
+                logger.error(f"Inference error: {e}", exc_info=True)
 
     def _build_vllm_input(self, image: Image.Image, prompt: str) -> Dict:
         """Build vLLM input."""
@@ -1016,6 +1179,10 @@ class VLLMWorker:
         # Stop processing threads by adding stop signals
         self.readahead_queue.put(None)
         self.inference_queue.put(None)
+
+        # Shutdown image processor
+        if self.image_processor is not None:
+            self.image_processor.shutdown()
 
         # Close websocket if connected
         if self.websocket:

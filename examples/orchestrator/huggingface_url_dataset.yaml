@@ -1,0 +1,82 @@
+# Caption Flow Configuration
+
+orchestrator:
+  host: 0.0.0.0
+  port: 8765
+  #ssl:
+  #  # Use the paths output by 'caption-flow generate-cert' command
+  #  cert: /etc/letsencrypt/live/caption.example.com/fullchain.pem  # From generate-cert output
+  #  key: /etc/letsencrypt/live/caption.example.com/privkey.pem      # From generate-cert output
+
+  # Dataset configuration - centrally managed by orchestrator
+  chunk_size: 1000 # Items per chunk
+  chunks_per_request: 2 # Chunks sent to worker at once
+  chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
+  min_chunk_buffer: 10 # Minimum chunks to keep ready
+  dataset:
+    type: "huggingface" # or "local"
+    path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
+    name: "pixelvision"
+    version: "1.0"
+
+  # vLLM configuration - distributed to all workers
+  vllm:
+    # Model settings
+    model: "Qwen/Qwen2.5-VL-3B-Instruct"
+    tensor_parallel_size: 1
+    max_model_len: 16384
+    dtype: "float16" # or "float32", "bfloat16"
+    gpu_memory_utilization: 0.92
+    enforce_eager: true
+    disable_mm_preprocessor_cache: true
+    limit_mm_per_prompt:
+      image: 1
+
+    # Batching
+    batch_size: 8
+
+    # Sampling parameters
+    sampling:
+      temperature: 0.7
+      top_p: 0.95
+      max_tokens: 256
+      repetition_penalty: 1.05
+      skip_special_tokens: true
+      stop:
+        - "<|end|>"
+        - "<|endoftext|>"
+        - "<|im_end|>"
+
+    # Inference prompts - each image gets captions from all prompts
+    inference_prompts:
+      - "describe this image in detail"
+      - "provide a comprehensive description of the visual content"
+      - "what are the key elements in this image?"
+      # Add more prompts for diverse captions
+      # - "describe the scene, including any notable objects, people, or activities"
+      # - "what story does this image tell?"
+
+  storage:
+    data_dir: ./caption_data
+    checkpoint_interval: 1000
+    caption_buffer_size: 100
+    job_buffer_size: 100
+    contributor_buffer_size: 10
+    checkpoint_dir: ./checkpoints
+
+  auth:
+    worker_tokens:
+      - token: "worker-alpha-2024"
+        name: "NVIDIA 4090 1"
+      - token: "worker-beta-2024"
+        name: "NVIDIA 4090 2"
+      - token: "worker-kappa-2024"
+        name: "NVIDIA 4090 3"
+      - token: "example-worker-token"
+        name: "Example Worker Token"
+    monitor_tokens:
+      - token: "letmein"
+        name: "Default demo Monitor user"
+    admin_tokens:
+      - token: "admin-secret-2024"
+        name: "Default admin user, misconfigured system"
