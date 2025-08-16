@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Generator, Tuple, Optional
 from threading import Event
+import shlex
 
 import webdataset as wds
 from PIL import Image
@@ -93,7 +94,6 @@ class WebDatasetShardProcessor(ShardProcessor):
         connected: Event,
     ) -> Generator[Tuple[str, str, bytes], None, None]:
         """Process WebDataset shard chunk."""
-        import shlex
 
         # Create WebDataset pipeline
         if self.dataset_type == "huggingface" and not chunk.shard_url.startswith("hf_dataset:"):
