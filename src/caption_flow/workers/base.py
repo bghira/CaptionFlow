@@ -1,4 +1,3 @@
-# caption_flow.workers.base
 """Base worker class for WebSocket-based distributed workers."""
 
 import asyncio
