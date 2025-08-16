@@ -37,6 +37,7 @@ from .utils import CaptionUtils
 from .utils.dataset_loader import DatasetLoader
 from .utils.vllm_config import VLLMConfigManager
 from .utils.image_processor import ImageProcessor
+from .utils.shard_processor import HFDatasetShardProcessor, WebDatasetShardProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,10 @@ class VLLMWorker:
             self.image_processor = ImageProcessor()
 
         # Shard chunk processing
+        self.hf_processor = HFDatasetShardProcessor()
+        self.webdataset_processor = WebDatasetShardProcessor(
+            hf_token=self.hf_token, dataset_type=self.dataset_type
+        )
         self.chunk_lock = Lock()
         self.assigned_chunks = deque()
         self.current_chunk = None
@@ -689,173 +694,60 @@ class VLLMWorker:
         """Process a single shard chunk."""
         logger.info(f"Processing shard {chunk.shard_name} from index {chunk.start_index}")
 
-        # Check if this is a virtual HuggingFace dataset shard
+        # Select appropriate processor
         if chunk.shard_url.startswith("hf_dataset:"):
-            # Use dataset loader's iterate_shard method directly
-            # It knows how to handle virtual shards
-            if not self.dataset_loader:
-                logger.error("No dataset loader configured for HuggingFace dataset shard")
-                return
-
-            items_processed = 0
-
-            # For HF dataset chunks, we need to construct the proper virtual shard URL
-            # The chunk has the actual start index in its chunk.start_index field
-            # We need to create a virtual shard URL that includes this offset
-            parts = chunk.shard_url.split("_chunk_")
-            if len(parts) == 2:
-                base_path = parts[0]  # e.g., "hf_dataset:RareConcepts/pixelvision-670k"
-                # Construct virtual shard URL with the correct offset
-                virtual_shard_url = f"{base_path}:chunk:{chunk.start_index}"
-            else:
-                # Fallback to original URL
-                virtual_shard_url = chunk.shard_url
-
-            logger.debug(f"Using virtual shard URL: {virtual_shard_url}")
-
-            # Iterate through the virtual shard
-            for key, url, image_data in self.dataset_loader.iterate_shard(virtual_shard_url):
-                # Check if we should stop
-                if (
-                    not self.running
-                    or self.should_stop_processing.is_set()
-                    or not self.connected.is_set()
-                ):
-                    logger.info(f"Stopping chunk processing early due to disconnect")
-                    break
-
-                # Check if we've processed enough for this chunk
-                if items_processed >= chunk.chunk_size:
-                    break
-
-                try:
-                    # Load image
-                    img = Image.open(io.BytesIO(image_data))
-
-                    # Create processing item
-                    item = ProcessingItem(
-                        chunk_id=chunk.chunk_id, item_key=key, image=img, image_data=image_data
-                    )
-
-                    # Add to readahead queue
-                    timeout_end = time.time() + 30
-                    while (
-                        self.running
-                        and not self.should_stop_processing.is_set()
-                        and self.connected.is_set()
-                    ):
-                        try:
-                            self.readahead_queue.put(item, timeout=1)
-                            break
-                        except:
-                            if time.time() > timeout_end:
-                                raise TimeoutError("Queue put timeout")
-                            continue
-
-                    # If we couldn't queue due to disconnection, skip this item
-                    if not self.connected.is_set() or self.should_stop_processing.is_set():
-                        logger.debug(f"Skipping item {key} due to disconnection")
-                        break
-
-                    items_processed += 1
-                    self.current_chunk_progress = items_processed
-
-                    # Batch items for inference
-                    batch_size = self.vllm_config.get("batch_size", 8)
-                    if self.readahead_queue.qsize() >= batch_size:
-                        self._batch_for_inference()
-
-                except Exception as e:
-                    if self.should_stop_processing.is_set():
-                        break
-                    logger.error(f"Error processing item {key}: {e}")
-                    self.items_failed += 1
-
+            processor = self.hf_processor
         else:
-            # Regular WebDataset shard processing
-            # Create WebDataset pipeline
-            if self.dataset_type == "huggingface" and not chunk.shard_url.startswith("hf_dataset:"):
-                # Use curl with auth for HuggingFace WebDataset
-                url_cmd = f"pipe:curl -s -L -H 'Authorization:Bearer {shlex.quote(self.hf_token)}' {shlex.quote(chunk.shard_url)} || true"
-                ds = wds.DataPipeline(
-                    wds.SimpleShardList(url_cmd),
-                    wds.tarfile_to_samples(),
-                    wds.to_tuple("__key__", "jpg;png;jpeg;webp"),
-                )
-            else:
-                # Local file
-                ds = wds.DataPipeline(
-                    wds.SimpleShardList(chunk.shard_url),
-                    wds.tarfile_to_samples(),
-                    wds.to_tuple("__key__", "jpg;png;jpeg;webp"),
+            processor = self.webdataset_processor
+
+        items_processed = 0
+
+        # Iterate through chunk items using the processor
+        for key, url, image_data in processor.iterate_chunk(
+            chunk, self.dataset_loader, self.should_stop_processing, self.connected
+        ):
+            try:
+                # Load image
+                img = Image.open(io.BytesIO(image_data))
+
+                # Create processing item
+                item = ProcessingItem(
+                    chunk_id=chunk.chunk_id, item_key=key, image=img, image_data=image_data
                 )
 
-            # Process items with readahead
-            items_processed = 0
-            items_to_skip = chunk.start_index
-
-            for key, image_data in ds:
-                # Check if we should stop
-                if (
-                    not self.running
-                    or self.should_stop_processing.is_set()
-                    or not self.connected.is_set()
+                # Add to readahead queue
+                timeout_end = time.time() + 30
+                while (
+                    self.running
+                    and not self.should_stop_processing.is_set()
+                    and self.connected.is_set()
                 ):
-                    logger.info(f"Stopping chunk processing early due to disconnect")
+                    try:
+                        self.readahead_queue.put(item, timeout=1)
+                        break
+                    except:
+                        if time.time() > timeout_end:
+                            raise TimeoutError("Queue put timeout")
+                        continue
+
+                # If we couldn't queue due to disconnection, skip this item
+                if not self.connected.is_set() or self.should_stop_processing.is_set():
+                    logger.debug(f"Skipping item {key} due to disconnection")
                     break
 
-                # Skip to start index
-                if items_to_skip > 0:
-                    items_to_skip -= 1
-                    continue
+                items_processed += 1
+                self.current_chunk_progress = items_processed
 
-                # Check if we've processed enough
-                if items_processed >= chunk.chunk_size:
+                # Batch items for inference
+                batch_size = self.vllm_config.get("batch_size", 8)
+                if self.readahead_queue.qsize() >= batch_size:
+                    self._batch_for_inference()
+
+            except Exception as e:
+                if self.should_stop_processing.is_set():
                     break
-
-                try:
-                    # Load image
-                    img = Image.open(io.BytesIO(image_data))
-
-                    # Create processing item
-                    item = ProcessingItem(
-                        chunk_id=chunk.chunk_id, item_key=key, image=img, image_data=image_data
-                    )
-
-                    # Add to readahead queue (blocks if full - provides backpressure)
-                    # Use timeout to allow checking for disconnection
-                    timeout_end = time.time() + 30
-                    while (
-                        self.running
-                        and not self.should_stop_processing.is_set()
-                        and self.connected.is_set()
-                    ):
-                        try:
-                            self.readahead_queue.put(item, timeout=1)
-                            break
-                        except:
-                            if time.time() > timeout_end:
-                                raise TimeoutError("Queue put timeout")
-                            continue
-
-                    # If we couldn't queue due to disconnection, skip this item
-                    if not self.connected.is_set() or self.should_stop_processing.is_set():
-                        logger.debug(f"Skipping item {key} due to disconnection")
-                        break
-
-                    items_processed += 1
-                    self.current_chunk_progress = items_processed
-
-                    # Batch items for inference
-                    batch_size = self.vllm_config.get("batch_size", 8)
-                    if self.readahead_queue.qsize() >= batch_size:
-                        self._batch_for_inference()
-
-                except Exception as e:
-                    if self.should_stop_processing.is_set():
-                        break
-                    logger.error(f"Error processing item {key}: {e}")
-                    self.items_failed += 1
+                logger.error(f"Error processing item {key}: {e}")
+                self.items_failed += 1
 
         # Process remaining items only if still connected
         if not self.should_stop_processing.is_set():

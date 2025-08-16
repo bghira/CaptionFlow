@@ -1488,7 +1488,7 @@ class Orchestrator:
 
         # Save chunk state
         if self.chunk_tracker:
-            self.chunk_tracker.save_checkpoint()
+            self.chunk_tracker.save()
 
         # Final checkpoint
         logger.info(f"Final flush: {len(self.storage.caption_buffer)} captions in buffer")
