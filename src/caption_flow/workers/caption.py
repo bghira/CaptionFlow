@@ -626,7 +626,11 @@ class CaptionWorker(BaseWorker):
 
                 # Create processing item
                 item = ProcessingItem(
-                    chunk_id=chunk.chunk_id, item_key=key, image=img, image_data=image_data
+                    chunk_id=chunk.chunk_id,
+                    item_key=key,
+                    image=img,
+                    image_data=image_data,
+                    metadata=metadata,
                 )
 
                 # Add to readahead queue
