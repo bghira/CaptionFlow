@@ -12,7 +12,6 @@ import webdataset as wds
 from PIL import Image
 
 from .dataset_loader import DatasetLoader
-from .image_processor import ImageProcessor
 
 logger = logging.getLogger(__name__)
 
