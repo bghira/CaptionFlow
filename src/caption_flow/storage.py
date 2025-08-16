@@ -692,3 +692,23 @@ class StorageManager:
             f"Total caption entries: {self.total_caption_entries_written}, "
             f"Duplicates skipped: {self.duplicates_skipped}"
         )
+
+    async def get_storage_stats(self) -> Dict[str, Any]:
+        """Get all storage-related statistics."""
+        # Count captions on disk
+        disk_captions = await self.count_captions()
+
+        # Count captions in buffer
+        buffer_captions = sum(len(row["captions"]) for row in self.caption_buffer)
+
+        return {
+            "total_captions": disk_captions + buffer_captions,  # Include buffered captions!
+            "total_rows": await self.count_caption_rows() + len(self.caption_buffer),
+            "buffer_size": len(self.caption_buffer),
+            "total_written": self.total_captions_written,
+            "total_entries_written": self.total_caption_entries_written,
+            "duplicates_skipped": self.duplicates_skipped,
+            "total_flushes": self.total_flushes,
+            "job_buffer_size": len(self.job_buffer),
+            "contributor_buffer_size": len(self.contributor_buffer),
+        }

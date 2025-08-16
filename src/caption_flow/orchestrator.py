@@ -266,13 +266,10 @@ class Orchestrator:
             "total_chunks": 0,
             "completed_chunks": 0,
             "failed_chunks": 0,
-            "total_captions": 0,
             "connected_workers": 0,
             "total_shards": 0,
             "completed_shards": 0,
             "current_shard": None,
-            "buffer_size": 0,
-            "total_written": 0,
             "last_checkpoint": None,
         }
 
@@ -1129,10 +1126,6 @@ class Orchestrator:
         # Add to central storage buffer as a single entry
         await self.storage.save_caption(caption)
 
-        # Update statistics
-        self.stats["total_captions"] += len(captions_list)
-        self.stats["buffer_size"] = len(self.storage.caption_buffer)
-
         # Update contributor stats
         contributor = await self.storage.get_contributor(worker_id)
         if contributor:
@@ -1298,9 +1291,15 @@ class Orchestrator:
         if not self.monitors:
             return
 
+        # Get storage stats
+        storage_stats = await self.storage.get_storage_stats()
+
         # Include chunk stats
         chunk_stats = self.chunk_manager.get_stats()
         self.stats.update({f"chunks_{k}": v for k, v in chunk_stats.items()})
+
+        # Merge storage stats
+        self.stats.update(storage_stats)
 
         # Add rate information
         self.stats.update(
@@ -1373,25 +1372,29 @@ class Orchestrator:
         while True:
             await asyncio.sleep(60)
 
+            # Get current caption count from storage
+            storage_stats = await self.storage.get_storage_stats()
+            total_captions = storage_stats["total_captions"]
+
             # Force checkpoint at regular intervals
-            if self.stats["total_captions"] > 0 and self.stats["total_captions"] % interval == 0:
-                logger.info(f"Triggering checkpoint at {self.stats['total_captions']} captions")
+            if total_captions > 0 and total_captions % interval == 0:
+                logger.info(f"Triggering checkpoint at {total_captions} captions")
                 await self.storage.checkpoint()
 
                 # Update stats
                 self.stats["last_checkpoint"] = datetime.utcnow().isoformat()
-                self.stats["total_written"] = self.storage.total_captions_written
-                self.stats["buffer_size"] = len(self.storage.caption_buffer)
+                # No need to update total_written or buffer_size - they come from storage
 
                 await self._broadcast_stats()
                 logger.info(
-                    f"Checkpoint complete. Total written to disk: {self.stats['total_written']}"
+                    f"Checkpoint complete. Total written to disk: {storage_stats['total_written']}"
                 )
 
     async def _stats_update_loop(self):
         """Periodically update and broadcast stats."""
         # Track session start values
-        session_start_captions = self.stats["total_captions"]
+        storage_stats = await self.storage.get_storage_stats()
+        session_start_captions = storage_stats["total_captions"]
         session_start_time = time.time()
 
         while True:
@@ -1399,6 +1402,8 @@ class Orchestrator:
 
             # Update chunk stats
             chunk_stats = self.chunk_manager.get_stats()
+            storage_stats = await self.storage.get_storage_stats()
+            current_total_captions = storage_stats["total_captions"]
             self.stats["total_chunks"] = chunk_stats["total"]
             self.stats["completed_chunks"] = chunk_stats["completed"]
             self.stats["failed_chunks"] = chunk_stats["failed"]
@@ -1422,15 +1427,13 @@ class Orchestrator:
 
             if elapsed_since_update > 0:
                 # Calculate current rate (captions per minute)
-                caption_diff = (
-                    self.stats["total_captions"] - self.rate_tracker["last_caption_count"]
-                )
+                caption_diff = current_total_captions - self.rate_tracker["last_caption_count"]
                 self.rate_tracker["current_rate"] = (caption_diff / elapsed_since_update) * 60
 
                 # Calculate average rate since THIS SESSION started
                 session_elapsed = current_time - session_start_time
                 if session_elapsed > 0:
-                    session_captions = self.stats["total_captions"] - session_start_captions
+                    session_captions = current_total_captions - session_start_captions
                     self.rate_tracker["average_rate"] = (session_captions / session_elapsed) * 60
 
                 # Calculate expected rate based on workers
@@ -1442,7 +1445,7 @@ class Orchestrator:
 
                 # Update trackers
                 self.rate_tracker["last_update_time"] = current_time
-                self.rate_tracker["last_caption_count"] = self.stats["total_captions"]
+                self.rate_tracker["last_caption_count"] = current_total_captions
 
             # Log rate information when workers are connected
             if worker_count > 0:
@@ -1457,10 +1460,8 @@ class Orchestrator:
 
     async def _restore_state(self):
         """Restore state from storage on startup."""
-        # Update statistics
-        self.stats["total_captions"] = await self.storage.count_captions()
-
-        logger.info(f"Restored state: {self.stats['total_captions']} captions")
+        total_captions = await self.storage.count_captions()
+        logger.info(f"Restored state: {total_captions} captions")
 
     async def shutdown(self):
         """Graceful shutdown."""
