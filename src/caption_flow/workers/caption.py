@@ -10,7 +10,7 @@ import json
 import logging
 import websockets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from queue import Queue, Empty
@@ -28,6 +28,7 @@ from ..utils.dataset_loader import DatasetLoader
 from ..utils.vllm_config import VLLMConfigManager
 from ..utils.image_processor import ImageProcessor
 from ..utils.shard_processor import HFDatasetShardProcessor, WebDatasetShardProcessor
+from ..utils.prompt_template import PromptTemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class ProcessingItem:
     item_key: str
     image: Image.Image
     image_data: bytes
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -88,6 +90,7 @@ class CaptionWorker(BaseWorker):
         self.vllm_config = None
         self.inference_prompts = None
         self.vllm_config_manager = VLLMConfigManager()
+        self.prompt_template_manager = None
 
         # Backward compatibility: local config for GPU selection
         self.gpu_id = config.get("gpu_id", 0)
@@ -285,7 +288,14 @@ class CaptionWorker(BaseWorker):
                     "what are the key elements in this image?",
                 ],
             )
+            # Initialize prompt template manager after getting prompts
+            self.prompt_template_manager = PromptTemplateManager(self.inference_prompts)
 
+            # Log required columns if any
+            if self.prompt_template_manager.required_columns:
+                logger.info(
+                    f"Prompt templates require columns: {self.prompt_template_manager.required_columns}"
+                )
             self.vllm_config_manager.current_config = self.vllm_config
 
             dataset_config = welcome_data.get("dataset_config", {})
@@ -443,11 +453,17 @@ class CaptionWorker(BaseWorker):
             if change.sampling_changed:
                 self.sampling_params = self.vllm_config_manager.create_sampling_params(new_config)
 
-            # Update prompts if changed
+            # If prompts changed, update the template manager
             if change.prompts_changed:
                 self.inference_prompts = new_config.get("inference_prompts", self.inference_prompts)
-                logger.info(f"Updated inference prompts: {len(self.inference_prompts)} prompts")
+                self.prompt_template_manager = PromptTemplateManager(self.inference_prompts)
+                logger.info(f"Updated prompt templates: {len(self.inference_prompts)} prompts")
 
+                # Log required columns
+                if self.prompt_template_manager.required_columns:
+                    logger.info(
+                        f"New templates require columns: {self.prompt_template_manager.required_columns}"
+                    )
             # Update config
             self.vllm_config = new_config
             logger.info("vLLM configuration updated successfully without reload")
@@ -601,7 +617,7 @@ class CaptionWorker(BaseWorker):
         items_processed = 0
 
         # Iterate through chunk items using the processor
-        for key, url, image_data in processor.iterate_chunk(
+        for key, url, image_data, metadata in processor.iterate_chunk_with_metadata(
             chunk, self.dataset_loader, self.should_stop_processing, self.connected
         ):
             try:
@@ -692,8 +708,15 @@ class CaptionWorker(BaseWorker):
                 # Prepare image with background replacement if needed
                 converted_img = ImageProcessor.prepare_for_inference(item.image)
 
+                # Format prompts with metadata using template manager
+                if self.prompt_template_manager and item.metadata:
+                    formatted_prompts = self.prompt_template_manager.format_all(item.metadata)
+                else:
+                    # Fallback to original prompts if no metadata or templates
+                    formatted_prompts = self.inference_prompts
+
                 # Build requests for all prompts
-                for prompt in self.inference_prompts:
+                for prompt in formatted_prompts:
                     req = self._build_vllm_input(converted_img, prompt)
                     requests.append(req)
 
