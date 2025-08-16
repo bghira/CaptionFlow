@@ -1,11 +1,12 @@
-"""Chunk tracking for persistent state across restarts."""
+"""Chunk tracking using CheckpointTracker base class."""
 
-import json
 import logging
 from pathlib import Path
 from typing import Set, Dict, List, Optional, Any
 from datetime import datetime
 from dataclasses import dataclass, asdict
+
+from .checkpoint_tracker import CheckpointTracker
 
 logger = logging.getLogger(__name__)
 
@@ -44,80 +45,38 @@ class ChunkState:
         return cls(**d)
 
 
-class ChunkTracker:
+class ChunkTracker(CheckpointTracker):
     """Tracks chunk processing state persistently."""
 
     def __init__(self, checkpoint_file: Path):
-        self.checkpoint_file = checkpoint_file
         self.chunks: Dict[str, ChunkState] = {}
         self.completed_chunks: Set[str] = set()
-        self._load_checkpoint()
+        super().__init__(checkpoint_file)
 
-    def _load_checkpoint(self):
-        """Load checkpoint from disk."""
-        if self.checkpoint_file.exists():
-            try:
-                with open(self.checkpoint_file, "r") as f:
-                    data = json.load(f)
+    def _get_default_state(self) -> Dict[str, Any]:
+        """Return default state structure for new checkpoints."""
+        return {"chunks": {}}
 
-                # Load chunk states
-                for chunk_id, chunk_data in data.get("chunks", {}).items():
-                    chunk_state = ChunkState.from_dict(chunk_data)
-                    self.chunks[chunk_id] = chunk_state
-                    if chunk_state.status == "completed":
-                        self.completed_chunks.add(chunk_id)
+    def _deserialize_state(self, data: Dict[str, Any]) -> None:
+        """Deserialize loaded data into instance state."""
+        self.chunks = {}
+        self.completed_chunks = set()
 
-                logger.info(
-                    f"Loaded {len(self.chunks)} chunks from checkpoint, "
-                    f"{len(self.completed_chunks)} completed"
-                )
+        # Load chunk states
+        for chunk_id, chunk_data in data.get("chunks", {}).items():
+            chunk_state = ChunkState.from_dict(chunk_data)
+            self.chunks[chunk_id] = chunk_state
+            if chunk_state.status == "completed":
+                self.completed_chunks.add(chunk_id)
 
-            except Exception as e:
-                logger.error(f"Error loading chunk checkpoint: {e}")
-                self.chunks = {}
-                self.completed_chunks = set()
+        logger.info(
+            f"Loaded {len(self.chunks)} chunks from checkpoint, "
+            f"{len(self.completed_chunks)} completed"
+        )
 
-    def save_checkpoint(self):
-        """Save checkpoint to disk."""
-        try:
-            # Ensure parent directory exists
-            self.checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
-
-            # Convert chunks to serializable format
-            data = {
-                "chunks": {chunk_id: chunk.to_dict() for chunk_id, chunk in self.chunks.items()},
-                "updated_at": datetime.utcnow().isoformat(),
-            }
-
-            # Write atomically with absolute paths
-            tmp_file = self.checkpoint_file.parent / f"{self.checkpoint_file.name}.tmp"
-
-            # Write to temp file
-            with open(tmp_file, "w") as f:
-                json.dump(data, f, indent=2)
-
-            # Ensure temp file was created
-            if not tmp_file.exists():
-                raise IOError(f"Failed to create temporary file: {tmp_file}")
-
-            # Move atomically (use rename for same filesystem)
-            import shutil
-
-            shutil.move(str(tmp_file), str(self.checkpoint_file))
-
-            logger.debug(
-                f"Saved chunk checkpoint with {len(self.chunks)} chunks to {self.checkpoint_file}"
-            )
-
-        except Exception as e:
-            logger.error(f"Error saving chunk checkpoint: {e}", exc_info=True)
-            # Try direct write as fallback
-            try:
-                with open(self.checkpoint_file, "w") as f:
-                    json.dump(data, f, indent=2)
-                logger.info("Saved checkpoint using fallback direct write")
-            except Exception as fallback_error:
-                logger.error(f"Fallback save also failed: {fallback_error}")
+    def _serialize_state(self) -> Dict[str, Any]:
+        """Serialize instance state for saving."""
+        return {"chunks": {chunk_id: chunk.to_dict() for chunk_id, chunk in self.chunks.items()}}
 
     def add_chunk(self, chunk_id: str, shard_name: str, start_index: int, chunk_size: int) -> bool:
         """Add a new chunk. Returns False if chunk already exists and is completed."""
@@ -133,7 +92,7 @@ class ChunkTracker:
                 chunk_size=chunk_size,
                 status="pending",
             )
-            self.save_checkpoint()
+            self.save()
 
         return True
 
@@ -144,7 +103,7 @@ class ChunkTracker:
             chunk.status = "assigned"
             chunk.assigned_to = worker_id
             chunk.assigned_at = datetime.utcnow()
-            self.save_checkpoint()
+            self.save()
 
     def mark_completed(self, chunk_id: str):
         """Mark chunk as completed."""
@@ -153,7 +112,7 @@ class ChunkTracker:
             chunk.status = "completed"
             chunk.completed_at = datetime.utcnow()
             self.completed_chunks.add(chunk_id)
-            self.save_checkpoint()
+            self.save()
             logger.info(f"Chunk {chunk_id} marked as completed")
 
     def mark_failed(self, chunk_id: str):
@@ -163,7 +122,7 @@ class ChunkTracker:
             chunk.status = "pending"  # Reset to pending for retry
             chunk.assigned_to = None
             chunk.assigned_at = None
-            self.save_checkpoint()
+            self.save()
 
     def mark_pending(self, chunk_id: str):
         """Mark chunk as pending (for manual reset)."""
@@ -172,7 +131,7 @@ class ChunkTracker:
             chunk.status = "pending"
             chunk.assigned_to = None
             chunk.assigned_at = None
-            self.save_checkpoint()
+            self.save()
 
     def release_worker_chunks(self, worker_id: str):
         """Release all chunks assigned to a worker."""
@@ -183,7 +142,7 @@ class ChunkTracker:
                 chunk.assigned_to = None
                 chunk.assigned_at = None
                 released_chunks.append(chunk_id)
-        self.save_checkpoint()
+        self.save()
         return released_chunks
 
     def get_pending_chunks(self, shard_name: Optional[str] = None) -> List[str]:
@@ -206,14 +165,17 @@ class ChunkTracker:
 
     def get_stats(self) -> Dict[str, int]:
         """Get chunk statistics."""
-        stats = {
-            "total": len(self.chunks),
-            "pending": sum(1 for c in self.chunks.values() if c.status == "pending"),
-            "assigned": sum(1 for c in self.chunks.values() if c.status == "assigned"),
-            "completed": len(self.completed_chunks),
-            "failed": sum(1 for c in self.chunks.values() if c.status == "failed"),
-        }
-        return stats
+        base_stats = super().get_stats()
+        base_stats.update(
+            {
+                "total": len(self.chunks),
+                "pending": sum(1 for c in self.chunks.values() if c.status == "pending"),
+                "assigned": sum(1 for c in self.chunks.values() if c.status == "assigned"),
+                "completed": len(self.completed_chunks),
+                "failed": sum(1 for c in self.chunks.values() if c.status == "failed"),
+            }
+        )
+        return base_stats
 
     def get_shards_summary(self) -> Dict[str, Dict[str, Any]]:
         """Get summary of all shards and their chunk status."""
@@ -223,7 +185,6 @@ class ChunkTracker:
             shard_name = chunk_state.shard_name
 
             # For virtual HF dataset shards, normalize the shard name
-            # Convert "hf_dataset:path:chunk:10000" to "hf_dataset:path"
             if shard_name.startswith("hf_dataset:"):
                 parts = shard_name.split(":")
                 if len(parts) >= 4 and parts[2] == "chunk":
@@ -269,40 +230,6 @@ class ChunkTracker:
             if chunk_state.status != "completed":
                 incomplete.add(chunk_state.shard_name)
         return incomplete
-
-    def get_shards_summary(self) -> Dict[str, Dict[str, Any]]:
-        """Get summary of all shards and their chunk status."""
-        shards = {}
-
-        for chunk_id, chunk_state in self.chunks.items():
-            shard_name = chunk_state.shard_name
-            if shard_name not in shards:
-                shards[shard_name] = {
-                    "total_chunks": 0,
-                    "completed_chunks": 0,
-                    "pending_chunks": 0,
-                    "assigned_chunks": 0,
-                    "failed_chunks": 0,
-                    "is_complete": True,
-                    "chunks": [],
-                }
-
-            shards[shard_name]["chunks"].append(chunk_state)
-            shards[shard_name]["total_chunks"] += 1
-
-            if chunk_state.status == "completed":
-                shards[shard_name]["completed_chunks"] += 1
-            elif chunk_state.status == "pending":
-                shards[shard_name]["pending_chunks"] += 1
-                shards[shard_name]["is_complete"] = False
-            elif chunk_state.status == "assigned":
-                shards[shard_name]["assigned_chunks"] += 1
-                shards[shard_name]["is_complete"] = False
-            elif chunk_state.status == "failed":
-                shards[shard_name]["failed_chunks"] += 1
-                shards[shard_name]["is_complete"] = False
-
-        return shards
 
     async def sync_with_storage(self, storage_manager):
         """Sync chunk state with storage to detect already-processed chunks."""
@@ -375,4 +302,4 @@ class ChunkTracker:
 
                 logger.info(f"Inferred {len(self.completed_chunks)} completed chunks from job_ids")
 
-            self.save_checkpoint()
+            self.save()
