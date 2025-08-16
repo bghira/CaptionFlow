@@ -27,9 +27,7 @@ from websockets.server import WebSocketServerProtocol
 from .storage import StorageManager
 from .models import Caption, Contributor
 from .utils.auth import AuthManager
-from .utils.dataset_loader import DatasetLoader
-from .utils.shard_tracker import ShardTracker
-from .utils.chunk_tracker import ChunkTracker
+from .utils import DatasetLoader, ShardTracker, ChunkTracker
 from .utils.json_utils import safe_dict, safe_json_dumps, to_json_dict
 
 logger = logging.getLogger(__name__)
