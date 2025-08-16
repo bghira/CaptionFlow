@@ -18,17 +18,6 @@ from .dataset_loader import DatasetLoader
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ProcessingItemWithMetadata:
-    """Processing item that includes dataset metadata."""
-
-    chunk_id: str
-    item_key: str
-    image: Image.Image
-    image_data: bytes
-    metadata: Dict[str, Any]  # Dataset columns for this item
-
-
 class ShardProcessor(ABC):
     """Abstract base for processing dataset shards."""
 
