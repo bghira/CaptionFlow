@@ -221,8 +221,21 @@ class ChunkTracker:
 
         for chunk_id, chunk_state in self.chunks.items():
             shard_name = chunk_state.shard_name
-            if shard_name not in shards:
-                shards[shard_name] = {
+
+            # For virtual HF dataset shards, normalize the shard name
+            # Convert "hf_dataset:path:chunk:10000" to "hf_dataset:path"
+            if shard_name.startswith("hf_dataset:"):
+                parts = shard_name.split(":")
+                if len(parts) >= 4 and parts[2] == "chunk":
+                    # Use just the dataset identifier as the shard name
+                    normalized_shard_name = ":".join(parts[:2])
+                else:
+                    normalized_shard_name = shard_name
+            else:
+                normalized_shard_name = shard_name
+
+            if normalized_shard_name not in shards:
+                shards[normalized_shard_name] = {
                     "total_chunks": 0,
                     "completed_chunks": 0,
                     "pending_chunks": 0,
@@ -232,20 +245,20 @@ class ChunkTracker:
                     "chunks": [],
                 }
 
-            shards[shard_name]["chunks"].append(chunk_state)
-            shards[shard_name]["total_chunks"] += 1
+            shards[normalized_shard_name]["chunks"].append(chunk_state)
+            shards[normalized_shard_name]["total_chunks"] += 1
 
             if chunk_state.status == "completed":
-                shards[shard_name]["completed_chunks"] += 1
+                shards[normalized_shard_name]["completed_chunks"] += 1
             elif chunk_state.status == "pending":
-                shards[shard_name]["pending_chunks"] += 1
-                shards[shard_name]["is_complete"] = False
+                shards[normalized_shard_name]["pending_chunks"] += 1
+                shards[normalized_shard_name]["is_complete"] = False
             elif chunk_state.status == "assigned":
-                shards[shard_name]["assigned_chunks"] += 1
-                shards[shard_name]["is_complete"] = False
+                shards[normalized_shard_name]["assigned_chunks"] += 1
+                shards[normalized_shard_name]["is_complete"] = False
             elif chunk_state.status == "failed":
-                shards[shard_name]["failed_chunks"] += 1
-                shards[shard_name]["is_complete"] = False
+                shards[normalized_shard_name]["failed_chunks"] += 1
+                shards[normalized_shard_name]["is_complete"] = False
 
         return shards
 

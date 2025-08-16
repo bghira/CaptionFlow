@@ -17,7 +17,30 @@ class AuthManager:
     """Manages authentication tokens."""
 
     def __init__(self, config: Dict[str, Any]):
-        self.reload_config(config=config)
+        self.worker_tokens = {}
+        self.admin_tokens = {}
+        self.monitor_tokens = {}
+        if "orchestrator" in config:
+            # compatibility with nested config as well.
+            config = config.get("orchestrator").get("auth")
+
+        # Load worker tokens
+        for worker in config.get("worker_tokens", []):
+            worker_name = worker.get("name", None)
+            assert worker_name is not None, "Worker token must have a name"
+            self.worker_tokens[worker["token"]] = worker_name
+
+        # Load admin tokens
+        for admin in config.get("admin_tokens", []):
+            admin_name = admin.get("name", None)
+            assert admin_name is not None, "Admin token must have a name"
+            self.admin_tokens[admin["token"]] = admin_name
+
+        # Load monitor tokens
+        for monitor in config.get("monitor_tokens", []):
+            monitor_name = monitor.get("name", None)
+            assert monitor_name is not None, "Monitor token must have a name"
+            self.monitor_tokens[monitor["token"]] = monitor_name
 
     def authenticate(self, token: str) -> Optional[str]:
         """Authenticate token and return role."""
@@ -41,27 +64,3 @@ class AuthManager:
             role=role, name=self.worker_tokens.get(token, f"Anonymous {role}"), token=token
         )
         return worker_auth_details
-
-    def reload_config(self, config: dict) -> None:
-        """Reload configuration from file."""
-        self.worker_tokens = {}
-        self.admin_tokens = {}
-        self.monitor_tokens = {}
-
-        # Load worker tokens
-        for worker in config.get("worker_tokens", []):
-            worker_name = worker.get("name", None)
-            assert worker_name is not None, "Worker token must have a name"
-            self.worker_tokens[worker["token"]] = worker_name
-
-        # Load admin tokens
-        for admin in config.get("admin_tokens", []):
-            admin_name = admin.get("name", None)
-            assert admin_name is not None, "Admin token must have a name"
-            self.admin_tokens[admin["token"]] = admin_name
-
-        # Load monitor tokens
-        for monitor in config.get("monitor_tokens", []):
-            monitor_name = monitor.get("name", None)
-            assert monitor_name is not None, "Monitor token must have a name"
-            self.monitor_tokens[monitor["token"]] = monitor_name

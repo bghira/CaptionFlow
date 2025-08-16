@@ -168,8 +168,6 @@ def orchestrator(ctx, config: Optional[str], **kwargs):
     else:
         config_data = base_config
 
-    console.print(f"Config contents: {config_data}")
-
     # Apply CLI overrides
     if kwargs.get("port"):
         config_data["port"] = kwargs["port"]
@@ -262,84 +260,92 @@ def worker(ctx, config: Optional[str], **kwargs):
 @click.option("--no-verify-ssl", is_flag=True, help="Skip SSL verification")
 @click.option("--debug", is_flag=True, help="Enable debug output")
 @click.pass_context
-def monitor(ctx, config: Optional[str], server: Optional[str], token: Optional[str], 
-           no_verify_ssl: bool, debug: bool):
+def monitor(
+    ctx,
+    config: Optional[str],
+    server: Optional[str],
+    token: Optional[str],
+    no_verify_ssl: bool,
+    debug: bool,
+):
     """Start the monitoring TUI."""
-    
+
     # Enable debug logging if requested
     if debug:
         setup_logging(verbose=True)
         console.print("[yellow]Debug mode enabled[/yellow]")
-    
+
     # Load configuration
-    base_config = ConfigManager.find_config('monitor', config)
-    
+    base_config = ConfigManager.find_config("monitor", config)
+
     if not base_config:
         # Try to find monitor config in orchestrator config as fallback
-        orch_config = ConfigManager.find_config('orchestrator')
-        if orch_config and 'monitor' in orch_config:
-            base_config = {'monitor': orch_config['monitor']}
+        orch_config = ConfigManager.find_config("orchestrator")
+        if orch_config and "monitor" in orch_config:
+            base_config = {"monitor": orch_config["monitor"]}
             console.print("[dim]Using monitor config from orchestrator.yaml[/dim]")
         else:
             base_config = {}
             if not server or not token:
                 console.print("[yellow]No monitor config found, using CLI args[/yellow]")
-    
+
     # Handle different config structures
     # Case 1: Config has top-level 'monitor' section
-    if 'monitor' in base_config:
-        config_data = base_config['monitor']
+    if "monitor" in base_config:
+        config_data = base_config["monitor"]
     # Case 2: Config IS the monitor config (no wrapper)
     else:
         config_data = base_config
-    
+
     # Apply CLI overrides (CLI always wins)
     if server:
-        config_data['server'] = server
+        config_data["server"] = server
     if token:
-        config_data['token'] = token
+        config_data["token"] = token
     if no_verify_ssl:
-        config_data['verify_ssl'] = False
-    
+        config_data["verify_ssl"] = False
+
     # Debug output
     if debug:
         console.print("\n[cyan]Final monitor configuration:[/cyan]")
         console.print(f"  Server: {config_data.get('server', 'NOT SET')}")
-        console.print(f"  Token: {'***' + config_data.get('token', '')[-4:] if config_data.get('token') else 'NOT SET'}")
+        console.print(
+            f"  Token: {'***' + config_data.get('token', '')[-4:] if config_data.get('token') else 'NOT SET'}"
+        )
         console.print(f"  Verify SSL: {config_data.get('verify_ssl', True)}")
         console.print()
-    
+
     # Validate required fields
-    if not config_data.get('server'):
+    if not config_data.get("server"):
         console.print("[red]Error: --server required (or set 'server' in monitor.yaml)[/red]")
         console.print("\n[dim]Example monitor.yaml:[/dim]")
         console.print("server: wss://localhost:8765")
         console.print("token: your-token-here")
         sys.exit(1)
-        
-    if not config_data.get('token'):
+
+    if not config_data.get("token"):
         console.print("[red]Error: --token required (or set 'token' in monitor.yaml)[/red]")
         console.print("\n[dim]Example monitor.yaml:[/dim]")
         console.print("server: wss://localhost:8765")
         console.print("token: your-token-here")
         sys.exit(1)
-    
+
     # Set defaults for optional settings
-    config_data.setdefault('refresh_interval', 1.0)
-    config_data.setdefault('show_inactive_workers', False)
-    config_data.setdefault('max_log_lines', 100)
-    
+    config_data.setdefault("refresh_interval", 1.0)
+    config_data.setdefault("show_inactive_workers", False)
+    config_data.setdefault("max_log_lines", 100)
+
     # Create and start monitor
     try:
         monitor_instance = Monitor(config_data)
-        
+
         if debug:
             console.print("[green]Starting monitor...[/green]")
             console.print(f"[dim]Connecting to: {config_data['server']}[/dim]")
             sys.exit(1)
-        
+
         asyncio.run(monitor_instance.start())
-        
+
     except KeyboardInterrupt:
         console.print("\n[yellow]Closing monitor...[/yellow]")
     except ConnectionRefusedError:
@@ -350,8 +356,10 @@ def monitor(ctx, config: Optional[str], server: Optional[str], token: Optional[s
         console.print(f"\n[red]Error starting monitor: {e}[/red]")
         if debug:
             import traceback
+
             traceback.print_exc()
         sys.exit(1)
+
 
 @main.command()
 @click.option("--config", type=click.Path(exists=True), help="Configuration file")
@@ -376,11 +384,21 @@ def reload_config(
     if not server or not token:
         base_config = ConfigManager.find_config("orchestrator", config) or {}
         admin_config = base_config.get("admin", {})
+        admin_tokens = base_config.get("orchestrator", {}).get("auth", {}).get("admin_tokens", [])
+        has_admin_tokens = False
+        if len(admin_tokens) > 0:
+            has_admin_tokens = True
+            first_admin_token = admin_tokens[0].get("token", None)
+        # Do not print sensitive admin token to console.
 
         if not server:
-            server = admin_config.get("server")
+            server = admin_config.get("server", "ws://localhost:8765")
         if not token:
-            token = admin_config.get("token")
+            token = admin_config.get("token", None)
+            if token is None and has_admin_tokens:
+                # grab the first one, we'll just assume we're localhost.
+                console.print("Using first admin token.")
+                token = first_admin_token
 
     if not server:
         console.print("[red]Error: --server required (or set in config)[/red]")
@@ -447,7 +465,7 @@ def reload_config(
                     return True
                 else:
                     error = reload_response.get("error", "Unknown error")
-                    console.print(f"[red]Reload failed: {error}[/red]")
+                    console.print(f"[red]Reload failed: {error} ({reload_response=})[/red]")
                     return False
 
         except Exception as e:
