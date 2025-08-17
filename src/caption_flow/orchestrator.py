@@ -1093,43 +1093,63 @@ class Orchestrator:
             logger.debug(f"Heartbeat from {worker_id}: {data}")
 
     async def _handle_captions_submission(self, worker_id: str, data: Dict):
-        """Process multiple captions submission from worker."""
+        """Process caption submission from worker - now handles multi-stage outputs."""
         chunk_id = data.get("chunk_id")
         item_key = data["item_key"]
-        captions_list = data["captions"]
 
-        logger.debug(
-            f"Received {len(captions_list)} captions for item {item_key} from worker {worker_id}"
-        )
+        # Handle both old format (captions list) and new format (outputs dict)
+        if "outputs" in data:
+            # New multi-stage format
+            outputs = data["outputs"]  # Dict of field_name -> list of outputs
+            captions_list = outputs.get("captions", [])  # For backward compatibility
 
-        # Create a SINGLE caption record with ALL captions as a list
+            # Count total outputs across all fields
+            total_outputs = sum(len(v) for v in outputs.values())
+
+            logger.debug(
+                f"Received multi-stage outputs for item {item_key} from worker {worker_id}: "
+                f"{total_outputs} outputs across {len(outputs)} fields"
+            )
+        else:
+            # Old format - single captions list
+            captions_list = data["captions"]
+            outputs = {"captions": captions_list}
+            total_outputs = len(captions_list)
+
+            logger.debug(
+                f"Received {len(captions_list)} captions for item {item_key} from worker {worker_id}"
+            )
+
+        # Create caption record with multi-stage outputs
         caption = Caption(
-            job_id=f"{chunk_id}_{item_key}",  # Single ID for the item
+            job_id=f"{chunk_id}_{item_key}",
             dataset=data.get("dataset"),
             shard=data.get("shard"),
             item_key=item_key,
-            captions=captions_list,  # Store ALL captions as a list
+            captions=captions_list,  # Keep for backward compatibility
+            outputs=outputs,  # NEW: Store all outputs
             contributor_id=worker_id,
             timestamp=datetime.utcnow(),
-            quality_scores=None,  # Could be a list of scores matching captions
+            quality_scores=None,
             # Image metadata
             image_width=data.get("image_width"),
             image_height=data.get("image_height"),
             image_format=data.get("image_format"),
             file_size=data.get("file_size"),
             # Processing metadata
-            caption_count=len(captions_list),
+            caption_count=total_outputs,  # Total across all fields
             processing_time_ms=data.get("processing_time_ms"),
             chunk_id=chunk_id,
+            metadata=data.get("metadata", {}),  # NEW: Store metadata if provided
         )
 
-        # Add to central storage buffer as a single entry
+        # Add to central storage buffer
         await self.storage.save_caption(caption)
 
         # Update contributor stats
         contributor = await self.storage.get_contributor(worker_id)
         if contributor:
-            contributor.total_captions += len(captions_list)
+            contributor.total_captions += total_outputs
             await self.storage.save_contributor(contributor)
 
         # Broadcast updated stats
@@ -1137,7 +1157,7 @@ class Orchestrator:
 
         # Log progress periodically
         if self.stats["total_captions"] % 100 == 0:
-            logger.info(f"Collected {self.stats['total_captions']} captions centrally")
+            logger.info(f"Collected {self.stats['total_captions']} outputs centrally")
 
     async def _check_shard_completion(self, chunk_id: str):
         """Check if a shard is complete after chunk completion."""
@@ -1287,7 +1307,7 @@ class Orchestrator:
             self.monitors.discard(websocket)
 
     async def _broadcast_stats(self):
-        """Broadcast statistics to all monitors."""
+        """Broadcast statistics to all monitors - enhanced for multi-stage."""
         if not self.monitors:
             return
 
@@ -1310,9 +1330,22 @@ class Orchestrator:
             }
         )
 
-        # Add vLLM info
+        # Add vLLM info - now includes stage count
         self.stats["vllm_model"] = self.vllm_config.get("model", "unknown")
         self.stats["vllm_batch_size"] = self.vllm_config.get("batch_size", 0)
+
+        # NEW: Add stage information
+        stages = self.vllm_config.get("stages", [])
+        if stages:
+            self.stats["stage_count"] = len(stages)
+            self.stats["stage_names"] = [s.get("name", "unnamed") for s in stages]
+        else:
+            self.stats["stage_count"] = 1  # Backward compatibility
+            self.stats["stage_names"] = ["default"]
+
+        # NEW: Get output field statistics from storage
+        field_stats = await self.storage.get_output_field_stats()
+        self.stats["output_fields"] = field_stats
 
         message = safe_json_dumps({"type": "stats", "data": self.stats})
 

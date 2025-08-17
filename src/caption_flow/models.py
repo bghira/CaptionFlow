@@ -1,9 +1,9 @@
 """Data models for CaptionFlow."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 
 class JobStatus(Enum):
@@ -51,9 +51,10 @@ class Caption:
     timestamp: datetime
     caption_count: int = 1  # Number of captions generated for this item
     caption: Optional[str] = None
-    captions: Optional[list] = None
+    captions: Optional[List[str]] = None
+    outputs: Dict[str, List[str]] = field(default_factory=dict)
     quality_score: Optional[float] = None
-    quality_scores: Optional[list] = None
+    quality_scores: Optional[List[float]] = None
 
     # Image metadata
     image_width: Optional[int] = None
@@ -66,6 +67,7 @@ class Caption:
     total_captions: Optional[int] = None  # Total captions for this image
     processing_time_ms: Optional[float] = None
     chunk_id: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.caption is None and self.captions is None:
