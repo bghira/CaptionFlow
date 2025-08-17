@@ -346,7 +346,6 @@ class CaptionWorker(BaseWorker):
         for stage in stages:
             in_degree[stage.name] = len(stage.requires)
             for dep in stage.requires:
-                if dep in stage_map:
                 if dep not in stage_map:
                     raise ValueError(f"Stage '{stage.name}' requires missing dependency '{dep}'")
                 graph[dep].append(stage.name)
