@@ -47,6 +47,41 @@ class ShardChunk:
     assigned_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
+    @classmethod
+    def create(
+        cls, shard_url: str, shard_name: str, start_index: int, chunk_size: int
+    ) -> "ShardChunk":
+        """Factory method to create a chunk with proper ID."""
+        # Generate chunk_id based on shard type
+        if shard_url.startswith("hf_dataset:"):
+            # For HF datasets, the shard_url is already unique per chunk
+            chunk_id = shard_url
+        else:
+            # For WebDataset, create a unique ID
+            chunk_id = f"{shard_name}:chunk:{start_index}"
+
+        return cls(
+            chunk_id=chunk_id,
+            shard_url=shard_url,
+            shard_name=shard_name,
+            start_index=start_index,
+            chunk_size=chunk_size,
+        )
+
+    def belongs_to_shard(self, shard_identifier: str) -> bool:
+        """Check if this chunk belongs to a given shard."""
+        return self.shard_name == shard_identifier
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict for JSON serialization (for workers)."""
+        return {
+            "chunk_id": self.chunk_id,
+            "shard_url": self.shard_url,
+            "shard_name": self.shard_name,
+            "start_index": self.start_index,
+            "chunk_size": self.chunk_size,
+        }
+
 
 class ChunkManager:
     """Manages shard chunk creation and assignment."""
@@ -66,9 +101,7 @@ class ChunkManager:
         chunks = []
 
         for start_idx in range(0, total_items, self.chunk_size):
-            chunk_id = f"{shard_name}_chunk_{start_idx}"
-            chunk = ShardChunk(
-                chunk_id=chunk_id,
+            chunk = ShardChunk.create(
                 shard_url=shard_url,
                 shard_name=shard_name,
                 start_index=start_idx,
@@ -76,8 +109,8 @@ class ChunkManager:
             )
 
             with self.lock:
-                self.chunks[chunk_id] = chunk
-                self.pending_chunks.append(chunk_id)
+                self.chunks[chunk.chunk_id] = chunk
+                self.pending_chunks.append(chunk.chunk_id)
 
             chunks.append(chunk)
 
@@ -389,29 +422,18 @@ class Orchestrator:
             with self.chunk_manager.lock:
                 for chunk_state in shard_info["chunks"]:
                     if chunk_state.status in ["pending", "failed", "assigned"]:
-                        # Find shard URL
-                        shard_url = None
-                        for url in self.all_shards:
-                            if url.startswith("hf_dataset:"):
-                                if url == shard_name:  # For virtual shards, use full ID
-                                    shard_url = url
-                                    break
-                            elif Path(url).stem == shard_name:
-                                shard_url = url
-                                break
-
-                        if shard_url:
-                            chunk = ShardChunk(
-                                chunk_id=chunk_state.chunk_id,
-                                shard_url=shard_url,
-                                shard_name=chunk_state.shard_name,
-                                start_index=chunk_state.start_index,
-                                chunk_size=chunk_state.chunk_size,
-                            )
-                            self.chunk_manager.chunks[chunk_state.chunk_id] = chunk
-                            self.chunk_manager.pending_chunks.append(chunk_state.chunk_id)
-                            requeued_chunks_by_shard[shard_name].append(chunk_state.chunk_id)
-                            initial_pending += 1
+                        # ChunkState already has shard_url stored
+                        chunk = ShardChunk(
+                            chunk_id=chunk_state.chunk_id,
+                            shard_url=chunk_state.shard_url,
+                            shard_name=chunk_state.shard_name,
+                            start_index=chunk_state.start_index,
+                            chunk_size=chunk_state.chunk_size,
+                        )
+                        self.chunk_manager.chunks[chunk_state.chunk_id] = chunk
+                        self.chunk_manager.pending_chunks.append(chunk_state.chunk_id)
+                        requeued_chunks_by_shard[shard_name].append(chunk_state.chunk_id)
+                        initial_pending += 1
 
         logger.info(f"Re-queued {initial_pending} existing pending chunks")
         for shard_name, chunk_ids in requeued_chunks_by_shard.items():
@@ -558,33 +580,24 @@ class Orchestrator:
                 # Create a chunk from current shard
                 if current_shard_url and current_shard_index < current_shard_items:
                     # For virtual shards, we need to handle the chunk_id differently
-                    if current_shard_url.startswith("hf_dataset:"):
-                        # Extract the base shard identifier without the start index
-                        # Format: hf_dataset:path:chunk:0 -> base is hf_dataset:path
-                        parts = current_shard_url.split(":")
-                        base_shard = ":".join(parts[:2])  # hf_dataset:path
-                        chunk_id = f"{base_shard}_chunk_{current_shard_index}"
-                    else:
-                        chunk_id = f"{current_shard_name}_chunk_{current_shard_index}"
+                    chunk = ShardChunk.create(
+                        shard_url=current_shard_url,
+                        shard_name=current_shard_name,
+                        start_index=current_shard_index,
+                        chunk_size=min(self.chunk_size, current_shard_items - current_shard_index),
+                    )
 
-                    chunk_size = min(self.chunk_size, current_shard_items - current_shard_index)
-
-                    # Add to ChunkTracker
+                    # Add to ChunkTracker with all required fields
                     if self.chunk_tracker and self.chunk_tracker.add_chunk(
-                        chunk_id, current_shard_name, current_shard_index, chunk_size
+                        chunk.chunk_id,
+                        chunk.shard_name,
+                        chunk.shard_url,
+                        chunk.start_index,
+                        chunk.chunk_size,
                     ):
-                        # Create chunk
-                        chunk = ShardChunk(
-                            chunk_id=chunk_id,
-                            shard_url=current_shard_url,
-                            shard_name=current_shard_name,
-                            start_index=current_shard_index,
-                            chunk_size=chunk_size,
-                        )
-
                         with self.chunk_manager.lock:
-                            self.chunk_manager.chunks[chunk_id] = chunk
-                            self.chunk_manager.pending_chunks.append(chunk_id)
+                            self.chunk_manager.chunks[chunk.chunk_id] = chunk
+                            self.chunk_manager.pending_chunks.append(chunk.chunk_id)
 
                         chunks_created += 1
                         self.stats["total_chunks"] += 1
@@ -1031,22 +1044,13 @@ class Orchestrator:
             chunks = self.chunk_manager.get_chunks_for_worker(worker_id, count, self.chunk_tracker)
 
             if chunks:
-                # Only send the fields that worker expects
-                chunk_data = []
-                for chunk in chunks:
-                    chunk_data.append(
-                        {
-                            "chunk_id": chunk.chunk_id,
-                            "shard_url": chunk.shard_url,
-                            "shard_name": chunk.shard_name,
-                            "start_index": chunk.start_index,
-                            "chunk_size": chunk.chunk_size,
-                        }
-                    )
+                # Use the to_dict method for serialization
+                chunk_data = [chunk.to_dict() for chunk in chunks]
 
                 await self.workers[worker_id].send(
                     safe_json_dumps({"type": "shard_assignment", "chunks": chunk_data})
                 )
+
                 chunk_ids = [c["chunk_id"] for c in chunk_data]
                 logger.info(f"Assigned {len(chunks)} chunks to worker {worker_id}: {chunk_ids}")
                 await self._send_activity(f"Assigned {len(chunks)} chunks to {worker_id}")
@@ -1156,45 +1160,32 @@ class Orchestrator:
         await self._broadcast_stats()
 
         # Log progress periodically
-        if self.stats.get("total_outputs", 0) % 100 == 0:
-            logger.info(f"Collected {self.stats.get('total_outputs', 0)} outputs centrally")
+        # Only log every 100 outputs, but avoid duplicate logs for the same count
+        total_outputs = self.stats.get("total_outputs", 0)
+        if total_outputs > 0 and total_outputs % 100 == 0:
+            # Use a static variable to track last logged count
+            if (
+                not hasattr(self, "_last_logged_outputs")
+                or self._last_logged_outputs != total_outputs
+            ):
+                logger.info(f"Collected {total_outputs} outputs centrally")
+                self._last_logged_outputs = total_outputs
 
     async def _check_shard_completion(self, chunk_id: str):
         """Check if a shard is complete after chunk completion."""
-        # Extract shard name from chunk_id
-        if chunk_id.startswith("hf_dataset:"):
-            # For virtual shards, extract the base dataset identifier
-            parts = chunk_id.split("_chunk_")
-            if len(parts) == 2:
-                # Extract base dataset from chunk prefix
-                prefix_parts = parts[0].split(":")
-                if len(prefix_parts) >= 2:
-                    shard_name = ":".join(prefix_parts[:2])  # hf_dataset:path
-                else:
-                    shard_name = parts[0]
-            else:
-                shard_name = chunk_id
-        else:
-            # Regular WebDataset shard
-            shard_name = chunk_id.rsplit("_chunk_", 1)[0]
+        # Get the chunk
+        chunk = self.chunk_manager.chunks.get(chunk_id)
+        if not chunk:
+            return
 
-        # Check if all chunks for this shard are complete
-        chunk_stats = self.chunk_manager.get_stats()
+        shard_name = chunk.shard_name
 
-        # For virtual shards, we need to check chunks by normalized shard name
-        shard_chunks = []
-        for cid, chunk in self.chunk_manager.chunks.items():
-            chunk_shard_name = chunk.shard_name
+        # Find all chunks for this shard
+        shard_chunks = [
+            cid for cid, c in self.chunk_manager.chunks.items() if c.belongs_to_shard(shard_name)
+        ]
 
-            # Normalize virtual shard names for comparison
-            if chunk_shard_name.startswith("hf_dataset:"):
-                parts = chunk_shard_name.split(":")
-                if len(parts) >= 4 and parts[2] == "chunk":
-                    chunk_shard_name = ":".join(parts[:2])
-
-            if chunk_shard_name == shard_name:
-                shard_chunks.append(cid)
-
+        # Check if all are completed
         completed_chunks = [
             cid for cid in shard_chunks if self.chunk_manager.chunks[cid].status == "completed"
         ]
