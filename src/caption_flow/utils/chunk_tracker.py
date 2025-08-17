@@ -17,6 +17,7 @@ class ChunkState:
 
     chunk_id: str
     shard_name: str
+    shard_url: str
     start_index: int
     chunk_size: int
     status: str  # pending, assigned, completed, failed
@@ -78,7 +79,9 @@ class ChunkTracker(CheckpointTracker):
         """Serialize instance state for saving."""
         return {"chunks": {chunk_id: chunk.to_dict() for chunk_id, chunk in self.chunks.items()}}
 
-    def add_chunk(self, chunk_id: str, shard_name: str, start_index: int, chunk_size: int) -> bool:
+    def add_chunk(
+        self, chunk_id: str, shard_name: str, shard_url: str, start_index: int, chunk_size: int
+    ) -> bool:
         """Add a new chunk. Returns False if chunk already exists and is completed."""
         if chunk_id in self.completed_chunks:
             logger.debug(f"Chunk {chunk_id} already completed, skipping")
@@ -88,6 +91,7 @@ class ChunkTracker(CheckpointTracker):
             self.chunks[chunk_id] = ChunkState(
                 chunk_id=chunk_id,
                 shard_name=shard_name,
+                shard_url=shard_url,  # Now included
                 start_index=start_index,
                 chunk_size=chunk_size,
                 status="pending",
@@ -261,12 +265,22 @@ class ChunkTracker(CheckpointTracker):
                             shard_name = parts[0]
                             try:
                                 start_idx = int(parts[1])
-                                # We don't know exact chunk size, but mark it as completed
+                                # We need the shard_url but it's not stored in old data
+                                # For backward compatibility, reconstruct it
+                                if chunk_id.startswith("hf_dataset:"):
+                                    # Reconstruct HF dataset URL
+                                    shard_url = chunk_id  # For HF, chunk_id IS the shard_url
+                                else:
+                                    # For WebDataset, we don't have the original URL
+                                    # Use a placeholder or skip
+                                    shard_url = f"unknown://{shard_name}"  # Or skip this chunk
+
                                 self.chunks[chunk_id] = ChunkState(
                                     chunk_id=chunk_id,
                                     shard_name=shard_name,
+                                    shard_url=shard_url,
                                     start_index=start_idx,
-                                    chunk_size=1000,  # Default chunk size
+                                    chunk_size=1000,
                                     status="completed",
                                     completed_at=datetime.utcnow(),
                                 )
