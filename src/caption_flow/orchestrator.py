@@ -1093,51 +1093,71 @@ class Orchestrator:
             logger.debug(f"Heartbeat from {worker_id}: {data}")
 
     async def _handle_captions_submission(self, worker_id: str, data: Dict):
-        """Process multiple captions submission from worker."""
+        """Process caption submission from worker - now handles multi-stage outputs."""
         chunk_id = data.get("chunk_id")
         item_key = data["item_key"]
-        captions_list = data["captions"]
 
-        logger.debug(
-            f"Received {len(captions_list)} captions for item {item_key} from worker {worker_id}"
-        )
+        # Handle both old format (captions list) and new format (outputs dict)
+        if "outputs" in data:
+            # New multi-stage format
+            outputs = data["outputs"]  # Dict of field_name -> list of outputs
+            captions_list = outputs.get("captions", [])  # For backward compatibility
 
-        # Create a SINGLE caption record with ALL captions as a list
+            # Count total outputs across all fields
+            total_outputs = sum(len(v) for v in outputs.values())
+
+            logger.debug(
+                f"Received multi-stage outputs for item {item_key} from worker {worker_id}: "
+                f"{total_outputs} outputs across {len(outputs)} fields"
+            )
+        else:
+            # Old format - single captions list
+            captions_list = data["captions"]
+            outputs = {"captions": captions_list}
+            total_outputs = len(captions_list)
+
+            logger.debug(
+                f"Received {len(captions_list)} captions for item {item_key} from worker {worker_id}"
+            )
+
+        # Create caption record with multi-stage outputs
         caption = Caption(
-            job_id=f"{chunk_id}_{item_key}",  # Single ID for the item
+            job_id=f"{chunk_id}_{item_key}",
             dataset=data.get("dataset"),
             shard=data.get("shard"),
             item_key=item_key,
-            captions=captions_list,  # Store ALL captions as a list
+            captions=captions_list,  # Keep for backward compatibility
+            outputs=outputs,  # NEW: Store all outputs
             contributor_id=worker_id,
             timestamp=datetime.utcnow(),
-            quality_scores=None,  # Could be a list of scores matching captions
+            quality_scores=None,
             # Image metadata
             image_width=data.get("image_width"),
             image_height=data.get("image_height"),
             image_format=data.get("image_format"),
             file_size=data.get("file_size"),
             # Processing metadata
-            caption_count=len(captions_list),
+            caption_count=total_outputs,  # Total across all fields
             processing_time_ms=data.get("processing_time_ms"),
             chunk_id=chunk_id,
+            metadata=data.get("metadata", {}),  # NEW: Store metadata if provided
         )
 
-        # Add to central storage buffer as a single entry
+        # Add to central storage buffer
         await self.storage.save_caption(caption)
 
         # Update contributor stats
         contributor = await self.storage.get_contributor(worker_id)
         if contributor:
-            contributor.total_captions += len(captions_list)
+            contributor.total_captions += total_outputs
             await self.storage.save_contributor(contributor)
 
         # Broadcast updated stats
         await self._broadcast_stats()
 
         # Log progress periodically
-        if self.stats["total_captions"] % 100 == 0:
-            logger.info(f"Collected {self.stats['total_captions']} captions centrally")
+        if self.stats.get("total_outputs", 0) % 100 == 0:
+            logger.info(f"Collected {self.stats.get('total_outputs', 0)} outputs centrally")
 
     async def _check_shard_completion(self, chunk_id: str):
         """Check if a shard is complete after chunk completion."""
@@ -1287,7 +1307,7 @@ class Orchestrator:
             self.monitors.discard(websocket)
 
     async def _broadcast_stats(self):
-        """Broadcast statistics to all monitors."""
+        """Broadcast statistics to all monitors - enhanced for multi-stage."""
         if not self.monitors:
             return
 
@@ -1310,9 +1330,22 @@ class Orchestrator:
             }
         )
 
-        # Add vLLM info
+        # Add vLLM info - now includes stage count
         self.stats["vllm_model"] = self.vllm_config.get("model", "unknown")
         self.stats["vllm_batch_size"] = self.vllm_config.get("batch_size", 0)
+
+        # NEW: Add stage information
+        stages = self.vllm_config.get("stages", [])
+        if stages:
+            self.stats["stage_count"] = len(stages)
+            self.stats["stage_names"] = [s.get("name", "unnamed") for s in stages]
+        else:
+            self.stats["stage_count"] = 1  # Backward compatibility
+            self.stats["stage_names"] = ["default"]
+
+        # NEW: Get output field statistics from storage
+        field_stats = await self.storage.get_output_field_stats()
+        self.stats["output_fields"] = field_stats
 
         message = safe_json_dumps({"type": "stats", "data": self.stats})
 
@@ -1394,7 +1427,7 @@ class Orchestrator:
         """Periodically update and broadcast stats."""
         # Track session start values
         storage_stats = await self.storage.get_storage_stats()
-        session_start_captions = storage_stats["total_captions"]
+        session_start_outputs = storage_stats["total_captions"]  # This now counts ALL outputs
         session_start_time = time.time()
 
         while True:
@@ -1403,10 +1436,15 @@ class Orchestrator:
             # Update chunk stats
             chunk_stats = self.chunk_manager.get_stats()
             storage_stats = await self.storage.get_storage_stats()
-            current_total_captions = storage_stats["total_captions"]
+            current_total_outputs = storage_stats["total_captions"]  # ALL outputs
+
             self.stats["total_chunks"] = chunk_stats["total"]
             self.stats["completed_chunks"] = chunk_stats["completed"]
             self.stats["failed_chunks"] = chunk_stats["failed"]
+
+            # Update total outputs stat (rename from total_captions for clarity)
+            self.stats["total_outputs"] = current_total_outputs
+            self.stats["total_captions"] = current_total_outputs  # Keep for backward compatibility
 
             # Add queue information
             with self.chunk_manager.lock:
@@ -1426,31 +1464,42 @@ class Orchestrator:
             elapsed_since_update = current_time - self.rate_tracker["last_update_time"]
 
             if elapsed_since_update > 0:
-                # Calculate current rate (captions per minute)
-                caption_diff = current_total_captions - self.rate_tracker["last_caption_count"]
-                self.rate_tracker["current_rate"] = (caption_diff / elapsed_since_update) * 60
+                # Calculate current rate (outputs per minute)
+                output_diff = current_total_outputs - self.rate_tracker["last_caption_count"]
+                self.rate_tracker["current_rate"] = (output_diff / elapsed_since_update) * 60
 
                 # Calculate average rate since THIS SESSION started
                 session_elapsed = current_time - session_start_time
                 if session_elapsed > 0:
-                    session_captions = current_total_captions - session_start_captions
-                    self.rate_tracker["average_rate"] = (session_captions / session_elapsed) * 60
+                    session_outputs = current_total_outputs - session_start_outputs
+                    self.rate_tracker["average_rate"] = (session_outputs / session_elapsed) * 60
 
-                # Calculate expected rate based on workers
-                # Assume each worker processes batch_size images every ~2 seconds with 3 captions each
+                # Calculate expected rate based on workers and stages
                 batch_size = self.vllm_config.get("batch_size", 8)
-                num_prompts = len(self.vllm_config.get("inference_prompts", ["", "", ""]))
+
+                # Count total prompts across all stages
+                total_prompts = 0
+                stages = self.vllm_config.get("stages", [])
+                if stages:
+                    for stage in stages:
+                        total_prompts += len(stage.get("prompts", []))
+                else:
+                    # Backward compatibility
+                    total_prompts = len(self.vllm_config.get("inference_prompts", ["", "", ""]))
+
                 images_per_minute = 30  # Rough estimate: 30 images/min per worker
-                self.rate_tracker["expected_rate"] = worker_count * images_per_minute * num_prompts
+                self.rate_tracker["expected_rate"] = (
+                    worker_count * images_per_minute * total_prompts
+                )
 
                 # Update trackers
                 self.rate_tracker["last_update_time"] = current_time
-                self.rate_tracker["last_caption_count"] = current_total_captions
+                self.rate_tracker["last_caption_count"] = current_total_outputs
 
             # Log rate information when workers are connected
             if worker_count > 0:
                 logger.info(
-                    f"Rate: {self.rate_tracker['current_rate']:.1f} captions/min "
+                    f"Rate: {self.rate_tracker['current_rate']:.1f} outputs/min "
                     f"(avg: {self.rate_tracker['average_rate']:.1f}, "
                     f"expected: {self.rate_tracker['expected_rate']:.1f}) | "
                     f"Workers: {worker_count}, Chunks: {active_chunks}/{target_buffer}"
