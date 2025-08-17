@@ -1019,10 +1019,11 @@ class StorageManager:
 
         # Get field-specific stats
         field_stats = await self.get_caption_stats()
+        total_rows_including_buffer = await self.count_caption_rows() + len(self.caption_buffer)
 
         return {
             "total_captions": disk_outputs + buffer_outputs,
-            "total_rows": await self.count_caption_rows() + len(self.caption_buffer),
+            "total_rows": total_rows_including_buffer,
             "buffer_size": len(self.caption_buffer),
             "total_written": self.total_captions_written,
             "total_entries_written": self.total_caption_entries_written,
