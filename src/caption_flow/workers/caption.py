@@ -182,7 +182,16 @@ class MultiStageVLLMManager:
         return params
 
     def get_model_for_stage(self, stage_name: str, model_name: str) -> Tuple[Any, Any, Any, Any]:
-        """Get model components for a stage."""
+        """
+        Get model components for a stage.
+
+        Returns:
+            tuple: A tuple containing:
+                - llm: The language model instance for the given model name.
+                - processor: The processor associated with the model.
+                - tokenizer: The tokenizer for the model.
+                - sampling_params: The sampling parameters for the given stage.
+        """
         return (
             self.models[model_name],
             self.processors[model_name],
