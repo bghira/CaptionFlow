@@ -347,7 +347,9 @@ class CaptionWorker(BaseWorker):
             in_degree[stage.name] = len(stage.requires)
             for dep in stage.requires:
                 if dep in stage_map:
-                    graph[dep].append(stage.name)
+                if dep not in stage_map:
+                    raise ValueError(f"Stage '{stage.name}' requires missing dependency '{dep}'")
+                graph[dep].append(stage.name)
 
         # Topological sort using Kahn's algorithm
         queue = deque([name for name, degree in in_degree.items() if degree == 0])
