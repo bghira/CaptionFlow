@@ -235,17 +235,16 @@ class StorageManager:
         # Remove old "captions" field if it exists (will be in outputs)
         caption_dict.pop("captions", None)
 
-        # Add each output field as a column
         new_fields = set()
         for field_name, field_values in outputs.items():
             caption_dict[field_name] = field_values
             if field_name not in self.known_output_fields:
                 new_fields.add(field_name)
+                self.known_output_fields.add(field_name)  # Add immediately
 
-        # If we have new fields, we'll need to handle schema evolution
         if new_fields:
-            self.known_output_fields.update(new_fields)
             logger.info(f"New output fields detected: {sorted(new_fields)}")
+            logger.info(f"Total known output fields: {sorted(self.known_output_fields)}")
 
         # Serialize metadata to JSON if present
         if "metadata" in caption_dict:
@@ -676,15 +675,24 @@ class StorageManager:
                         length = len(value)
                         field_total += length
                         field_lengths.append(length)
+                    elif pd.notna(value):
+                        length = 1
+                        field_total += length
+                        field_lengths.append(length)
 
                 if field_lengths:
                     field_stats[field_name] = {
                         "rows_with_data": non_null_count,
                         "total_items": field_total,
                         "avg_items_per_row": sum(field_lengths) / len(field_lengths),
-                        "min_items": min(field_lengths),
-                        "max_items": max(field_lengths),
                     }
+                    if min(field_lengths) != max(field_lengths):
+                        field_stats[field_name].update(
+                            {
+                                "min_items": min(field_lengths),
+                                "max_items": max(field_lengths),
+                            }
+                        )
                     total_outputs += field_total
 
         return {
@@ -1030,7 +1038,7 @@ class StorageManager:
             "duplicates_skipped": self.duplicates_skipped,
             "total_flushes": self.total_flushes,
             "output_fields": sorted(list(self.known_output_fields)),
-            "field_breakdown": field_stats.get("field_stats", {}),
+            "field_breakdown": field_stats.get("field_stats", None),
             "job_buffer_size": len(self.job_buffer),
             "contributor_buffer_size": len(self.contributor_buffer),
         }
