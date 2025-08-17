@@ -243,35 +243,57 @@ class DatasetLoader:
 
         dataset_path, start_idx, chunk_size = self._parse_virtual_shard(shard_url)
 
-        # Use streaming mode for HuggingFace datasets to avoid loading everything into memory
+        # IMPORTANT: Check if start_idx is beyond dataset bounds
+        if self._hf_total_items is not None and start_idx >= self._hf_total_items:
+            logger.warning(
+                f"Virtual shard starts at index {start_idx} but dataset only has "
+                f"{self._hf_total_items} items. Skipping this shard."
+            )
+            return
+
+        # Use streaming mode for HuggingFace datasets
         logger.info(
-            f"Loading HuggingFace dataset in streaming mode: {dataset_path} (split: {self.split})"
+            f"Loading HuggingFace dataset in streaming mode: {dataset_path} "
+            f"(split: {self.split}, start: {start_idx}, chunk_size: {chunk_size})"
         )
+
         try:
             # Load dataset in streaming mode
             dataset = load_dataset(
                 dataset_path,
                 split=self.split,
-                streaming=True,  # This is the key change
+                streaming=True,
                 token=self.token,
             )
-            logger.info("Loaded Huggingface dataset.")
-            # Skip to start index and process chunk_size items
+
             items_processed = 0
+            items_skipped = 0
 
-            # attempt to set the starting index for iteration
-            if start_idx > 0:
-                dataset.skip(start_idx)
-
-            logger.info(f"Skipping {start_idx} irrelevant chunk samples..")
+            # For streaming datasets, we need to manually skip items
             for idx, item in enumerate(dataset):
                 # Skip items before our start index
                 if idx < start_idx:
+                    items_skipped += 1
+                    # Check if we're skipping too many items (indicates bounds issue)
+                    if self._hf_total_items and items_skipped > self._hf_total_items:
+                        logger.error(
+                            f"Skipped {items_skipped} items but dataset only has "
+                            f"{self._hf_total_items} total. Breaking to prevent infinite loop."
+                        )
+                        break
                     continue
 
                 # Stop after processing chunk_size items
                 if items_processed >= chunk_size:
-                    logger.info(f"Skipping, {items_processed=} >= {chunk_size=}")
+                    logger.info(f"Completed chunk: processed {items_processed} items")
+                    break
+
+                # Also stop if we've reached the dataset end
+                if self._hf_total_items and (start_idx + items_processed) >= self._hf_total_items:
+                    logger.info(
+                        f"Reached dataset end at item {start_idx + items_processed} "
+                        f"(total: {self._hf_total_items})"
+                    )
                     break
 
                 # Generate a unique key for this item
@@ -279,7 +301,6 @@ class DatasetLoader:
 
                 if key in processed_keys:
                     items_processed += 1
-                    logger.info(f"Skipping, {key=} in processed keys")
                     continue
 
                 try:
@@ -299,31 +320,22 @@ class DatasetLoader:
                             logger.warning(f"Failed to process image for item {idx}")
                             items_processed += 1
                             continue
-
                     else:
-                        # Try common column names if configured one doesn't exist
-                        found = False
-                        for col in ["image", "url", "image_url", "img", "image_path"]:
-                            if col in item:
-                                logger.warning(
-                                    f"Column '{self.image_column}' not found, but '{col}' exists. "
-                                    f"Consider setting image_column='{col}' in config."
-                                )
-                                found = True
-                                break
-
-                        if not found:
-                            logger.warning(
-                                f"No image column '{self.image_column}' found in item {idx}. "
-                                f"Available columns: {list(item.keys())}"
-                            )
-
+                        logger.warning(
+                            f"No image column '{self.image_column}' found in item {idx}. "
+                            f"Available columns: {list(item.keys())}"
+                        )
                         items_processed += 1
 
                 except Exception as e:
                     logger.error(f"Error processing item {idx}: {e}")
                     items_processed += 1
                     continue
+
+            logger.info(
+                f"Virtual shard complete: processed {items_processed} items "
+                f"(skipped {items_skipped}, start_idx: {start_idx})"
+            )
 
         except Exception as e:
             logger.error(f"Error loading HuggingFace dataset: {e}")
@@ -428,10 +440,26 @@ class DatasetLoader:
             # For virtual shards, return the chunk size
             _, start_idx, chunk_size = self._parse_virtual_shard(shard_url)
 
-            # If we have the total dataset size, cap it appropriately
+            # CRITICAL: Cap chunk size by dataset bounds
             if self._hf_total_items is not None:
-                return min(chunk_size, max(0, self._hf_total_items - start_idx))
+                # If start index is beyond dataset, return 0
+                if start_idx >= self._hf_total_items:
+                    logger.warning(
+                        f"Virtual shard starts at {start_idx} but dataset has "
+                        f"only {self._hf_total_items} items"
+                    )
+                    return 0
+
+                # Otherwise, return the minimum of chunk_size and remaining items
+                remaining_items = self._hf_total_items - start_idx
+                actual_size = min(chunk_size, remaining_items)
+                logger.debug(
+                    f"Virtual shard at {start_idx}: chunk_size={chunk_size}, "
+                    f"remaining={remaining_items}, actual={actual_size}"
+                )
+                return actual_size
             else:
+                # If we don't know total size, return chunk_size
                 return chunk_size
         else:
             # Regular WebDataset counting
