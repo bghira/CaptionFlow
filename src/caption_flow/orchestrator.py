@@ -1156,8 +1156,8 @@ class Orchestrator:
         await self._broadcast_stats()
 
         # Log progress periodically
-        if self.stats["total_captions"] % 100 == 0:
-            logger.info(f"Collected {self.stats['total_captions']} outputs centrally")
+        if self.stats.get("total_outputs", 0) % 100 == 0:
+            logger.info(f"Collected {self.stats.get('total_outputs', 0)} outputs centrally")
 
     async def _check_shard_completion(self, chunk_id: str):
         """Check if a shard is complete after chunk completion."""
@@ -1427,7 +1427,7 @@ class Orchestrator:
         """Periodically update and broadcast stats."""
         # Track session start values
         storage_stats = await self.storage.get_storage_stats()
-        session_start_captions = storage_stats["total_captions"]
+        session_start_outputs = storage_stats["total_captions"]  # This now counts ALL outputs
         session_start_time = time.time()
 
         while True:
@@ -1436,10 +1436,15 @@ class Orchestrator:
             # Update chunk stats
             chunk_stats = self.chunk_manager.get_stats()
             storage_stats = await self.storage.get_storage_stats()
-            current_total_captions = storage_stats["total_captions"]
+            current_total_outputs = storage_stats["total_captions"]  # ALL outputs
+
             self.stats["total_chunks"] = chunk_stats["total"]
             self.stats["completed_chunks"] = chunk_stats["completed"]
             self.stats["failed_chunks"] = chunk_stats["failed"]
+
+            # Update total outputs stat (rename from total_captions for clarity)
+            self.stats["total_outputs"] = current_total_outputs
+            self.stats["total_captions"] = current_total_outputs  # Keep for backward compatibility
 
             # Add queue information
             with self.chunk_manager.lock:
@@ -1459,31 +1464,42 @@ class Orchestrator:
             elapsed_since_update = current_time - self.rate_tracker["last_update_time"]
 
             if elapsed_since_update > 0:
-                # Calculate current rate (captions per minute)
-                caption_diff = current_total_captions - self.rate_tracker["last_caption_count"]
-                self.rate_tracker["current_rate"] = (caption_diff / elapsed_since_update) * 60
+                # Calculate current rate (outputs per minute)
+                output_diff = current_total_outputs - self.rate_tracker["last_caption_count"]
+                self.rate_tracker["current_rate"] = (output_diff / elapsed_since_update) * 60
 
                 # Calculate average rate since THIS SESSION started
                 session_elapsed = current_time - session_start_time
                 if session_elapsed > 0:
-                    session_captions = current_total_captions - session_start_captions
-                    self.rate_tracker["average_rate"] = (session_captions / session_elapsed) * 60
+                    session_outputs = current_total_outputs - session_start_outputs
+                    self.rate_tracker["average_rate"] = (session_outputs / session_elapsed) * 60
 
-                # Calculate expected rate based on workers
-                # Assume each worker processes batch_size images every ~2 seconds with 3 captions each
+                # Calculate expected rate based on workers and stages
                 batch_size = self.vllm_config.get("batch_size", 8)
-                num_prompts = len(self.vllm_config.get("inference_prompts", ["", "", ""]))
+
+                # Count total prompts across all stages
+                total_prompts = 0
+                stages = self.vllm_config.get("stages", [])
+                if stages:
+                    for stage in stages:
+                        total_prompts += len(stage.get("prompts", []))
+                else:
+                    # Backward compatibility
+                    total_prompts = len(self.vllm_config.get("inference_prompts", ["", "", ""]))
+
                 images_per_minute = 30  # Rough estimate: 30 images/min per worker
-                self.rate_tracker["expected_rate"] = worker_count * images_per_minute * num_prompts
+                self.rate_tracker["expected_rate"] = (
+                    worker_count * images_per_minute * total_prompts
+                )
 
                 # Update trackers
                 self.rate_tracker["last_update_time"] = current_time
-                self.rate_tracker["last_caption_count"] = current_total_captions
+                self.rate_tracker["last_caption_count"] = current_total_outputs
 
             # Log rate information when workers are connected
             if worker_count > 0:
                 logger.info(
-                    f"Rate: {self.rate_tracker['current_rate']:.1f} captions/min "
+                    f"Rate: {self.rate_tracker['current_rate']:.1f} outputs/min "
                     f"(avg: {self.rate_tracker['average_rate']:.1f}, "
                     f"expected: {self.rate_tracker['expected_rate']:.1f}) | "
                     f"Workers: {worker_count}, Chunks: {active_chunks}/{target_buffer}"

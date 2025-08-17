@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pyarrow import fs
 import pandas as pd
+from collections import defaultdict
 
 from .models import Job, Caption, Contributor, JobStatus
 
@@ -504,13 +505,24 @@ class StorageManager:
         }
 
     async def count_captions(self) -> int:
-        """Count total caption entries (not rows)."""
+        """Count total outputs across all fields (not just caption entries)."""
         if not self.captions_path.exists():
             return 0
 
-        table = pq.read_table(self.captions_path, columns=["caption_count"])
+        table = pq.read_table(self.captions_path, columns=["outputs"])
         df = table.to_pandas()
-        return df["caption_count"].sum()
+
+        total = 0
+        for outputs_json in df["outputs"]:
+            try:
+                outputs = json.loads(outputs_json)
+                # Count all outputs across all fields
+                total += sum(len(v) for v in outputs.values())
+            except:
+                # Fallback for old data or errors
+                continue
+
+        return total
 
     async def count_caption_rows(self) -> int:
         """Count total rows (unique images with captions)."""
@@ -833,19 +845,33 @@ class StorageManager:
         )
 
     async def get_storage_stats(self) -> Dict[str, Any]:
-        """Get all storage-related statistics."""
-        # Count captions on disk
-        disk_captions = await self.count_captions()
+        """Get all storage-related statistics with proper multi-stage counting."""
+        # Count outputs on disk
+        disk_outputs = await self.count_captions()  # Now counts ALL outputs
 
-        # Count captions in buffer
-        buffer_captions = sum(len(row["captions"]) for row in self.caption_buffer)
+        # Count outputs in buffer
+        buffer_outputs = 0
+        for row in self.caption_buffer:
+            try:
+                if isinstance(row.get("outputs"), str):
+                    outputs = json.loads(row["outputs"])
+                elif isinstance(row.get("outputs"), dict):
+                    outputs = row["outputs"]
+                else:
+                    # Fallback to captions
+                    outputs = {"captions": row.get("captions", [])}
+
+                buffer_outputs += sum(len(v) for v in outputs.values())
+            except:
+                # Fallback to caption_count if available
+                buffer_outputs += row.get("caption_count", 0)
 
         return {
-            "total_captions": disk_captions + buffer_captions,  # Include buffered captions!
+            "total_captions": disk_outputs + buffer_outputs,  # Total outputs across all fields
             "total_rows": await self.count_caption_rows() + len(self.caption_buffer),
             "buffer_size": len(self.caption_buffer),
-            "total_written": self.total_captions_written,
-            "total_entries_written": self.total_caption_entries_written,
+            "total_written": self.total_captions_written,  # Rows written
+            "total_entries_written": self.total_caption_entries_written,  # Total outputs written
             "duplicates_skipped": self.duplicates_skipped,
             "total_flushes": self.total_flushes,
             "job_buffer_size": len(self.job_buffer),
