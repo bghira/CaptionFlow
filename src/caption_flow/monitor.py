@@ -166,6 +166,8 @@ class Monitor:
         # Filter out rate stats (already shown in rates panel)
         for key, value in self.stats.items():
             if key not in ["current_rate", "average_rate", "expected_rate"]:
+                if isinstance(value, dict):
+                    value = json.dumps(value, indent=2)
                 stats_table.add_row(key.replace("_", " ").title(), str(value))
 
         layout["stats"].update(Panel(stats_table, title="System Statistics", border_style="green"))
@@ -178,9 +180,18 @@ class Monitor:
         leaderboard_table.add_column("Trust", style="green")
 
         for i, contributor in enumerate(self.leaderboard[:10], 1):
+            # Format name with active worker count
+            name = contributor.get("name", "Unknown")
+            active_workers = contributor.get("active_workers", 0)
+
+            if active_workers > 0:
+                name_display = f"{name} [bright_green](x{active_workers})[/bright_green]"
+            else:
+                name_display = f"{name} [dim](offline)[/dim]"
+
             leaderboard_table.add_row(
                 str(i),
-                contributor.get("name", "Unknown"),
+                name_display,
                 str(contributor.get("total_captions", 0)),
                 "⭐" * contributor.get("trust_level", 0),
             )
@@ -188,7 +199,6 @@ class Monitor:
         layout["leaderboard"].update(
             Panel(leaderboard_table, title="Top Contributors", border_style="yellow")
         )
-
         # Activity panel
         activity_text = Text()
         for activity in self.recent_activity[-10:]:

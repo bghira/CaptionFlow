@@ -972,34 +972,51 @@ class Orchestrator:
 
     async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_ticket):
         """Handle worker connection lifecycle."""
-        worker_id = getattr(auth_ticket, "name", str(uuid.uuid4()))
+        # Generate unique worker ID even if using same token
+        base_name = getattr(auth_ticket, "name", "worker")
+        worker_id = f"{base_name}_{str(uuid.uuid4())[:8]}"  # Add unique suffix
+
+        # Track the original token/user for accounting
+        worker_user = base_name  # Keep track of which user/token this worker belongs to
+
         self.workers[worker_id] = websocket
         self.stats["connected_workers"] = len(self.workers)
 
-        # Register contributor
-        contributor = Contributor(
-            contributor_id=worker_id, name=worker_id, total_captions=0, trust_level=1
-        )
-        await self.storage.save_contributor(contributor)
+        # Optionally track workers by user/token
+        if not hasattr(self, "workers_by_user"):
+            self.workers_by_user = defaultdict(set)
+        self.workers_by_user[worker_user].add(worker_id)
 
-        logger.info(f"Worker {worker_id} connected")
+        # Register contributor with the base name (for aggregating stats per user)
+        contributor = await self.storage.get_contributor(worker_user)
+        if not contributor:
+            contributor = Contributor(
+                contributor_id=worker_user,  # Use base name for contributor
+                name=worker_user,
+                total_captions=0,
+                trust_level=1,
+            )
+            await self.storage.save_contributor(contributor)
+
+        logger.info(f"Worker {worker_id} (user: {worker_user}) connected")
         await self._broadcast_stats()
-        await self._send_activity(f"Worker {worker_id} connected")
+        await self._send_activity(f"Worker {worker_id} (user: {worker_user}) connected")
 
         try:
             # Send welcome message with dataset configuration
             welcome_message = {
                 "type": "welcome",
-                "worker_id": worker_id,
+                "worker_id": worker_id,  # Send unique worker ID
+                "user_id": worker_user,  # Also send user/token identifier
                 "dataset_config": {
                     "dataset_path": self.dataset_path,
                     "dataset_type": self.dataset_type,
-                    "dataset_split": self.dataset_split,  # Include split
-                    "dataset_image_column": self.dataset_image_column,  # Include image column
-                    "path": self.dataset_path,  # For compatibility
-                    "type": self.dataset_type,  # For compatibility
-                    "split": self.dataset_split,  # For compatibility
-                    "image_column": self.dataset_image_column,  # For compatibility
+                    "dataset_split": self.dataset_split,
+                    "dataset_image_column": self.dataset_image_column,
+                    "path": self.dataset_path,
+                    "type": self.dataset_type,
+                    "split": self.dataset_split,
+                    "image_column": self.dataset_image_column,
                 },
                 "vllm_config": self.vllm_config,
             }
@@ -1010,22 +1027,29 @@ class Orchestrator:
                 await self._process_worker_message(worker_id, data)
 
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Worker {worker_id} disconnected")
+            logger.info(f"Worker {worker_id} (user: {worker_user}) disconnected")
         finally:
             if worker_id in self.workers:
                 del self.workers[worker_id]
+
+            # Clean up user tracking
+            if hasattr(self, "workers_by_user") and worker_user in self.workers_by_user:
+                self.workers_by_user[worker_user].discard(worker_id)
+                if not self.workers_by_user[worker_user]:
+                    del self.workers_by_user[worker_user]
+
             self.stats["connected_workers"] = len(self.workers)
-            # Release chunks in both managers
+
+            # Release chunks
             self.chunk_manager.release_worker_chunks(worker_id)
             if self.chunk_tracker:
-                # Mark released chunks as pending in tracker
                 released_chunks = self.chunk_tracker.release_worker_chunks(worker_id)
                 logger.info(
                     f"Released {len(released_chunks) if released_chunks is not None else 0} chunks from worker {worker_id}"
                 )
 
             await self._broadcast_stats()
-            await self._send_activity(f"Worker {worker_id} disconnected")
+            await self._send_activity(f"Worker {worker_id} (user: {worker_user}) disconnected")
 
     async def _process_worker_message(self, worker_id: str, data: Dict):
         """Process message from worker."""
@@ -1101,13 +1125,14 @@ class Orchestrator:
         chunk_id = data.get("chunk_id")
         item_key = data["item_key"]
 
+        # Extract user from worker_id (format: "username_uuid")
+        worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
+
         # Handle both old format (captions list) and new format (outputs dict)
         if "outputs" in data:
             # New multi-stage format
-            outputs = data["outputs"]  # Dict of field_name -> list of outputs
-            captions_list = outputs.get("captions", [])  # For backward compatibility
-
-            # Count total outputs across all fields
+            outputs = data["outputs"]
+            captions_list = outputs.get("captions", [])
             total_outputs = sum(len(v) for v in outputs.values())
 
             logger.debug(
@@ -1130,9 +1155,9 @@ class Orchestrator:
             dataset=data.get("dataset"),
             shard=data.get("shard"),
             item_key=item_key,
-            captions=captions_list,  # Keep for backward compatibility
-            outputs=outputs,  # NEW: Store all outputs
-            contributor_id=worker_id,
+            captions=captions_list,
+            outputs=outputs,
+            contributor_id=worker_user,  # Use the user, not unique worker ID
             timestamp=datetime.utcnow(),
             quality_scores=None,
             # Image metadata
@@ -1141,17 +1166,17 @@ class Orchestrator:
             image_format=data.get("image_format"),
             file_size=data.get("file_size"),
             # Processing metadata
-            caption_count=total_outputs,  # Total across all fields
+            caption_count=total_outputs,
             processing_time_ms=data.get("processing_time_ms"),
             chunk_id=chunk_id,
-            metadata=data.get("metadata", {}),  # NEW: Store metadata if provided
+            metadata=data.get("metadata", {}),
         )
 
         # Add to central storage buffer
         await self.storage.save_caption(caption)
 
-        # Update contributor stats
-        contributor = await self.storage.get_contributor(worker_id)
+        # Update contributor stats (use user, not worker)
+        contributor = await self.storage.get_contributor(worker_user)
         if contributor:
             contributor.total_captions += total_outputs
             await self.storage.save_contributor(contributor)
@@ -1160,10 +1185,8 @@ class Orchestrator:
         await self._broadcast_stats()
 
         # Log progress periodically
-        # Only log every 100 outputs, but avoid duplicate logs for the same count
         total_outputs = self.stats.get("total_outputs", 0)
         if total_outputs > 0 and total_outputs % 100 == 0:
-            # Use a static variable to track last logged count
             if (
                 not hasattr(self, "_last_logged_outputs")
                 or self._last_logged_outputs != total_outputs
@@ -1280,12 +1303,29 @@ class Orchestrator:
             chunk_stats = self.chunk_manager.get_stats()
             await websocket.send(safe_json_dumps({"type": "chunk_stats", "data": chunk_stats}))
 
-            # Send contributor leaderboard
+            # Send contributor leaderboard with active worker counts
             contributors = await self.storage.get_top_contributors(10)
+
+            # Enhance contributor data with active worker counts
+            enhanced_contributors = []
+            worker_counts = (
+                self.get_workers_by_user_stats() if hasattr(self, "workers_by_user") else {}
+            )
+
+            for contributor in contributors:
+                contrib_dict = {
+                    "contributor_id": contributor.contributor_id,
+                    "name": contributor.name,
+                    "total_captions": contributor.total_captions,
+                    "trust_level": contributor.trust_level,
+                    "active_workers": len(
+                        worker_counts.get(contributor.contributor_id, {}).get("worker_ids", [])
+                    ),
+                }
+                enhanced_contributors.append(contrib_dict)
+
             await websocket.send(
-                safe_json_dumps(
-                    {"type": "leaderboard", "data": [safe_dict(c) for c in contributors]}
-                )
+                safe_json_dumps({"type": "leaderboard", "data": enhanced_contributors})
             )
 
             # Keep connection alive
@@ -1304,6 +1344,7 @@ class Orchestrator:
 
         # Get storage stats
         storage_stats = await self.storage.get_storage_stats()
+        caption_stats = await self.storage.get_caption_stats()
 
         # Include chunk stats
         chunk_stats = self.chunk_manager.get_stats()
@@ -1311,6 +1352,8 @@ class Orchestrator:
 
         # Merge storage stats
         self.stats.update(storage_stats)
+        self.stats["field_breakdown"] = caption_stats.get("field_stats", {})
+        self.stats["output_fields_list"] = caption_stats.get("output_fields", [])
 
         # Add rate information
         self.stats.update(
@@ -1334,7 +1377,6 @@ class Orchestrator:
             self.stats["stage_count"] = 1  # Backward compatibility
             self.stats["stage_names"] = ["default"]
 
-        # NEW: Get output field statistics from storage
         field_stats = await self.storage.get_output_field_stats()
         self.stats["output_fields"] = field_stats
 
@@ -1349,8 +1391,58 @@ class Orchestrator:
             except websockets.exceptions.ConnectionClosed:
                 disconnected.add(monitor)
 
+        # send updated leaderboard
+        try:
+            contributors = await self.storage.get_top_contributors(10)
+            enhanced_contributors = []
+            worker_counts = (
+                self.get_workers_by_user_stats() if hasattr(self, "workers_by_user") else {}
+            )
+
+            for contributor in contributors:
+                contrib_dict = {
+                    "contributor_id": contributor.contributor_id,
+                    "name": contributor.name,
+                    "total_captions": contributor.total_captions,
+                    "trust_level": contributor.trust_level,
+                    "active_workers": len(
+                        worker_counts.get(contributor.contributor_id, {}).get("worker_ids", [])
+                    ),
+                }
+                enhanced_contributors.append(contrib_dict)
+
+            leaderboard_message = safe_json_dumps(
+                {"type": "leaderboard", "data": enhanced_contributors}
+            )
+
+            # Send to all monitors
+            disconnected = set()
+            for monitor in self.monitors.copy():
+                try:
+                    await monitor.send(leaderboard_message)
+                except websockets.exceptions.ConnectionClosed:
+                    disconnected.add(monitor)
+
+            self.monitors -= disconnected
+
+        except Exception as e:
+            logger.error(f"Error sending leaderboard update: {e}")
+
         # Clean up disconnected monitors
         self.monitors -= disconnected
+
+    def get_workers_by_user_stats(self) -> Dict[str, Any]:
+        """Get statistics about workers grouped by user/token."""
+        if not hasattr(self, "workers_by_user"):
+            return {}
+        
+        stats = {}
+        for user, worker_ids in self.workers_by_user.items():
+            stats[user] = {
+                "worker_count": len(worker_ids),
+                "worker_ids": list(worker_ids)
+            }
+        return stats
 
     async def _send_activity(self, activity: str):
         """Send activity update to monitors."""
