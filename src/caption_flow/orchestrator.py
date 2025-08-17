@@ -1421,6 +1421,9 @@ class Orchestrator:
         session_start_outputs = storage_stats["total_captions"]  # This now counts ALL outputs
         session_start_time = time.time()
 
+        # Track the last known total to detect flushes
+        last_known_total = session_start_outputs
+
         while True:
             await asyncio.sleep(10)
 
@@ -1455,13 +1458,26 @@ class Orchestrator:
             elapsed_since_update = current_time - self.rate_tracker["last_update_time"]
 
             if elapsed_since_update > 0:
-                # Calculate current rate (outputs per minute)
-                output_diff = current_total_outputs - self.rate_tracker["last_caption_count"]
-                self.rate_tracker["current_rate"] = (output_diff / elapsed_since_update) * 60
+                # FIX: Handle the case where duplicates were skipped during save
+                # If current total is less than last known, it means duplicates were skipped
+                # We should not count this as negative progress
+                if current_total_outputs < last_known_total:
+                    logger.debug(
+                        f"Detected duplicate skip during save: {last_known_total} -> {current_total_outputs}"
+                    )
+                    # Don't calculate negative rate, just update the baseline
+                    self.rate_tracker["last_caption_count"] = current_total_outputs
+                    self.rate_tracker["current_rate"] = 0.0  # Set to 0 during flush
+                else:
+                    # Normal rate calculation
+                    output_diff = current_total_outputs - self.rate_tracker["last_caption_count"]
+                    self.rate_tracker["current_rate"] = (output_diff / elapsed_since_update) * 60
+                    self.rate_tracker["last_caption_count"] = current_total_outputs
 
                 # Calculate average rate since THIS SESSION started
                 session_elapsed = current_time - session_start_time
                 if session_elapsed > 0:
+                    # Always use the difference from session start for average
                     session_outputs = current_total_outputs - session_start_outputs
                     self.rate_tracker["average_rate"] = (session_outputs / session_elapsed) * 60
 
@@ -1485,10 +1501,12 @@ class Orchestrator:
 
                 # Update trackers
                 self.rate_tracker["last_update_time"] = current_time
-                self.rate_tracker["last_caption_count"] = current_total_outputs
+                last_known_total = current_total_outputs
 
             # Log rate information when workers are connected
-            if worker_count > 0:
+            if (
+                worker_count > 0 and self.rate_tracker["current_rate"] >= 0
+            ):  # Only log non-negative rates
                 logger.info(
                     f"Rate: {self.rate_tracker['current_rate']:.1f} outputs/min "
                     f"(avg: {self.rate_tracker['average_rate']:.1f}, "
