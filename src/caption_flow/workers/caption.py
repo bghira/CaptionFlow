@@ -701,9 +701,6 @@ class CaptionWorker(BaseWorker):
             f"Processing shard {chunk.shard_name} with unprocessed ranges: {chunk.unprocessed_ranges}"
         )
 
-        # Get unprocessed ranges
-        unprocessed_ranges = chunk.unprocessed_ranges or [(0, chunk.chunk_size - 1)]
-
         # Select appropriate processor
         if chunk.shard_url.startswith("hf_dataset:"):
             processor = self.hf_processor
@@ -711,24 +708,16 @@ class CaptionWorker(BaseWorker):
             processor = self.webdataset_processor
 
         items_processed = 0
-        current_item_idx = 0
 
-        # Process only unprocessed ranges
+        # Let the processor handle the range filtering
         for key, url, image_data, metadata in processor.iterate_chunk_with_metadata(
             chunk, self.dataset_loader, self.should_stop_processing, self.connected
         ):
-            # Check if current item is in any unprocessed range
-            in_range = any(start <= current_item_idx <= end for start, end in unprocessed_ranges)
-
-            if not in_range:
-                current_item_idx += 1
-                continue  # Skip already processed items
-
             try:
                 # Load image
                 img = Image.open(io.BytesIO(image_data))
 
-                # Create processing item with index
+                # Create processing item
                 item = ProcessingItem(
                     chunk_id=chunk.chunk_id,
                     item_key=key,
@@ -736,8 +725,13 @@ class CaptionWorker(BaseWorker):
                     image_data=image_data,
                     metadata=metadata,
                 )
+
                 # Store absolute item index for tracking
-                item.metadata["_item_index"] = chunk.start_index + current_item_idx
+                # The processor should provide the correct index in metadata
+                if "_chunk_relative_index" in metadata:
+                    item.metadata["_item_index"] = (
+                        chunk.start_index + metadata["_chunk_relative_index"]
+                    )
 
                 # Add to readahead queue with timeout handling
                 timeout_end = time.time() + 30
@@ -760,7 +754,6 @@ class CaptionWorker(BaseWorker):
                     break
 
                 items_processed += 1
-                self.current_chunk_progress = current_item_idx
 
                 # Batch items for inference
                 batch_size = self.vllm_config.get("batch_size", 8)
@@ -770,17 +763,15 @@ class CaptionWorker(BaseWorker):
             except Exception as e:
                 if self.should_stop_processing.is_set():
                     break
-                logger.error(f"Error processing item {key} at index {current_item_idx}: {e}")
+                logger.error(f"Error processing item {key}: {e}")
                 self.items_failed += 1
-
-            current_item_idx += 1
 
         # Process any remaining items in queue
         if not self.should_stop_processing.is_set():
             self._batch_for_inference()
 
         logger.info(
-            f"Chunk {chunk.chunk_id} processed {items_processed} unprocessed items out of {current_item_idx} total"
+            f"Chunk {chunk.chunk_id} processed {items_processed} items from unprocessed ranges"
         )
 
     def _shard_reader_thread(self):

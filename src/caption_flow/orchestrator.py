@@ -314,6 +314,11 @@ class Orchestrator:
 
         # Initialize chunk manager with reference to chunk tracker
         self.chunk_manager = ChunkManager(self.chunk_size, self.chunk_tracker)
+        self.pending_processed_items = defaultdict(list)  # chunk_id -> list of indices
+        self.item_batch_lock = threading.Lock()
+        self.last_item_batch_flush = time.time()
+        self.item_batch_interval = 5  # Flush every 5 seconds
+        self.item_batch_size = 100  # Or every 100 items
 
         # Track connections
         self.workers: Dict[str, WebSocketServerProtocol] = {}
@@ -1219,7 +1224,20 @@ class Orchestrator:
         await self.storage.save_caption(caption)
 
         if chunk_id and item_index is not None and self.chunk_tracker:
-            self.chunk_tracker.mark_items_processed(chunk_id, item_index, item_index)
+            with self.item_batch_lock:
+                self.pending_processed_items[chunk_id].append(item_index)
+
+                # Check if we should flush
+                total_pending = sum(
+                    len(indices) for indices in self.pending_processed_items.values()
+                )
+                time_since_flush = time.time() - self.last_item_batch_flush
+
+                if (
+                    total_pending >= self.item_batch_size
+                    or time_since_flush >= self.item_batch_interval
+                ):
+                    await self._flush_processed_items()
 
         # Update contributor stats (use user, not worker)
         contributor = await self.storage.get_contributor(worker_user)
@@ -1477,6 +1495,48 @@ class Orchestrator:
         # Clean up disconnected monitors
         self.monitors -= disconnected
 
+    async def _flush_processed_items(self):
+        """Flush batched processed items to chunk tracker."""
+        with self.item_batch_lock:
+            if not self.pending_processed_items:
+                return
+
+            for chunk_id, indices in self.pending_processed_items.items():
+                if not indices:
+                    continue
+
+                # Sort indices
+                indices.sort()
+
+                # Group consecutive indices into ranges
+                ranges = []
+                start = indices[0]
+                end = indices[0]
+
+                for i in range(1, len(indices)):
+                    if indices[i] == end + 1:
+                        # Consecutive, extend range
+                        end = indices[i]
+                    else:
+                        # Gap found, save current range and start new one
+                        ranges.append((start, end))
+                        start = indices[i]
+                        end = indices[i]
+
+                # Don't forget the last range
+                ranges.append((start, end))
+
+                # Mark ranges as processed
+                for start_idx, end_idx in ranges:
+                    self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
+                    logger.info(
+                        f"Marked items {start_idx}-{end_idx} as processed in chunk {chunk_id}"
+                    )
+
+            # Clear pending items
+            self.pending_processed_items.clear()
+            self.last_item_batch_flush = time.time()
+
     def get_workers_by_user_stats(self) -> Dict[str, Any]:
         """Get statistics about workers grouped by user/token."""
         if not hasattr(self, "workers_by_user"):
@@ -1566,6 +1626,8 @@ class Orchestrator:
             chunk_stats = self.chunk_manager.get_stats()
             storage_stats = await self.storage.get_storage_stats()
             current_total_outputs = storage_stats["total_captions"]  # ALL outputs
+            if self.chunk_tracker:
+                await self._flush_processed_items()
 
             self.stats["total_chunks"] = chunk_stats["total"]
             self.stats["completed_chunks"] = chunk_stats["completed"]
@@ -1661,6 +1723,8 @@ class Orchestrator:
         logger.info("Shutting down orchestrator...")
 
         # Stop chunk creation
+        if self.chunk_tracker:
+            await self._flush_processed_items()
         self.stop_chunk_creation.set()
         if self.chunk_creation_thread:
             self.chunk_creation_thread.join(timeout=5)
