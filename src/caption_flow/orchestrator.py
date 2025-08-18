@@ -21,6 +21,7 @@ from collections import deque, defaultdict
 import threading
 from queue import Queue, Empty
 
+from .workers import data
 import websockets
 from websockets.server import WebSocketServerProtocol
 
@@ -51,14 +52,16 @@ class ShardChunk:
     def create(
         cls, shard_url: str, shard_name: str, start_index: int, chunk_size: int
     ) -> "ShardChunk":
-        """Factory method to create a chunk with proper ID."""
-        # Generate chunk_id based on shard type
+        """Factory method to create a chunk with consistent ID."""
+        # Always use consistent format: dataset_chunk_startindex
         if shard_url.startswith("hf_dataset:"):
-            # For HF datasets, the shard_url is already unique per chunk
-            chunk_id = shard_url
+            # Extract dataset path
+            parts = shard_url.split(":")
+            dataset_path = parts[1] if len(parts) > 1 else "unknown"
+            chunk_id = f"{dataset_path.replace('/', '_')}_chunk_{start_index}"
         else:
-            # For WebDataset, create a unique ID
-            chunk_id = f"{shard_name}:chunk:{start_index}"
+            # WebDataset format
+            chunk_id = f"{shard_name}_chunk_{start_index}"
 
         return cls(
             chunk_id=chunk_id,
@@ -118,23 +121,83 @@ class ChunkManager:
 
     def get_chunks_for_worker(
         self, worker_id: str, count: int = 1, tracker: Optional["ChunkTracker"] = None
-    ) -> List[ShardChunk]:
-        """Get available chunks for a worker."""
+    ) -> List[Dict[str, Any]]:
+        """Get available chunks with unprocessed items for a worker."""
         assigned = []
 
         with self.lock:
+            # FIRST PRIORITY: Check if this worker already has assigned chunks
+            # Workers should complete their current chunks before getting new ones
+            if worker_id in self.assigned_chunks:
+                existing_chunk_ids = list(self.assigned_chunks[worker_id])
+                for chunk_id in existing_chunk_ids:
+                    if len(assigned) >= count:
+                        break
+
+                    chunk = self.chunks.get(chunk_id)
+                    if not chunk:
+                        continue
+
+                    # Check if chunk still has unprocessed items
+                    if tracker:
+                        chunk_info = tracker.get_chunk_with_unprocessed_items(chunk_id)
+                        if chunk_info and chunk_info["unprocessed_ranges"]:
+                            assigned.append(
+                                {
+                                    "chunk": chunk,
+                                    "unprocessed_ranges": chunk_info["unprocessed_ranges"],
+                                }
+                            )
+                    else:
+                        # No tracker, assume chunk needs processing
+                        assigned.append(
+                            {
+                                "chunk": chunk,
+                                "unprocessed_ranges": [(0, chunk.chunk_size - 1)],
+                            }
+                        )
+
+            # SECOND PRIORITY: Get new pending chunks
+            # Only if worker doesn't have enough chunks already
             while len(assigned) < count and self.pending_chunks:
                 chunk_id = self.pending_chunks.popleft()
-                chunk = self.chunks[chunk_id]
+                chunk = self.chunks.get(chunk_id)
 
+                if not chunk:
+                    continue
+
+                # Verify chunk is truly pending (defensive check)
+                if chunk.status != "pending" or chunk.assigned_to is not None:
+                    logger.warning(
+                        f"Chunk {chunk_id} in pending queue but status={chunk.status}, assigned_to={chunk.assigned_to}"
+                    )
+                    continue
+
+                # Assign to this worker
                 chunk.assigned_to = worker_id
                 chunk.status = "assigned"
                 chunk.assigned_at = datetime.utcnow()
-
                 self.assigned_chunks[worker_id].add(chunk_id)
-                assigned.append(chunk)
+
+                # Get unprocessed ranges
+                unprocessed_ranges = [(0, chunk.chunk_size - 1)]  # Default
                 if tracker:
+                    chunk_info = tracker.get_chunk_with_unprocessed_items(chunk_id)
+                    if chunk_info:
+                        unprocessed_ranges = chunk_info["unprocessed_ranges"]
                     tracker.mark_assigned(chunk_id, worker_id)
+
+                assigned.append({"chunk": chunk, "unprocessed_ranges": unprocessed_ranges})
+
+        # Log what we're assigning
+        if assigned:
+            chunk_summary = ", ".join(
+                [
+                    f"{info['chunk'].chunk_id}[{len(info['unprocessed_ranges'])} ranges]"
+                    for info in assigned
+                ]
+            )
+            logger.info(f"Assigning to worker {worker_id}: {chunk_summary}")
 
         return assigned
 
@@ -219,8 +282,8 @@ class Orchestrator:
             self.dataset_loader = DatasetLoader(
                 self.dataset_path,
                 self.dataset_type,
-                self.dataset_split,  # Pass split to DatasetLoader
-                self.dataset_image_column,  # Pass image column
+                self.dataset_split,
+                self.dataset_image_column,
             )
             checkpoint_dir = Path(config.get("storage", {}).get("checkpoint_dir", "./checkpoints"))
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -286,6 +349,11 @@ class Orchestrator:
 
         # Initialize chunk manager with reference to chunk tracker
         self.chunk_manager = ChunkManager(self.chunk_size, self.chunk_tracker)
+        self.pending_processed_items = defaultdict(list)  # chunk_id -> list of indices
+        self.item_batch_lock = threading.Lock()
+        self.last_item_batch_flush = time.time()
+        self.item_batch_interval = 5  # Flush every 5 seconds
+        self.item_batch_size = 100  # Or every 100 items
 
         # Track connections
         self.workers: Dict[str, WebSocketServerProtocol] = {}
@@ -579,11 +647,26 @@ class Orchestrator:
 
                 # Create a chunk from current shard
                 if current_shard_url and current_shard_index < current_shard_items:
-                    # For virtual shards, we need to handle the chunk_id differently
+                    # Calculate the absolute dataset index for this chunk
+                    if current_shard_url.startswith("hf_dataset:"):
+                        # Parse the virtual shard URL to get the base start index
+                        parts = current_shard_url.split(":")
+                        if len(parts) >= 4 and parts[2] == "chunk":
+                            shard_base_index = int(parts[3])
+                        else:
+                            shard_base_index = 0
+
+                        # The absolute start index for this chunk in the dataset
+                        absolute_start_index = shard_base_index + current_shard_index
+                    else:
+                        # For WebDataset, current_shard_index is already absolute
+                        absolute_start_index = current_shard_index
+
+                    # Create chunk with absolute index
                     chunk = ShardChunk.create(
                         shard_url=current_shard_url,
                         shard_name=current_shard_name,
-                        start_index=current_shard_index,
+                        start_index=absolute_start_index,
                         chunk_size=min(self.chunk_size, current_shard_items - current_shard_index),
                     )
 
@@ -991,7 +1074,7 @@ class Orchestrator:
         contributor = await self.storage.get_contributor(worker_user)
         if not contributor:
             contributor = Contributor(
-                contributor_id=worker_user,  # Use base name for contributor
+                contributor_id=worker_user,
                 name=worker_user,
                 total_captions=0,
                 trust_level=1,
@@ -1006,8 +1089,8 @@ class Orchestrator:
             # Send welcome message with dataset configuration
             welcome_message = {
                 "type": "welcome",
-                "worker_id": worker_id,  # Send unique worker ID
-                "user_id": worker_user,  # Also send user/token identifier
+                "worker_id": worker_id,
+                "user_id": worker_user,
                 "dataset_config": {
                     "dataset_path": self.dataset_path,
                     "dataset_type": self.dataset_type,
@@ -1065,19 +1148,26 @@ class Orchestrator:
                 return
 
             count = data.get("count", self.chunks_per_request)
-            chunks = self.chunk_manager.get_chunks_for_worker(worker_id, count, self.chunk_tracker)
+            chunk_infos = self.chunk_manager.get_chunks_for_worker(
+                worker_id, count, self.chunk_tracker
+            )
 
-            if chunks:
-                # Use the to_dict method for serialization
-                chunk_data = [chunk.to_dict() for chunk in chunks]
+            if chunk_infos:
+                # Send chunks with unprocessed ranges
+                chunks_data = []
+                for info in chunk_infos:
+                    chunk_dict = info["chunk"].to_dict()
+                    chunk_dict["unprocessed_ranges"] = info["unprocessed_ranges"]
+                    chunks_data.append(chunk_dict)
 
                 await self.workers[worker_id].send(
-                    safe_json_dumps({"type": "shard_assignment", "chunks": chunk_data})
+                    safe_json_dumps({"type": "shard_assignment", "chunks": chunks_data})
                 )
 
-                chunk_ids = [c["chunk_id"] for c in chunk_data]
-                logger.info(f"Assigned {len(chunks)} chunks to worker {worker_id}: {chunk_ids}")
-                await self._send_activity(f"Assigned {len(chunks)} chunks to {worker_id}")
+                chunk_ids = [c["chunk_id"] for c in chunks_data]
+                logger.info(
+                    f"Assigned {len(chunks_data)} chunks to worker {worker_id}: {chunk_ids}"
+                )
             else:
                 await self.workers[worker_id].send(safe_json_dumps({"type": "no_chunks"}))
 
@@ -1125,6 +1215,14 @@ class Orchestrator:
         chunk_id = data.get("chunk_id")
         item_key = data["item_key"]
 
+        item_index = data.get("item_index")  # Worker should send this
+        if item_index is None:
+            # Try to extract from item_key (format: dataset_XXXXXXXX)
+            try:
+                item_index = int(item_key.split("_")[-1])
+            except:
+                logger.warning(f"Could not extract item index from key: {item_key}")
+
         # Extract user from worker_id (format: "username_uuid")
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
 
@@ -1157,7 +1255,7 @@ class Orchestrator:
             item_key=item_key,
             captions=captions_list,
             outputs=outputs,
-            contributor_id=worker_user,  # Use the user, not unique worker ID
+            contributor_id=worker_user,
             timestamp=datetime.utcnow(),
             quality_scores=None,
             # Image metadata
@@ -1174,6 +1272,27 @@ class Orchestrator:
 
         # Add to central storage buffer
         await self.storage.save_caption(caption)
+
+        # Handle item tracking with fixed deadlock
+        should_flush = False
+        if chunk_id and item_index is not None and self.chunk_tracker:
+            with self.item_batch_lock:
+                self.pending_processed_items[chunk_id].append(item_index)
+
+                # Check if we should flush
+                total_pending = sum(
+                    len(indices) for indices in self.pending_processed_items.values()
+                )
+                time_since_flush = time.time() - self.last_item_batch_flush
+
+                if (
+                    total_pending >= self.item_batch_size
+                    or time_since_flush >= self.item_batch_interval
+                ):
+                    should_flush = True
+
+            if should_flush:
+                await self._flush_processed_items()
 
         # Update contributor stats (use user, not worker)
         contributor = await self.storage.get_contributor(worker_user)
@@ -1431,17 +1550,54 @@ class Orchestrator:
         # Clean up disconnected monitors
         self.monitors -= disconnected
 
+    async def _flush_processed_items(self):
+        """Flush batched processed items to chunk tracker."""
+        with self.item_batch_lock:
+            if not self.pending_processed_items:
+                return
+
+            for chunk_id, indices in self.pending_processed_items.items():
+                if not indices:
+                    continue
+
+                # Indices here are ABSOLUTE dataset indices
+                # Sort indices
+                indices.sort()
+
+                # Group consecutive indices into ranges
+                ranges = []
+                start = indices[0]
+                end = indices[0]
+
+                for i in range(1, len(indices)):
+                    if indices[i] == end + 1:
+                        # Consecutive, extend range
+                        end = indices[i]
+                    else:
+                        # Gap found, save current range and start new one
+                        ranges.append((start, end))
+                        start = indices[i]
+                        end = indices[i]
+
+                # Don't forget the last range
+                ranges.append((start, end))
+
+                # Mark ranges as processed (mark_items_processed expects absolute indices)
+                for start_idx, end_idx in ranges:
+                    self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
+
+            # Clear pending items
+            self.pending_processed_items.clear()
+            self.last_item_batch_flush = time.time()
+
     def get_workers_by_user_stats(self) -> Dict[str, Any]:
         """Get statistics about workers grouped by user/token."""
         if not hasattr(self, "workers_by_user"):
             return {}
-        
+
         stats = {}
         for user, worker_ids in self.workers_by_user.items():
-            stats[user] = {
-                "worker_count": len(worker_ids),
-                "worker_ids": list(worker_ids)
-            }
+            stats[user] = {"worker_count": len(worker_ids), "worker_ids": list(worker_ids)}
         return stats
 
     async def _send_activity(self, activity: str):
@@ -1523,6 +1679,8 @@ class Orchestrator:
             chunk_stats = self.chunk_manager.get_stats()
             storage_stats = await self.storage.get_storage_stats()
             current_total_outputs = storage_stats["total_captions"]  # ALL outputs
+            if self.chunk_tracker:
+                await self._flush_processed_items()
 
             self.stats["total_chunks"] = chunk_stats["total"]
             self.stats["completed_chunks"] = chunk_stats["completed"]
@@ -1618,6 +1776,8 @@ class Orchestrator:
         logger.info("Shutting down orchestrator...")
 
         # Stop chunk creation
+        if self.chunk_tracker:
+            await self._flush_processed_items()
         self.stop_chunk_creation.set()
         if self.chunk_creation_thread:
             self.chunk_creation_thread.join(timeout=5)

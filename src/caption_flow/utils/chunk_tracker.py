@@ -1,10 +1,11 @@
 """Chunk tracking using CheckpointTracker base class."""
 
+from collections import defaultdict
 import logging
 from pathlib import Path
-from typing import Set, Dict, List, Optional, Any
+from typing import Set, Dict, List, Optional, Any, Tuple
 from datetime import datetime
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 from .checkpoint_tracker import CheckpointTracker
 
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ChunkState:
-    """State of a chunk."""
+    """State of a chunk with item-level tracking."""
 
     chunk_id: str
     shard_name: str
@@ -21,14 +22,60 @@ class ChunkState:
     start_index: int
     chunk_size: int
     status: str  # pending, assigned, completed, failed
+
+    processed_ranges: List[Tuple[int, int]] = field(default_factory=list)  # [(start, end), ...]
+    processed_count: int = 0
+
     completed_at: Optional[datetime] = None
     assigned_to: Optional[str] = None
     assigned_at: Optional[datetime] = None
 
+    def add_processed_range(self, start: int, end: int):
+        """Add a processed range and merge if needed."""
+        # Add new range
+        self.processed_ranges.append((start, end))
+
+        # Sort and merge overlapping ranges
+        processed_ranges = sorted([list(r) for r in self.processed_ranges])
+        merged = []
+        for start, end in processed_ranges:
+            if merged and start <= merged[-1][1] + 1:
+                # Merge with previous range
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+
+        self.processed_ranges = merged
+
+        # Update count
+        self.processed_count = sum(end - start + 1 for start, end in self.processed_ranges)
+
+        # Auto-complete if all items processed
+        if self.processed_count >= self.chunk_size:
+            self.status = "completed"
+            self.completed_at = datetime.utcnow()
+
+    def get_unprocessed_ranges(self) -> List[Tuple[int, int]]:
+        """Get ranges that haven't been processed yet."""
+        if not self.processed_ranges:
+            return [(0, self.chunk_size - 1)]
+
+        unprocessed = []
+        current = 0
+
+        for start, end in self.processed_ranges:
+            if current < start:
+                unprocessed.append((current, start - 1))
+            current = max(current, end + 1)
+
+        if current < self.chunk_size:
+            unprocessed.append((current, self.chunk_size - 1))
+
+        return unprocessed
+
     def to_dict(self):
         """Convert to dictionary for JSON serialization."""
         d = asdict(self)
-        # Convert datetime objects to ISO format strings
         if d["completed_at"]:
             d["completed_at"] = d["completed_at"].isoformat()
         if d["assigned_at"]:
@@ -38,11 +85,13 @@ class ChunkState:
     @classmethod
     def from_dict(cls, d: Dict):
         """Create from dictionary."""
-        # Convert ISO format strings back to datetime objects
         if d.get("completed_at"):
             d["completed_at"] = datetime.fromisoformat(d["completed_at"])
         if d.get("assigned_at"):
             d["assigned_at"] = datetime.fromisoformat(d["assigned_at"])
+        # Ensure processed_ranges exists
+        d.setdefault("processed_ranges", [])
+        d.setdefault("processed_count", 0)
         return cls(**d)
 
 
@@ -236,84 +285,165 @@ class ChunkTracker(CheckpointTracker):
         return incomplete
 
     async def sync_with_storage(self, storage_manager):
-        """Sync chunk state with storage to detect already-processed chunks."""
+        """Sync chunk state with storage to detect processed items."""
         logger.info("Syncing chunk state with storage...")
 
-        # Get all existing captions from storage
         if storage_manager.captions_path.exists():
             import pyarrow.parquet as pq
 
-            # Read just the job_id column
-            table = pq.read_table(storage_manager.captions_path, columns=["job_id", "chunk_id"])
-            existing_job_ids = set(table["job_id"].to_pylist())
+            # Read all relevant columns
+            columns = ["job_id", "chunk_id", "item_key"]
+            # Check if item_index column exists (new format)
+            table_metadata = pq.read_metadata(storage_manager.captions_path)
+            if "item_index" in table_metadata.schema.names:
+                columns.append("item_index")
 
-            # Also get chunk_ids if available
-            if "chunk_id" in table.column_names:
-                existing_chunk_ids = set(
-                    cid for cid in table["chunk_id"].to_pylist() if cid is not None
-                )
+            table = pq.read_table(storage_manager.captions_path, columns=columns)
 
-                # Mark existing chunks as completed
-                for chunk_id in existing_chunk_ids:
-                    if chunk_id in self.chunks:
-                        self.mark_completed(chunk_id)
+            # Build lookup of chunk_id -> processed indices
+            chunk_indices = defaultdict(set)
+
+            for i in range(len(table)):
+                chunk_id = table["chunk_id"][i].as_py()
+                if not chunk_id:
+                    continue
+
+                # Get the chunk to find its boundaries
+                if chunk_id not in self.chunks:
+                    # Try to recreate chunk from chunk_id
+                    parts = chunk_id.rsplit("_chunk_", 1)
+                    if len(parts) != 2:
+                        continue
+
+                    shard_name = parts[0]
+                    try:
+                        start_idx = int(parts[1])
+                    except ValueError:
+                        continue
+
+                    # Infer shard URL and create chunk with default size
+                    if shard_name.replace("_", "/") in chunk_id or "_" in shard_name:
+                        # HF dataset
+                        dataset_path = shard_name.replace("_", "/")
+                        shard_url = f"hf_dataset:{dataset_path}:chunk:{start_idx}"
                     else:
-                        # Create chunk entry for already-processed chunks
-                        # Extract shard name from chunk_id (format: shard_chunk_index)
-                        parts = chunk_id.rsplit("_chunk_", 1)
-                        if len(parts) == 2:
-                            shard_name = parts[0]
-                            try:
-                                start_idx = int(parts[1])
-                                # We need the shard_url but it's not stored in old data
-                                # For backward compatibility, reconstruct it
-                                if chunk_id.startswith("hf_dataset:"):
-                                    # Reconstruct HF dataset URL
-                                    shard_url = chunk_id  # For HF, chunk_id IS the shard_url
-                                else:
-                                    # For WebDataset, we don't have the original URL
-                                    # Use a placeholder or skip
-                                    shard_url = f"unknown://{shard_name}"  # Or skip this chunk
+                        # WebDataset
+                        shard_url = f"unknown://{shard_name}.tar"
 
-                                self.chunks[chunk_id] = ChunkState(
-                                    chunk_id=chunk_id,
-                                    shard_name=shard_name,
-                                    shard_url=shard_url,
-                                    start_index=start_idx,
-                                    chunk_size=1000,
-                                    status="completed",
-                                    completed_at=datetime.utcnow(),
-                                )
-                                self.completed_chunks.add(chunk_id)
-                            except ValueError:
-                                logger.warning(f"Could not parse chunk_id: {chunk_id}")
+                    self.chunks[chunk_id] = ChunkState(
+                        chunk_id=chunk_id,
+                        shard_name=shard_name,
+                        shard_url=shard_url,
+                        start_index=start_idx,
+                        chunk_size=10000,  # Default - should match your chunk size
+                        status="pending",
+                    )
 
-                logger.info(f"Found {len(existing_chunk_ids)} completed chunks in storage")
+                chunk = self.chunks[chunk_id]
 
-            # Also check by job_id pattern if chunk_id column doesn't exist
-            else:
-                for job_id in existing_job_ids:
-                    # Extract chunk_id from job_id (format: chunk_id_item_key)
-                    if "_chunk_" in job_id:
-                        parts = job_id.split("_")
-                        # Find the chunk part
-                        for i, part in enumerate(parts):
-                            if part == "chunk" and i + 1 < len(parts):
-                                try:
-                                    # Reconstruct chunk_id
-                                    chunk_idx = int(parts[i + 1])
-                                    shard_parts = parts[:i]
-                                    chunk_id = f"{'_'.join(shard_parts)}_chunk_{chunk_idx}"
+                # Get item index
+                if "item_index" in table.column_names:
+                    item_index = table["item_index"][i].as_py()
+                else:
+                    # Try to extract from item_key
+                    item_key = table["item_key"][i].as_py()
+                    try:
+                        item_index = int(item_key.split("_")[-1])
+                    except:
+                        continue
 
-                                    if chunk_id not in self.completed_chunks:
-                                        self.completed_chunks.add(chunk_id)
-                                        logger.debug(
-                                            f"Marked chunk {chunk_id} as completed from job_id"
-                                        )
-                                    break
-                                except ValueError:
-                                    continue
+                if item_index is None:
+                    continue
 
-                logger.info(f"Inferred {len(self.completed_chunks)} completed chunks from job_ids")
+                # CRITICAL: Validate that this item belongs to this chunk
+                if (
+                    item_index < chunk.start_index
+                    or item_index >= chunk.start_index + chunk.chunk_size
+                ):
+                    logger.warning(
+                        f"Item index {item_index} doesn't belong to chunk {chunk_id} "
+                        f"(boundaries: {chunk.start_index}-{chunk.start_index + chunk.chunk_size - 1})"
+                    )
+                    continue
 
+                # Store the absolute index for now
+                chunk_indices[chunk_id].add(item_index)
+
+            # Convert absolute indices to relative and mark as processed
+            for chunk_id, abs_indices in chunk_indices.items():
+                if chunk_id not in self.chunks:
+                    continue
+
+                chunk = self.chunks[chunk_id]
+
+                # Convert to relative indices and group into ranges
+                rel_indices = []
+                for abs_idx in sorted(abs_indices):
+                    rel_idx = abs_idx - chunk.start_index
+                    if 0 <= rel_idx < chunk.chunk_size:
+                        rel_indices.append(rel_idx)
+
+                # Group consecutive indices into ranges
+                if rel_indices:
+                    ranges = []
+                    start = rel_indices[0]
+                    end = rel_indices[0]
+
+                    for idx in rel_indices[1:]:
+                        if idx == end + 1:
+                            end = idx
+                        else:
+                            ranges.append((start, end))
+                            start = idx
+                            end = idx
+
+                    ranges.append((start, end))
+
+                    # Mark ranges as processed
+                    for start_idx, end_idx in ranges:
+                        chunk.add_processed_range(start_idx, end_idx)
+
+            logger.info(f"Synced {len(chunk_indices)} chunks with processed items")
             self.save()
+
+    def mark_items_processed(self, chunk_id: str, start_idx: int, end_idx: int):
+        """Mark a range of items as processed within a chunk (expects ABSOLUTE indices)."""
+        if chunk_id not in self.chunks:
+            logger.error(f"Unknown chunk: {chunk_id}")
+            return
+
+        chunk = self.chunks[chunk_id]
+
+        # Convert absolute indices to chunk-relative
+        relative_start = start_idx - chunk.start_index
+        relative_end = end_idx - chunk.start_index
+
+        # Validate boundaries
+        if relative_start < 0 or relative_end >= chunk.chunk_size:
+            logger.error(
+                f"Invalid indices for chunk {chunk_id}: "
+                f"absolute {start_idx}-{end_idx} (relative {relative_start}-{relative_end}) "
+                f"outside chunk bounds [{chunk.start_index}, {chunk.start_index + chunk.chunk_size - 1}]"
+            )
+            return
+
+        # Add the relative range
+        chunk.add_processed_range(relative_start, relative_end)
+
+        # If chunk is now complete, update completed set
+        if chunk.status == "completed":
+            self.completed_chunks.add(chunk_id)
+
+        self.save()
+        logger.debug(
+            f"Marked items {start_idx}-{end_idx} as processed in chunk {chunk_id} "
+            f"(relative indices: {relative_start}-{relative_end})"
+        )
+
+    def get_chunk_with_unprocessed_items(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Get chunk info including unprocessed ranges."""
+        if chunk_id not in self.chunks:
+            return None
+
+        chunk = self.chunks[chunk_id]
+        return {"chunk": chunk.to_dict(), "unprocessed_ranges": chunk.get_unprocessed_ranges()}
