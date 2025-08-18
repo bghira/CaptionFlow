@@ -120,13 +120,19 @@ class ConfigManager:
 
 
 def setup_logging(verbose: bool = False):
-    """Configure logging with rich handler."""
+    """Configure logging with rich handler, including timestamp."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(message)s",
+        format="%(asctime)s %(message)s",
+        datefmt="[%Y-%m-%d %H:%M:%S]",
         handlers=[
-            RichHandler(console=console, rich_tracebacks=True, show_path=False, show_time=False)
+            RichHandler(
+                console=console,
+                rich_tracebacks=True,
+                show_path=False,
+                show_time=True,  # Enables timestamp in RichHandler output
+            )
         ],
     )
 
