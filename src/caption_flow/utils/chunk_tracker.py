@@ -36,9 +36,9 @@ class ChunkState:
         self.processed_ranges.append((start, end))
 
         # Sort and merge overlapping ranges
-        self.processed_ranges.sort()
+        processed_ranges = sorted([list(r) for r in self.processed_ranges])
         merged = []
-        for start, end in self.processed_ranges:
+        for start, end in processed_ranges:
             if merged and start <= merged[-1][1] + 1:
                 # Merge with previous range
                 merged[-1] = (merged[-1][0], max(merged[-1][1], end))
@@ -285,7 +285,7 @@ class ChunkTracker(CheckpointTracker):
         return incomplete
 
     async def sync_with_storage(self, storage_manager):
-        """Sync chunk state with storage to detect processed items (HF and WebDataset compatible)."""
+        """Sync chunk state with storage to detect processed items."""
         logger.info("Syncing chunk state with storage...")
 
         if storage_manager.captions_path.exists():
@@ -308,39 +308,9 @@ class ChunkTracker(CheckpointTracker):
                 if not chunk_id:
                     continue
 
-                # Try to get item index from explicit column first
-                if "item_index" in table.column_names:
-                    item_index = table["item_index"][i].as_py()
-                    if item_index is not None:
-                        chunk_indices[chunk_id].add(item_index)
-                        continue
-
-                # Fallback to parsing from item_key or job_id
-                item_key = table["item_key"][i].as_py()
-                job_id = table["job_id"][i].as_py()
-
-                if chunk_id in self.chunks:
-                    chunk = self.chunks[chunk_id]
-
-                    # For HF datasets, parse from item_key
-                    if chunk.shard_url.startswith("hf_dataset:"):
-                        try:
-                            # Format: dataset_XXXXXXXX
-                            abs_idx = int(item_key.split("_")[-1])
-                            chunk_indices[chunk_id].add(abs_idx)
-                        except:
-                            pass
-
-                    # For WebDataset, we need to maintain order
-                    # Count occurrences to infer index
-                    else:
-                        # This is approximate - better to use explicit item_index
-                        chunk_indices[chunk_id].add(len(chunk_indices[chunk_id]))
-
-            # Update chunks with processed indices
-            for chunk_id, indices in chunk_indices.items():
+                # Get the chunk to find its boundaries
                 if chunk_id not in self.chunks:
-                    # Create chunk from ID
+                    # Try to recreate chunk from chunk_id
                     parts = chunk_id.rsplit("_chunk_", 1)
                     if len(parts) != 2:
                         continue
@@ -351,7 +321,7 @@ class ChunkTracker(CheckpointTracker):
                     except ValueError:
                         continue
 
-                    # Infer shard URL
+                    # Infer shard URL and create chunk with default size
                     if shard_name.replace("_", "/") in chunk_id or "_" in shard_name:
                         # HF dataset
                         dataset_path = shard_name.replace("_", "/")
@@ -365,38 +335,110 @@ class ChunkTracker(CheckpointTracker):
                         shard_name=shard_name,
                         shard_url=shard_url,
                         start_index=start_idx,
-                        chunk_size=1000,  # Default
+                        chunk_size=10000,  # Default - should match your chunk size
                         status="pending",
                     )
 
-                # Convert absolute indices to chunk-relative and mark as processed
                 chunk = self.chunks[chunk_id]
-                for abs_idx in sorted(indices):
-                    if chunk.shard_url.startswith("hf_dataset:"):
-                        # HF: absolute index to relative
-                        rel_idx = abs_idx - chunk.start_index
-                    else:
-                        # WebDataset: indices are already relative (0-based within chunk)
-                        rel_idx = abs_idx
 
+                # Get item index
+                if "item_index" in table.column_names:
+                    item_index = table["item_index"][i].as_py()
+                else:
+                    # Try to extract from item_key
+                    item_key = table["item_key"][i].as_py()
+                    try:
+                        item_index = int(item_key.split("_")[-1])
+                    except:
+                        continue
+
+                if item_index is None:
+                    continue
+
+                # CRITICAL: Validate that this item belongs to this chunk
+                if (
+                    item_index < chunk.start_index
+                    or item_index >= chunk.start_index + chunk.chunk_size
+                ):
+                    logger.warning(
+                        f"Item index {item_index} doesn't belong to chunk {chunk_id} "
+                        f"(boundaries: {chunk.start_index}-{chunk.start_index + chunk.chunk_size - 1})"
+                    )
+                    continue
+
+                # Store the absolute index for now
+                chunk_indices[chunk_id].add(item_index)
+
+            # Convert absolute indices to relative and mark as processed
+            for chunk_id, abs_indices in chunk_indices.items():
+                if chunk_id not in self.chunks:
+                    continue
+
+                chunk = self.chunks[chunk_id]
+
+                # Convert to relative indices and group into ranges
+                rel_indices = []
+                for abs_idx in sorted(abs_indices):
+                    rel_idx = abs_idx - chunk.start_index
                     if 0 <= rel_idx < chunk.chunk_size:
-                        chunk.add_processed_range(rel_idx, rel_idx)
+                        rel_indices.append(rel_idx)
+
+                # Group consecutive indices into ranges
+                if rel_indices:
+                    ranges = []
+                    start = rel_indices[0]
+                    end = rel_indices[0]
+
+                    for idx in rel_indices[1:]:
+                        if idx == end + 1:
+                            end = idx
+                        else:
+                            ranges.append((start, end))
+                            start = idx
+                            end = idx
+
+                    ranges.append((start, end))
+
+                    # Mark ranges as processed
+                    for start_idx, end_idx in ranges:
+                        chunk.add_processed_range(start_idx, end_idx)
 
             logger.info(f"Synced {len(chunk_indices)} chunks with processed items")
             self.save()
 
     def mark_items_processed(self, chunk_id: str, start_idx: int, end_idx: int):
-        """Mark a range of items as processed within a chunk."""
-        if chunk_id in self.chunks:
-            chunk = self.chunks[chunk_id]
-            chunk.add_processed_range(start_idx, end_idx)
+        """Mark a range of items as processed within a chunk (expects ABSOLUTE indices)."""
+        if chunk_id not in self.chunks:
+            logger.error(f"Unknown chunk: {chunk_id}")
+            return
 
-            # If chunk is now complete, update completed set
-            if chunk.status == "completed":
-                self.completed_chunks.add(chunk_id)
+        chunk = self.chunks[chunk_id]
 
-            self.save()
-            logger.info(f"Marked items {start_idx}-{end_idx} as processed in chunk {chunk_id}")
+        # Convert absolute indices to chunk-relative
+        relative_start = start_idx - chunk.start_index
+        relative_end = end_idx - chunk.start_index
+
+        # Validate boundaries
+        if relative_start < 0 or relative_end >= chunk.chunk_size:
+            logger.error(
+                f"Invalid indices for chunk {chunk_id}: "
+                f"absolute {start_idx}-{end_idx} (relative {relative_start}-{relative_end}) "
+                f"outside chunk bounds [{chunk.start_index}, {chunk.start_index + chunk.chunk_size - 1}]"
+            )
+            return
+
+        # Add the relative range
+        chunk.add_processed_range(relative_start, relative_end)
+
+        # If chunk is now complete, update completed set
+        if chunk.status == "completed":
+            self.completed_chunks.add(chunk_id)
+
+        self.save()
+        logger.debug(
+            f"Marked items {start_idx}-{end_idx} as processed in chunk {chunk_id} "
+            f"(relative indices: {relative_start}-{relative_end})"
+        )
 
     def get_chunk_with_unprocessed_items(self, chunk_id: str) -> Optional[Dict[str, Any]]:
         """Get chunk info including unprocessed ranges."""

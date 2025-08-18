@@ -126,14 +126,20 @@ class ChunkManager:
         assigned = []
 
         with self.lock:
-            # First, check partially processed chunks
-            if tracker:
-                for chunk_id, chunk in self.chunks.items():
+            # FIRST PRIORITY: Check if this worker already has assigned chunks
+            # Workers should complete their current chunks before getting new ones
+            if worker_id in self.assigned_chunks:
+                existing_chunk_ids = list(self.assigned_chunks[worker_id])
+                for chunk_id in existing_chunk_ids:
                     if len(assigned) >= count:
                         break
 
-                    if chunk.status == "assigned" and chunk.assigned_to == worker_id:
-                        # Already assigned to this worker
+                    chunk = self.chunks.get(chunk_id)
+                    if not chunk:
+                        continue
+
+                    # Check if chunk still has unprocessed items
+                    if tracker:
                         chunk_info = tracker.get_chunk_with_unprocessed_items(chunk_id)
                         if chunk_info and chunk_info["unprocessed_ranges"]:
                             assigned.append(
@@ -142,20 +148,39 @@ class ChunkManager:
                                     "unprocessed_ranges": chunk_info["unprocessed_ranges"],
                                 }
                             )
+                    else:
+                        # No tracker, assume chunk needs processing
+                        assigned.append(
+                            {
+                                "chunk": chunk,
+                                "unprocessed_ranges": [(0, chunk.chunk_size - 1)],
+                            }
+                        )
 
-            # Then get new pending chunks
+            # SECOND PRIORITY: Get new pending chunks
+            # Only if worker doesn't have enough chunks already
             while len(assigned) < count and self.pending_chunks:
                 chunk_id = self.pending_chunks.popleft()
-                chunk = self.chunks[chunk_id]
+                chunk = self.chunks.get(chunk_id)
 
+                if not chunk:
+                    continue
+
+                # Verify chunk is truly pending (defensive check)
+                if chunk.status != "pending" or chunk.assigned_to is not None:
+                    logger.warning(
+                        f"Chunk {chunk_id} in pending queue but status={chunk.status}, assigned_to={chunk.assigned_to}"
+                    )
+                    continue
+
+                # Assign to this worker
                 chunk.assigned_to = worker_id
                 chunk.status = "assigned"
                 chunk.assigned_at = datetime.utcnow()
-
                 self.assigned_chunks[worker_id].add(chunk_id)
 
                 # Get unprocessed ranges
-                unprocessed_ranges = [(0, chunk.chunk_size - 1)]  # Default: all unprocessed
+                unprocessed_ranges = [(0, chunk.chunk_size - 1)]  # Default
                 if tracker:
                     chunk_info = tracker.get_chunk_with_unprocessed_items(chunk_id)
                     if chunk_info:
@@ -163,6 +188,16 @@ class ChunkManager:
                     tracker.mark_assigned(chunk_id, worker_id)
 
                 assigned.append({"chunk": chunk, "unprocessed_ranges": unprocessed_ranges})
+
+        # Log what we're assigning
+        if assigned:
+            chunk_summary = ", ".join(
+                [
+                    f"{info['chunk'].chunk_id}[{len(info['unprocessed_ranges'])} ranges]"
+                    for info in assigned
+                ]
+            )
+            logger.info(f"Assigning to worker {worker_id}: {chunk_summary}")
 
         return assigned
 
@@ -247,8 +282,8 @@ class Orchestrator:
             self.dataset_loader = DatasetLoader(
                 self.dataset_path,
                 self.dataset_type,
-                self.dataset_split,  # Pass split to DatasetLoader
-                self.dataset_image_column,  # Pass image column
+                self.dataset_split,
+                self.dataset_image_column,
             )
             checkpoint_dir = Path(config.get("storage", {}).get("checkpoint_dir", "./checkpoints"))
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -612,11 +647,26 @@ class Orchestrator:
 
                 # Create a chunk from current shard
                 if current_shard_url and current_shard_index < current_shard_items:
-                    # For virtual shards, we need to handle the chunk_id differently
+                    # Calculate the absolute dataset index for this chunk
+                    if current_shard_url.startswith("hf_dataset:"):
+                        # Parse the virtual shard URL to get the base start index
+                        parts = current_shard_url.split(":")
+                        if len(parts) >= 4 and parts[2] == "chunk":
+                            shard_base_index = int(parts[3])
+                        else:
+                            shard_base_index = 0
+
+                        # The absolute start index for this chunk in the dataset
+                        absolute_start_index = shard_base_index + current_shard_index
+                    else:
+                        # For WebDataset, current_shard_index is already absolute
+                        absolute_start_index = current_shard_index
+
+                    # Create chunk with absolute index
                     chunk = ShardChunk.create(
                         shard_url=current_shard_url,
                         shard_name=current_shard_name,
-                        start_index=current_shard_index,
+                        start_index=absolute_start_index,
                         chunk_size=min(self.chunk_size, current_shard_items - current_shard_index),
                     )
 
@@ -1024,7 +1074,7 @@ class Orchestrator:
         contributor = await self.storage.get_contributor(worker_user)
         if not contributor:
             contributor = Contributor(
-                contributor_id=worker_user,  # Use base name for contributor
+                contributor_id=worker_user,
                 name=worker_user,
                 total_captions=0,
                 trust_level=1,
@@ -1039,8 +1089,8 @@ class Orchestrator:
             # Send welcome message with dataset configuration
             welcome_message = {
                 "type": "welcome",
-                "worker_id": worker_id,  # Send unique worker ID
-                "user_id": worker_user,  # Also send user/token identifier
+                "worker_id": worker_id,
+                "user_id": worker_user,
                 "dataset_config": {
                     "dataset_path": self.dataset_path,
                     "dataset_type": self.dataset_type,
@@ -1205,7 +1255,7 @@ class Orchestrator:
             item_key=item_key,
             captions=captions_list,
             outputs=outputs,
-            contributor_id=worker_user,  # Use the user, not unique worker ID
+            contributor_id=worker_user,
             timestamp=datetime.utcnow(),
             quality_scores=None,
             # Image metadata
@@ -1223,6 +1273,8 @@ class Orchestrator:
         # Add to central storage buffer
         await self.storage.save_caption(caption)
 
+        # Handle item tracking with fixed deadlock
+        should_flush = False
         if chunk_id and item_index is not None and self.chunk_tracker:
             with self.item_batch_lock:
                 self.pending_processed_items[chunk_id].append(item_index)
@@ -1237,7 +1289,10 @@ class Orchestrator:
                     total_pending >= self.item_batch_size
                     or time_since_flush >= self.item_batch_interval
                 ):
-                    await self._flush_processed_items()
+                    should_flush = True
+
+            if should_flush:
+                await self._flush_processed_items()
 
         # Update contributor stats (use user, not worker)
         contributor = await self.storage.get_contributor(worker_user)
@@ -1505,6 +1560,7 @@ class Orchestrator:
                 if not indices:
                     continue
 
+                # Indices here are ABSOLUTE dataset indices
                 # Sort indices
                 indices.sort()
 
@@ -1526,12 +1582,9 @@ class Orchestrator:
                 # Don't forget the last range
                 ranges.append((start, end))
 
-                # Mark ranges as processed
+                # Mark ranges as processed (mark_items_processed expects absolute indices)
                 for start_idx, end_idx in ranges:
                     self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
-                    logger.info(
-                        f"Marked items {start_idx}-{end_idx} as processed in chunk {chunk_id}"
-                    )
 
             # Clear pending items
             self.pending_processed_items.clear()
