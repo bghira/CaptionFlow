@@ -695,6 +695,94 @@ class CaptionWorker(BaseWorker):
                 logger.error(f"Job request error: {e}")
                 await asyncio.sleep(5)
 
+    def _process_shard_chunk(self, chunk: ShardChunk):
+        """Process a single shard chunk with item-level tracking."""
+        logger.info(
+            f"Processing shard {chunk.shard_name} with unprocessed ranges: {chunk.unprocessed_ranges}"
+        )
+
+        # Get unprocessed ranges
+        unprocessed_ranges = chunk.unprocessed_ranges or [(0, chunk.chunk_size - 1)]
+
+        # Select appropriate processor
+        if chunk.shard_url.startswith("hf_dataset:"):
+            processor = self.hf_processor
+        else:
+            processor = self.webdataset_processor
+
+        items_processed = 0
+        current_item_idx = 0
+
+        # Process only unprocessed ranges
+        for key, url, image_data, metadata in processor.iterate_chunk_with_metadata(
+            chunk, self.dataset_loader, self.should_stop_processing, self.connected
+        ):
+            # Check if current item is in any unprocessed range
+            in_range = any(start <= current_item_idx <= end for start, end in unprocessed_ranges)
+
+            if not in_range:
+                current_item_idx += 1
+                continue  # Skip already processed items
+
+            try:
+                # Load image
+                img = Image.open(io.BytesIO(image_data))
+
+                # Create processing item with index
+                item = ProcessingItem(
+                    chunk_id=chunk.chunk_id,
+                    item_key=key,
+                    image=img,
+                    image_data=image_data,
+                    metadata=metadata,
+                )
+                # Store absolute item index for tracking
+                item.metadata["_item_index"] = chunk.start_index + current_item_idx
+
+                # Add to readahead queue with timeout handling
+                timeout_end = time.time() + 30
+                while (
+                    self.running
+                    and not self.should_stop_processing.is_set()
+                    and self.connected.is_set()
+                ):
+                    try:
+                        self.readahead_queue.put(item, timeout=1)
+                        break
+                    except:
+                        if time.time() > timeout_end:
+                            raise TimeoutError("Queue put timeout")
+                        continue
+
+                # If we couldn't queue due to disconnection, stop processing
+                if not self.connected.is_set() or self.should_stop_processing.is_set():
+                    logger.debug(f"Skipping remaining items due to disconnection")
+                    break
+
+                items_processed += 1
+                self.current_chunk_progress = current_item_idx
+
+                # Batch items for inference
+                batch_size = self.vllm_config.get("batch_size", 8)
+                if self.readahead_queue.qsize() >= batch_size:
+                    self._batch_for_inference()
+
+            except Exception as e:
+                if self.should_stop_processing.is_set():
+                    break
+                logger.error(f"Error processing item {key} at index {current_item_idx}: {e}")
+                self.items_failed += 1
+
+            current_item_idx += 1
+
+        # Process any remaining items in queue
+        if not self.should_stop_processing.is_set():
+            self._batch_for_inference()
+
+        logger.info(
+            f"Chunk {chunk.chunk_id} processed {items_processed} unprocessed items out of {current_item_idx} total"
+        )
+
     def _shard_reader_thread(self):
         """Background thread that reads from WebDataset shards."""
         logger.info("Starting shard reader thread")
