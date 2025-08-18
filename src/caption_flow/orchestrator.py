@@ -1621,21 +1621,63 @@ class Orchestrator:
     async def _heartbeat_loop(self):
         """Send periodic heartbeats to maintain connections."""
         while True:
-            await asyncio.sleep(30)
+            try:
+                await asyncio.sleep(30)
 
-            # Ping workers
-            disconnected = []
-            for worker_id, ws in self.workers.items():
-                try:
-                    await ws.ping()
-                except:
-                    disconnected.append(worker_id)
+                # Create a copy of worker items to avoid modification during iteration
+                worker_items = list(self.workers.items())
+                disconnected = []
 
-            # Clean up disconnected workers
-            for worker_id in disconnected:
-                if worker_id in self.workers:
-                    del self.workers[worker_id]
-                    self.chunk_manager.release_worker_chunks(worker_id)
+                for worker_id, ws in worker_items:
+                    try:
+                        # Check if worker still exists before pinging
+                        if worker_id not in self.workers:
+                            continue
+
+                        # Send ping with timeout
+                        pong_waiter = await ws.ping()
+                        try:
+                            await asyncio.wait_for(pong_waiter, timeout=10)
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Worker {worker_id} failed to respond to ping")
+                            disconnected.append(worker_id)
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.info(f"Worker {worker_id} connection already closed")
+                        disconnected.append(worker_id)
+                    except Exception as e:
+                        logger.error(f"Error pinging worker {worker_id}: {e}")
+                        disconnected.append(worker_id)
+
+                # Clean up disconnected workers
+                for worker_id in disconnected:
+                    if worker_id in self.workers:
+                        logger.info(f"Removing unresponsive worker {worker_id}")
+                        del self.workers[worker_id]
+                        self.chunk_manager.release_worker_chunks(worker_id)
+
+                        # Update stats
+                        self.stats["connected_workers"] = len(self.workers)
+
+                        # Also clean up from workers_by_user if it exists
+                        if hasattr(self, "workers_by_user"):
+                            worker_user = (
+                                worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
+                            )
+                            if worker_user in self.workers_by_user:
+                                self.workers_by_user[worker_user].discard(worker_id)
+                                if not self.workers_by_user[worker_user]:
+                                    del self.workers_by_user[worker_user]
+
+                        # Notify monitors
+                        await self._broadcast_stats()
+                        await self._send_activity(
+                            f"Worker {worker_id} removed due to heartbeat timeout"
+                        )
+
+            except Exception as e:
+                logger.error(f"Error in heartbeat loop: {e}", exc_info=True)
+                # Continue the loop even if there's an error
+                await asyncio.sleep(5)
 
     async def _checkpoint_loop(self):
         """Periodically checkpoint storage."""
