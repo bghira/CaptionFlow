@@ -21,6 +21,7 @@ from collections import deque, defaultdict
 import threading
 from queue import Queue, Empty
 
+from .workers import data
 import websockets
 from websockets.server import WebSocketServerProtocol
 
@@ -51,14 +52,16 @@ class ShardChunk:
     def create(
         cls, shard_url: str, shard_name: str, start_index: int, chunk_size: int
     ) -> "ShardChunk":
-        """Factory method to create a chunk with proper ID."""
-        # Generate chunk_id based on shard type
+        """Factory method to create a chunk with consistent ID."""
+        # Always use consistent format: dataset_chunk_startindex
         if shard_url.startswith("hf_dataset:"):
-            # For HF datasets, the shard_url is already unique per chunk
-            chunk_id = shard_url
+            # Extract dataset path
+            parts = shard_url.split(":")
+            dataset_path = parts[1] if len(parts) > 1 else "unknown"
+            chunk_id = f"{dataset_path.replace('/', '_')}_chunk_{start_index}"
         else:
-            # For WebDataset, create a unique ID
-            chunk_id = f"{shard_name}:chunk:{start_index}"
+            # WebDataset format
+            chunk_id = f"{shard_name}_chunk_{start_index}"
 
         return cls(
             chunk_id=chunk_id,
@@ -118,11 +121,29 @@ class ChunkManager:
 
     def get_chunks_for_worker(
         self, worker_id: str, count: int = 1, tracker: Optional["ChunkTracker"] = None
-    ) -> List[ShardChunk]:
-        """Get available chunks for a worker."""
+    ) -> List[Dict[str, Any]]:
+        """Get available chunks with unprocessed items for a worker."""
         assigned = []
 
         with self.lock:
+            # First, check partially processed chunks
+            if tracker:
+                for chunk_id, chunk in self.chunks.items():
+                    if len(assigned) >= count:
+                        break
+
+                    if chunk.status == "assigned" and chunk.assigned_to == worker_id:
+                        # Already assigned to this worker
+                        chunk_info = tracker.get_chunk_with_unprocessed_items(chunk_id)
+                        if chunk_info and chunk_info["unprocessed_ranges"]:
+                            assigned.append(
+                                {
+                                    "chunk": chunk,
+                                    "unprocessed_ranges": chunk_info["unprocessed_ranges"],
+                                }
+                            )
+
+            # Then get new pending chunks
             while len(assigned) < count and self.pending_chunks:
                 chunk_id = self.pending_chunks.popleft()
                 chunk = self.chunks[chunk_id]
@@ -132,9 +153,16 @@ class ChunkManager:
                 chunk.assigned_at = datetime.utcnow()
 
                 self.assigned_chunks[worker_id].add(chunk_id)
-                assigned.append(chunk)
+
+                # Get unprocessed ranges
+                unprocessed_ranges = [(0, chunk.chunk_size - 1)]  # Default: all unprocessed
                 if tracker:
+                    chunk_info = tracker.get_chunk_with_unprocessed_items(chunk_id)
+                    if chunk_info:
+                        unprocessed_ranges = chunk_info["unprocessed_ranges"]
                     tracker.mark_assigned(chunk_id, worker_id)
+
+                assigned.append({"chunk": chunk, "unprocessed_ranges": unprocessed_ranges})
 
         return assigned
 
@@ -1065,19 +1093,26 @@ class Orchestrator:
                 return
 
             count = data.get("count", self.chunks_per_request)
-            chunks = self.chunk_manager.get_chunks_for_worker(worker_id, count, self.chunk_tracker)
+            chunk_infos = self.chunk_manager.get_chunks_for_worker(
+                worker_id, count, self.chunk_tracker
+            )
 
-            if chunks:
-                # Use the to_dict method for serialization
-                chunk_data = [chunk.to_dict() for chunk in chunks]
+            if chunk_infos:
+                # Send chunks with unprocessed ranges
+                chunks_data = []
+                for info in chunk_infos:
+                    chunk_dict = info["chunk"].to_dict()
+                    chunk_dict["unprocessed_ranges"] = info["unprocessed_ranges"]
+                    chunks_data.append(chunk_dict)
 
                 await self.workers[worker_id].send(
-                    safe_json_dumps({"type": "shard_assignment", "chunks": chunk_data})
+                    safe_json_dumps({"type": "shard_assignment", "chunks": chunks_data})
                 )
 
-                chunk_ids = [c["chunk_id"] for c in chunk_data]
-                logger.info(f"Assigned {len(chunks)} chunks to worker {worker_id}: {chunk_ids}")
-                await self._send_activity(f"Assigned {len(chunks)} chunks to {worker_id}")
+                chunk_ids = [c["chunk_id"] for c in chunks_data]
+                logger.info(
+                    f"Assigned {len(chunks_data)} chunks to worker {worker_id}: {chunk_ids}"
+                )
             else:
                 await self.workers[worker_id].send(safe_json_dumps({"type": "no_chunks"}))
 
@@ -1124,6 +1159,14 @@ class Orchestrator:
         """Process caption submission from worker - now handles multi-stage outputs."""
         chunk_id = data.get("chunk_id")
         item_key = data["item_key"]
+
+        item_index = data.get("item_index")  # Worker should send this
+        if item_index is None:
+            # Try to extract from item_key (format: dataset_XXXXXXXX)
+            try:
+                item_index = int(item_key.split("_")[-1])
+            except:
+                logger.warning(f"Could not extract item index from key: {item_key}")
 
         # Extract user from worker_id (format: "username_uuid")
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
@@ -1174,6 +1217,9 @@ class Orchestrator:
 
         # Add to central storage buffer
         await self.storage.save_caption(caption)
+
+        if chunk_id and item_index is not None and self.chunk_tracker:
+            self.chunk_tracker.mark_items_processed(chunk_id, item_index, item_index)
 
         # Update contributor stats (use user, not worker)
         contributor = await self.storage.get_contributor(worker_user)
@@ -1435,13 +1481,10 @@ class Orchestrator:
         """Get statistics about workers grouped by user/token."""
         if not hasattr(self, "workers_by_user"):
             return {}
-        
+
         stats = {}
         for user, worker_ids in self.workers_by_user.items():
-            stats[user] = {
-                "worker_count": len(worker_ids),
-                "worker_ids": list(worker_ids)
-            }
+            stats[user] = {"worker_count": len(worker_ids), "worker_ids": list(worker_ids)}
         return stats
 
     async def _send_activity(self, activity: str):

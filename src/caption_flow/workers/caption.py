@@ -62,13 +62,14 @@ class StageResult:
 
 @dataclass
 class ShardChunk:
-    """Shard chunk assignment from orchestrator."""
+    """Shard chunk assignment with unprocessed ranges."""
 
     chunk_id: str
     shard_url: str
     shard_name: str
     start_index: int
     chunk_size: int
+    unprocessed_ranges: List[Tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -795,74 +796,87 @@ class CaptionWorker(BaseWorker):
                 with self.chunk_lock:
                     self.current_chunk = None
 
-    def _process_shard_chunk(self, chunk: ShardChunk):
-        """Process a single shard chunk."""
-        logger.info(f"Processing shard {chunk.shard_name} from index {chunk.start_index}")
+    async def _result_sender(self):
+        """Send results back to orchestrator with item index."""
+        pending_results = []
 
-        # Select appropriate processor
-        if chunk.shard_url.startswith("hf_dataset:"):
-            processor = self.hf_processor
-        else:
-            processor = self.webdataset_processor
-
-        items_processed = 0
-
-        # Iterate through chunk items using the processor
-        for key, url, image_data, metadata in processor.iterate_chunk_with_metadata(
-            chunk, self.dataset_loader, self.should_stop_processing, self.connected
-        ):
-            try:
-                # Load image
-                img = Image.open(io.BytesIO(image_data))
-
-                # Create processing item
-                item = ProcessingItem(
-                    chunk_id=chunk.chunk_id,
-                    item_key=key,
-                    image=img,
-                    image_data=image_data,
-                    metadata=metadata,
-                )
-
-                # Add to readahead queue
-                timeout_end = time.time() + 30
-                while (
-                    self.running
-                    and not self.should_stop_processing.is_set()
-                    and self.connected.is_set()
-                ):
+        try:
+            while self.running and self.connected.is_set():
+                try:
+                    # Get result with timeout
                     try:
-                        self.readahead_queue.put(item, timeout=1)
-                        break
-                    except:
-                        if time.time() > timeout_end:
-                            raise TimeoutError("Queue put timeout")
-                        continue
+                        result = await asyncio.get_event_loop().run_in_executor(
+                            None, self.result_queue.get, True, 1
+                        )
+                        pending_results.append(result)
+                    except Empty:
+                        pass
 
-                # If we couldn't queue due to disconnection, skip this item
-                if not self.connected.is_set() or self.should_stop_processing.is_set():
-                    logger.debug(f"Skipping item {key} due to disconnection")
-                    break
+                    # Only try to send if connected
+                    if pending_results and self.websocket and self.connected.is_set():
+                        sent_results = []
+                        for result in pending_results:
+                            try:
+                                # Build message with item index
+                                message_data = {
+                                    "type": "submit_captions",
+                                    "chunk_id": result.chunk_id,
+                                    "dataset": self.dataset_config.get("dataset_path", "unknown"),
+                                    "shard": result.shard_name,
+                                    "item_key": result.item_key,
+                                    "item_index": result.item_index,  # NEW: Include index
+                                    "outputs": result.outputs,
+                                    "captions": result.outputs.get("captions", []),  # Compatibility
+                                    "caption_count": sum(len(v) for v in result.outputs.values()),
+                                    "image_width": result.image_width,
+                                    "image_height": result.image_height,
+                                    "image_format": result.image_format,
+                                    "file_size": result.file_size,
+                                    "processing_time_ms": result.processing_time_ms,
+                                    "metadata": result.metadata,
+                                }
 
-                items_processed += 1
-                self.current_chunk_progress = items_processed
+                                await self.websocket.send(json.dumps(message_data))
+                                sent_results.append(result)
 
-                # Batch items for inference
-                batch_size = self.vllm_config.get("batch_size", 8)
-                if self.readahead_queue.qsize() >= batch_size:
-                    self._batch_for_inference()
+                                if self.items_processed % 100 == 0:
+                                    total_outputs = sum(
+                                        len(outputs) for outputs in result.outputs.values()
+                                    )
+                                    logger.info(
+                                        f"Processed {self.items_processed} items "
+                                        f"(~{total_outputs} outputs across {len(result.outputs)} fields)"
+                                    )
 
-            except Exception as e:
-                if self.should_stop_processing.is_set():
-                    break
-                logger.error(f"Error processing item {key}: {e}")
-                self.items_failed += 1
+                            except websockets.exceptions.ConnectionClosed as e:
+                                logger.warning(f"Connection lost while sending result: {e}")
+                                raise
+                            except Exception as e:
+                                logger.error(f"Error sending result: {e}")
+                                break
 
-        # Process remaining items only if still connected
-        if not self.should_stop_processing.is_set():
-            self._batch_for_inference()
+                        # Remove successfully sent results
+                        for result in sent_results:
+                            pending_results.remove(result)
 
-        logger.info(f"Chunk {chunk.chunk_id} processed {items_processed} items")
+                    # Clear pending results if disconnected and buffer is too large
+                    if not self.connected.is_set() and len(pending_results) > 1000:
+                        logger.warning(
+                            f"Clearing {len(pending_results)} pending results due to prolonged disconnection"
+                        )
+                        pending_results.clear()
+
+                    await asyncio.sleep(0.1)
+
+                except Exception as e:
+                    if isinstance(e, websockets.exceptions.ConnectionClosed):
+                        raise
+                    logger.error(f"Unexpected error in result sender: {e}")
+                    await asyncio.sleep(1)
+
+        except asyncio.CancelledError:
+            logger.debug("Result sender cancelled")
+            raise
 
     def _batch_for_inference(self):
         """Batch items from readahead queue for inference."""
@@ -1147,6 +1161,7 @@ class CaptionWorker(BaseWorker):
                                                 ),
                                                 "shard": result.shard_name,
                                                 "item_key": result.item_key,
+                                                "item_index": result.metadata.get("_item_index"),
                                                 "captions": result.outputs["captions"],
                                                 "caption_count": len(result.outputs["captions"]),
                                                 "image_width": result.image_width,

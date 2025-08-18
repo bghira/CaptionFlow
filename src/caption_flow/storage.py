@@ -67,6 +67,7 @@ class StorageManager:
             ("shard", pa.string()),
             ("chunk_id", pa.string()),
             ("item_key", pa.string()),
+            ("item_index", pa.int32()),
             ("caption_count", pa.int32()),
             ("contributor_id", pa.string()),
             ("timestamp", pa.timestamp("us")),
@@ -228,6 +229,12 @@ class StorageManager:
         """Save a caption entry with dynamic output columns."""
         # Convert to dict
         caption_dict = asdict(caption)
+
+        # Extract item_index from metadata if present
+        if "metadata" in caption_dict and isinstance(caption_dict["metadata"], dict):
+            item_index = caption_dict["metadata"].get("_item_index")
+            if item_index is not None:
+                caption_dict["item_index"] = item_index
 
         # Extract outputs and handle them separately
         outputs = caption_dict.pop("outputs", {})

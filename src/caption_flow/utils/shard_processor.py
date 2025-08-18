@@ -126,7 +126,7 @@ class HFDatasetShardProcessor(ShardProcessor):
 
 
 class WebDatasetShardProcessor(ShardProcessor):
-    """Processor for WebDataset tar shards."""
+    """Processor for WebDataset tar shards with range support."""
 
     def __init__(self, hf_token: Optional[str] = None, dataset_type: str = "local"):
         self.hf_token = hf_token
@@ -139,7 +139,13 @@ class WebDatasetShardProcessor(ShardProcessor):
         should_stop: Event,
         connected: Event,
     ) -> Generator[Tuple[str, str, bytes], None, None]:
-        """Process WebDataset shard chunk."""
+        """Process WebDataset shard chunk with unprocessed ranges."""
+        # Get unprocessed ranges
+        unprocessed_ranges = getattr(chunk, "unprocessed_ranges", [(0, chunk.chunk_size - 1)])
+
+        logger.info(
+            f"Processing WebDataset chunk {chunk.chunk_id} with ranges: {unprocessed_ranges}"
+        )
 
         # Create WebDataset pipeline
         if self.dataset_type == "huggingface" and not chunk.shard_url.startswith("hf_dataset:"):
@@ -148,38 +154,51 @@ class WebDatasetShardProcessor(ShardProcessor):
             ds = wds.DataPipeline(
                 wds.SimpleShardList(url_cmd),
                 wds.tarfile_to_samples(),
-                wds.to_tuple("__key__", "jpg;png;jpeg;webp"),
+                wds.to_tuple("__key__", "jpg;png;jpeg;webp;jxl"),
             )
         else:
             # Local file
             ds = wds.DataPipeline(
                 wds.SimpleShardList(chunk.shard_url),
                 wds.tarfile_to_samples(),
-                wds.to_tuple("__key__", "jpg;png;jpeg;webp"),
+                wds.to_tuple("__key__", "jpg;png;jpeg;webp;jxl"),
             )
 
         # Process items
-        items_processed = 0
-        items_to_skip = chunk.start_index
+        current_idx = 0
+        items_yielded = 0
 
         for key, image_data in ds:
             # Check if we should stop
             if should_stop.is_set() or not connected.is_set():
-                logger.info(f"Stopping chunk processing early due to disconnect")
+                logger.info(f"Stopping WebDataset chunk processing early due to disconnect")
                 break
 
-            # Skip to start index
-            if items_to_skip > 0:
-                items_to_skip -= 1
+            # Calculate relative index within chunk
+            relative_idx = current_idx - chunk.start_index
+
+            # Skip items before chunk start
+            if current_idx < chunk.start_index:
+                current_idx += 1
                 continue
 
-            # Check if we've processed enough
-            if items_processed >= chunk.chunk_size:
+            # Stop if beyond chunk
+            if relative_idx >= chunk.chunk_size:
                 break
 
-            items_processed += 1
-            # URL is the shard URL for WebDataset
-            yield key, chunk.shard_url, image_data
+            # Check if current index is in any unprocessed range
+            in_range = any(start <= relative_idx <= end for start, end in unprocessed_ranges)
+
+            if in_range:
+                items_yielded += 1
+                yield key, chunk.shard_url, image_data
+
+            current_idx += 1
+
+        logger.info(
+            f"WebDataset chunk {chunk.chunk_id}: yielded {items_yielded} items "
+            f"from ranges {unprocessed_ranges}"
+        )
 
     def iterate_chunk_with_metadata(
         self,
@@ -188,19 +207,15 @@ class WebDatasetShardProcessor(ShardProcessor):
         should_stop: Event,
         connected: Event,
     ) -> Generator[Tuple[str, str, bytes, Dict[str, Any]], None, None]:
-        """
-        Process WebDataset shard chunk with metadata.
-
-        Note: WebDataset format doesn't inherently have column metadata,
-        so we return empty metadata dict unless custom handling is added.
-
-        Yields:
-            Tuple of (key, url, image_data, metadata)
-        """
+        """Process WebDataset shard chunk with metadata and range support."""
         # For WebDataset, we don't have column metadata by default
-        # You could extend this to parse .json sidecar files if your WebDataset has them
+        # But we need to track the index for proper range support
 
-        for key, url, image_data in self.iterate_chunk(
-            chunk, dataset_loader, should_stop, connected
+        for idx, (key, url, image_data) in enumerate(
+            self.iterate_chunk(chunk, dataset_loader, should_stop, connected)
         ):
-            yield key, url, image_data, {}  # Empty metadata for now
+            # Add index to metadata for tracking
+            metadata = {
+                "_chunk_relative_index": idx,  # Index within yielded items
+            }
+            yield key, url, image_data, metadata
