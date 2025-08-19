@@ -107,7 +107,7 @@ class Monitor:
         """Main display update loop."""
         layout = self._create_layout()
 
-        with Live(layout, console=self.console, refresh_per_second=4, screen=True) as live:
+        with Live(layout, console=self.console, refresh_per_second=1, screen=True) as live:
             while self.running:
                 self._update_layout(layout)
                 await asyncio.sleep(0.25)

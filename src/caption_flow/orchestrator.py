@@ -363,6 +363,7 @@ class Orchestrator:
         self.ssl_context = self._setup_ssl()
 
         # Statistics
+        self.is_generating_stats = False
         self.stats = {
             "total_chunks": 0,
             "completed_chunks": 0,
@@ -1409,28 +1410,36 @@ class Orchestrator:
         finally:
             del self.data_workers[worker_id]
 
-    async def _handle_monitor(self, websocket: WebSocketServerProtocol):
-        """Handle monitor connection."""
-        self.monitors.add(websocket)
-        logger.info("Monitor connected")
-
+    async def _send_leaderboard_to_monitor(self, websocket: WebSocketServerProtocol):
+        """Send leaderboard data to a specific monitor."""
+        total_start = time.time()
         try:
-            # Send initial stats
-            await websocket.send(safe_json_dumps({"type": "stats", "data": self.stats}))
+            if websocket not in self.monitors:
+                return
 
-            # Send chunk stats
-            chunk_stats = self.chunk_manager.get_stats()
-            await websocket.send(safe_json_dumps({"type": "chunk_stats", "data": chunk_stats}))
-
-            # Send contributor leaderboard with active worker counts
+            # Get contributors asynchronously
+            contributors_start = time.time()
             contributors = await self.storage.get_top_contributors(10)
-
-            # Enhance contributor data with active worker counts
-            enhanced_contributors = []
-            worker_counts = (
-                self.get_workers_by_user_stats() if hasattr(self, "workers_by_user") else {}
+            logger.debug(
+                f"Contributors retrieved in {(time.time() - contributors_start)*1000:.1f}ms"
             )
 
+            # Get worker counts in thread pool
+            worker_counts_start = time.time()
+            loop = asyncio.get_event_loop()
+            worker_counts = await loop.run_in_executor(
+                None,
+                lambda: (
+                    self.get_workers_by_user_stats() if hasattr(self, "workers_by_user") else {}
+                ),
+            )
+            logger.debug(
+                f"Worker counts retrieved in {(time.time() - worker_counts_start)*1000:.1f}ms"
+            )
+
+            # Build enhanced contributors list
+            build_start = time.time()
+            enhanced_contributors = []
             for contributor in contributors:
                 contrib_dict = {
                     "contributor_id": contributor.contributor_id,
@@ -1442,40 +1451,157 @@ class Orchestrator:
                     ),
                 }
                 enhanced_contributors.append(contrib_dict)
+            logger.debug(f"Enhanced contributors built in {(time.time() - build_start)*1000:.1f}ms")
 
-            await websocket.send(
-                safe_json_dumps({"type": "leaderboard", "data": enhanced_contributors})
+            # Cache for future monitors
+            self._cached_leaderboard = enhanced_contributors
+
+            # Send if still connected
+            if websocket in self.monitors:
+                send_start = time.time()
+                await websocket.send(
+                    safe_json_dumps({"type": "leaderboard", "data": enhanced_contributors})
+                )
+                logger.debug(
+                    f"Leaderboard sent to monitor in {(time.time() - send_start)*1000:.1f}ms"
+                )
+
+            logger.info(
+                f"Leaderboard send to monitor completed in {(time.time() - total_start)*1000:.1f}ms"
             )
 
-            # Keep connection alive
-            async for _ in websocket:
-                pass
+        except websockets.exceptions.ConnectionClosed:
+            logger.debug("Monitor disconnected during leaderboard send")
+        except Exception as e:
+            logger.error(f"Error sending leaderboard to monitor: {e}")
+
+    async def _send_initial_monitor_data(self, websocket: WebSocketServerProtocol):
+        """Send initial data to monitor in a separate task to avoid blocking."""
+        total_start = time.time()
+        try:
+            # Check if websocket is still in monitors set
+            if websocket not in self.monitors:
+                logger.debug("Monitor disconnected before initial data send")
+                return
+
+            # Send current stats (already in memory)
+            stats_start = time.time()
+            await websocket.send(safe_json_dumps({"type": "stats", "data": self.stats}))
+            logger.debug(f"Monitor stats sent in {(time.time() - stats_start)*1000:.1f}ms")
+
+            # Get chunk stats asynchronously
+            chunk_stats_start = time.time()
+            loop = asyncio.get_event_loop()
+            chunk_stats = await loop.run_in_executor(None, self.chunk_manager.get_stats)
+            logger.debug(f"Chunk stats retrieved in {(time.time() - chunk_stats_start)*1000:.1f}ms")
+
+            if websocket not in self.monitors:
+                return
+
+            chunk_send_start = time.time()
+            await websocket.send(safe_json_dumps({"type": "chunk_stats", "data": chunk_stats}))
+            logger.debug(f"Chunk stats sent in {(time.time() - chunk_send_start)*1000:.1f}ms")
+
+            # For leaderboard, check if we have a cached version first
+            if hasattr(self, "_cached_leaderboard") and self._cached_leaderboard:
+                # Use cached leaderboard if available
+                cache_send_start = time.time()
+                await websocket.send(
+                    safe_json_dumps({"type": "leaderboard", "data": self._cached_leaderboard})
+                )
+                logger.debug(
+                    f"Cached leaderboard sent in {(time.time() - cache_send_start)*1000:.1f}ms"
+                )
+            else:
+                # Schedule leaderboard update separately
+                leaderboard_task_start = time.time()
+                asyncio.create_task(self._send_leaderboard_to_monitor(websocket))
+                logger.debug(
+                    f"Leaderboard task created in {(time.time() - leaderboard_task_start)*1000:.1f}ms"
+                )
+
+            logger.info(
+                f"Monitor initial data send completed in {(time.time() - total_start)*1000:.1f}ms"
+            )
+
+        except websockets.exceptions.ConnectionClosed:
+            logger.debug("Monitor disconnected during initial data send")
+        except Exception as e:
+            logger.error(f"Error sending initial monitor data: {e}")
+
+    async def _handle_monitor(self, websocket: WebSocketServerProtocol):
+        """Handle monitor connection - truly non-blocking version."""
+        monitor_start = time.time()
+        self.monitors.add(websocket)
+        logger.info(f"Monitor connected (total monitors: {len(self.monitors)})")
+
+        try:
+            # Send welcome message immediately
+            welcome_start = time.time()
+            await websocket.send(safe_json_dumps({"type": "welcome", "role": "monitor"}))
+            logger.debug(f"Monitor welcome sent in {(time.time() - welcome_start)*1000:.1f}ms")
+
+            # Schedule initial data send as a separate task to avoid blocking
+            task_create_start = time.time()
+            asyncio.create_task(self._send_initial_monitor_data(websocket))
+            logger.debug(
+                f"Monitor initial data task created in {(time.time() - task_create_start)*1000:.1f}ms"
+            )
+
+            # Just keep the connection alive - no blocking work here
+            try:
+                async for message in websocket:
+                    # Handle any incoming messages from monitor if needed
+                    # For now, just ignore them
+                    pass
+            except websockets.exceptions.ConnectionClosed:
+                pass  # Normal disconnection
 
         except websockets.exceptions.ConnectionClosed:
             logger.info("Monitor disconnected")
+        except Exception as e:
+            logger.error(f"Error in monitor handler: {e}")
         finally:
             self.monitors.discard(websocket)
+            logger.info(f"Monitor handler completed in {(time.time() - monitor_start)*1000:.1f}ms")
 
     async def _broadcast_stats(self):
-        """Broadcast statistics to all monitors - enhanced for multi-stage."""
+        """Broadcast statistics to all monitors - truly non-blocking version."""
         if not self.monitors:
             return
+        if self.is_generating_stats:
+            return  # Already generating stats, skip this call
+        self.is_generating_stats = True
+        total_start = time.time()
 
-        # Get storage stats
+        # Prepare all the data first
+        data_prep_start = time.time()
+        loop = asyncio.get_event_loop()
+
+        # Get storage stats (already async)
+        storage_stats_start = time.time()
         storage_stats = await self.storage.get_storage_stats()
+        logger.debug(f"Storage stats retrieved in {(time.time() - storage_stats_start)*1000:.1f}ms")
+
+        caption_stats_start = time.time()
         caption_stats = await self.storage.get_caption_stats()
+        logger.debug(f"Caption stats retrieved in {(time.time() - caption_stats_start)*1000:.1f}ms")
 
-        # Include chunk stats
-        chunk_stats = self.chunk_manager.get_stats()
-        self.stats.update({f"chunks_{k}": v for k, v in chunk_stats.items()})
+        # Get chunk stats in thread pool
+        chunk_stats_start = time.time()
+        chunk_stats = await loop.run_in_executor(None, self.chunk_manager.get_stats)
+        logger.debug(f"Chunk stats retrieved in {(time.time() - chunk_stats_start)*1000:.1f}ms")
 
-        # Merge storage stats
-        self.stats.update(storage_stats)
-        self.stats["field_breakdown"] = caption_stats.get("field_stats", {})
-        self.stats["output_fields_list"] = caption_stats.get("output_fields", [])
+        # Build stats dict
+        build_stats_start = time.time()
+        stats_update = self.stats.copy()
+        stats_update.update({f"chunks_{k}": v for k, v in chunk_stats.items()})
+        stats_update.update(storage_stats)
+        stats_update["field_breakdown"] = caption_stats.get("field_stats", {})
+        stats_update["output_fields_list"] = caption_stats.get("output_fields", [])
 
         # Add rate information
-        self.stats.update(
+        stats_update.update(
             {
                 "current_rate": self.rate_tracker["current_rate"],
                 "average_rate": self.rate_tracker["average_rate"],
@@ -1483,41 +1609,107 @@ class Orchestrator:
             }
         )
 
-        # Add vLLM info - now includes stage count
-        self.stats["vllm_model"] = self.vllm_config.get("model", "unknown")
-        self.stats["vllm_batch_size"] = self.vllm_config.get("batch_size", 0)
+        # Add vLLM info
+        stats_update["vllm_model"] = self.vllm_config.get("model", "unknown")
+        stats_update["vllm_batch_size"] = self.vllm_config.get("batch_size", 0)
 
-        # NEW: Add stage information
+        # Add stage information
         stages = self.vllm_config.get("stages", [])
         if stages:
-            self.stats["stage_count"] = len(stages)
-            self.stats["stage_names"] = [s.get("name", "unnamed") for s in stages]
+            stats_update["stage_count"] = len(stages)
+            stats_update["stage_names"] = [s.get("name", "unnamed") for s in stages]
         else:
-            self.stats["stage_count"] = 1  # Backward compatibility
-            self.stats["stage_names"] = ["default"]
+            stats_update["stage_count"] = 1
+            stats_update["stage_names"] = ["default"]
 
+        # Get field stats
+        field_stats_start = time.time()
         field_stats = await self.storage.get_output_field_stats()
-        self.stats["output_fields"] = field_stats
+        stats_update["output_fields"] = field_stats
+        logger.debug(f"Field stats retrieved in {(time.time() - field_stats_start)*1000:.1f}ms")
 
-        message = safe_json_dumps({"type": "stats", "data": self.stats})
+        # Update our internal stats
+        self.stats = stats_update
+        logger.debug(f"Stats prepared in {(time.time() - build_stats_start)*1000:.1f}ms")
 
-        # Send to all monitors
-        disconnected = set()
-        _monitors = self.monitors.copy()
-        for monitor in _monitors:
+        logger.debug(f"Total data preparation took {(time.time() - data_prep_start)*1000:.1f}ms")
+
+        # Create message once
+        message_create_start = time.time()
+        stats_message = safe_json_dumps({"type": "stats", "data": self.stats})
+        logger.debug(f"Stats message created in {(time.time() - message_create_start)*1000:.1f}ms")
+
+        # Send to all monitors asynchronously in parallel
+        send_start = time.time()
+
+        async def send_to_monitor(monitor):
             try:
-                await monitor.send(message)
+                await monitor.send(stats_message)
             except websockets.exceptions.ConnectionClosed:
-                disconnected.add(monitor)
+                return monitor  # Return for removal
+            except Exception as e:
+                logger.debug(f"Error sending stats to monitor: {e}")
+                return monitor  # Return for removal
+            return None
 
-        # send updated leaderboard
+        # Send to all monitors in parallel
+        monitors_copy = self.monitors.copy()
+        results = await asyncio.gather(
+            *[send_to_monitor(m) for m in monitors_copy], return_exceptions=True
+        )
+
+        # Remove disconnected monitors
+        disconnected = {
+            m
+            for m, r in zip(monitors_copy, results)
+            if r is not None and not isinstance(r, Exception)
+        }
+        self.monitors -= disconnected
+
+        logger.debug(
+            f"Stats sent to {len(monitors_copy)} monitors in {(time.time() - send_start)*1000:.1f}ms"
+        )
+
+        # Send leaderboard update in a separate task to avoid blocking
+        leaderboard_task_start = time.time()
+        asyncio.create_task(self._broadcast_leaderboard())
+        self.is_generating_stats = False
+        logger.debug(
+            f"Leaderboard broadcast task created in {(time.time() - leaderboard_task_start)*1000:.1f}ms"
+        )
+
+        logger.info(f"Stats broadcast completed in {(time.time() - total_start)*1000:.1f}ms")
+
+    async def _broadcast_leaderboard(self):
+        """Send leaderboard updates to monitors - separate from stats to avoid blocking."""
+        if not self.monitors:
+            return
+
+        total_start = time.time()
         try:
+            # Get contributors
+            contributors_start = time.time()
             contributors = await self.storage.get_top_contributors(10)
-            enhanced_contributors = []
-            worker_counts = (
-                self.get_workers_by_user_stats() if hasattr(self, "workers_by_user") else {}
+            logger.debug(
+                f"Contributors retrieved for broadcast in {(time.time() - contributors_start)*1000:.1f}ms"
             )
 
+            # Get worker counts
+            worker_counts_start = time.time()
+            loop = asyncio.get_event_loop()
+            worker_counts = await loop.run_in_executor(
+                None,
+                lambda: (
+                    self.get_workers_by_user_stats() if hasattr(self, "workers_by_user") else {}
+                ),
+            )
+            logger.debug(
+                f"Worker counts retrieved for broadcast in {(time.time() - worker_counts_start)*1000:.1f}ms"
+            )
+
+            # Build enhanced contributors list
+            build_start = time.time()
+            enhanced_contributors = []
             for contributor in contributors:
                 contrib_dict = {
                     "contributor_id": contributor.contributor_id,
@@ -1529,26 +1721,64 @@ class Orchestrator:
                     ),
                 }
                 enhanced_contributors.append(contrib_dict)
+            logger.debug(
+                f"Enhanced contributors built for broadcast in {(time.time() - build_start)*1000:.1f}ms"
+            )
 
+            # Cache it
+            self._cached_leaderboard = enhanced_contributors
+
+            # Create message once
+            message_create_start = time.time()
             leaderboard_message = safe_json_dumps(
                 {"type": "leaderboard", "data": enhanced_contributors}
             )
+            logger.debug(
+                f"Leaderboard message created in {(time.time() - message_create_start)*1000:.1f}ms"
+            )
 
-            # Send to all monitors
-            disconnected = set()
-            for monitor in self.monitors.copy():
+            # Send to all monitors in parallel
+            send_start = time.time()
+
+            async def send_leaderboard(monitor):
                 try:
                     await monitor.send(leaderboard_message)
-                except websockets.exceptions.ConnectionClosed:
-                    disconnected.add(monitor)
+                except:
+                    return monitor  # Mark for removal
+                return None
 
+            monitors_copy = self.monitors.copy()
+            results = await asyncio.gather(
+                *[send_leaderboard(m) for m in monitors_copy], return_exceptions=True
+            )
+
+            # Remove disconnected
+            disconnected = {
+                m
+                for m, r in zip(monitors_copy, results)
+                if r is not None and not isinstance(r, Exception)
+            }
             self.monitors -= disconnected
 
-        except Exception as e:
-            logger.error(f"Error sending leaderboard update: {e}")
+            logger.debug(
+                f"Leaderboard sent to {len(monitors_copy)} monitors in {(time.time() - send_start)*1000:.1f}ms"
+            )
+            logger.info(
+                f"Leaderboard broadcast completed in {(time.time() - total_start)*1000:.1f}ms"
+            )
 
-        # Clean up disconnected monitors
-        self.monitors -= disconnected
+        except Exception as e:
+            logger.error(f"Error broadcasting leaderboard: {e}")
+
+    def _get_queue_stats(self) -> Dict[str, int]:
+        """Get queue statistics - synchronous helper for thread pool."""
+        with self.chunk_manager.lock:
+            return {
+                "pending_chunks": len(self.chunk_manager.pending_chunks),
+                "assigned_chunks": sum(
+                    len(chunks) for chunks in self.chunk_manager.assigned_chunks.values()
+                ),
+            }
 
     async def _flush_processed_items(self):
         """Flush batched processed items to chunk tracker."""
@@ -1591,12 +1821,14 @@ class Orchestrator:
             self.last_item_batch_flush = time.time()
 
     def get_workers_by_user_stats(self) -> Dict[str, Any]:
-        """Get statistics about workers grouped by user/token."""
+        """Get statistics about workers grouped by user/token - thread-safe version."""
         if not hasattr(self, "workers_by_user"):
             return {}
 
+        # Create a copy to avoid issues with concurrent modification
         stats = {}
-        for user, worker_ids in self.workers_by_user.items():
+        workers_snapshot = dict(self.workers_by_user)
+        for user, worker_ids in workers_snapshot.items():
             stats[user] = {"worker_count": len(worker_ids), "worker_ids": list(worker_ids)}
         return stats
 
@@ -1705,7 +1937,10 @@ class Orchestrator:
                 )
 
     async def _stats_update_loop(self):
-        """Periodically update and broadcast stats."""
+        """Periodically update and broadcast stats - non-blocking version."""
+        # Get the event loop for running blocking operations
+        loop = asyncio.get_event_loop()
+
         # Track session start values
         storage_stats = await self.storage.get_storage_stats()
         session_start_outputs = storage_stats["total_captions"]  # This now counts ALL outputs
@@ -1717,8 +1952,8 @@ class Orchestrator:
         while True:
             await asyncio.sleep(10)
 
-            # Update chunk stats
-            chunk_stats = self.chunk_manager.get_stats()
+            # Update chunk stats in thread pool to avoid blocking
+            chunk_stats = await loop.run_in_executor(None, self.chunk_manager.get_stats)
             storage_stats = await self.storage.get_storage_stats()
             current_total_outputs = storage_stats["total_captions"]  # ALL outputs
             if self.chunk_tracker:
@@ -1732,12 +1967,9 @@ class Orchestrator:
             self.stats["total_outputs"] = current_total_outputs
             self.stats["total_captions"] = current_total_outputs  # Keep for backward compatibility
 
-            # Add queue information
-            with self.chunk_manager.lock:
-                self.stats["pending_chunks"] = len(self.chunk_manager.pending_chunks)
-                self.stats["assigned_chunks"] = sum(
-                    len(chunks) for chunks in self.chunk_manager.assigned_chunks.values()
-                )
+            # Get queue stats in thread pool to avoid blocking
+            queue_stats = await loop.run_in_executor(None, self._get_queue_stats)
+            self.stats.update(queue_stats)
 
             # Calculate if we need more chunks
             worker_count = self.stats.get("connected_workers", 0)
