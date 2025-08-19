@@ -1466,7 +1466,7 @@ class Orchestrator:
                     f"Leaderboard sent to monitor in {(time.time() - send_start)*1000:.1f}ms"
                 )
 
-            logger.info(
+            logger.debug(
                 f"Leaderboard send to monitor completed in {(time.time() - total_start)*1000:.1f}ms"
             )
 
@@ -1520,7 +1520,7 @@ class Orchestrator:
                     f"Leaderboard task created in {(time.time() - leaderboard_task_start)*1000:.1f}ms"
                 )
 
-            logger.info(
+            logger.debug(
                 f"Monitor initial data send completed in {(time.time() - total_start)*1000:.1f}ms"
             )
 
@@ -1563,7 +1563,7 @@ class Orchestrator:
             logger.error(f"Error in monitor handler: {e}")
         finally:
             self.monitors.discard(websocket)
-            logger.info(f"Monitor handler completed in {(time.time() - monitor_start)*1000:.1f}ms")
+            logger.debug(f"Monitor handler completed in {(time.time() - monitor_start)*1000:.1f}ms")
 
     async def _broadcast_stats(self):
         """Broadcast statistics to all monitors - truly non-blocking version."""
@@ -1677,8 +1677,7 @@ class Orchestrator:
         logger.debug(
             f"Leaderboard broadcast task created in {(time.time() - leaderboard_task_start)*1000:.1f}ms"
         )
-
-        logger.info(f"Stats broadcast completed in {(time.time() - total_start)*1000:.1f}ms")
+        logger.debug(f"Stats broadcast completed in {(time.time() - total_start)*1000:.1f}ms")
 
     async def _broadcast_leaderboard(self):
         """Send leaderboard updates to monitors - separate from stats to avoid blocking."""
@@ -1763,7 +1762,7 @@ class Orchestrator:
             logger.debug(
                 f"Leaderboard sent to {len(monitors_copy)} monitors in {(time.time() - send_start)*1000:.1f}ms"
             )
-            logger.info(
+            logger.debug(
                 f"Leaderboard broadcast completed in {(time.time() - total_start)*1000:.1f}ms"
             )
 

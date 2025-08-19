@@ -234,6 +234,54 @@ class DatasetLoader:
             for key, url, image_data in ds:
                 yield key, url, image_data
 
+    def _create_dataset_at_position(self, dataset_path: str, split: str, start_idx: int):
+        """Create a dataset iterator positioned at start_idx using state_dict if available."""
+        try:
+            # Load dataset in streaming mode
+            dataset = load_dataset(
+                dataset_path,
+                split=split,
+                streaming=True,
+                token=self.token,
+            )
+
+            # Check if the dataset supports state_dict (newer versions of datasets library)
+            if hasattr(dataset, "load_state_dict") and hasattr(dataset, "state_dict"):
+                # Try to use the dataset's native state management
+                try:
+                    # Get current state
+                    state = dataset.state_dict()
+
+                    # Modify the state to skip to start_idx
+                    if "epoch" in state:
+                        state["epoch"] = 0
+                    if "num_examples_since_previous_state" in state:
+                        state["num_examples_since_previous_state"] = start_idx
+
+                    # For newer datasets with examples_iterable state
+                    if "examples_iterable" in state:
+                        if isinstance(state["examples_iterable"], dict):
+                            if "shard_example_idx" in state["examples_iterable"]:
+                                state["examples_iterable"]["shard_example_idx"] = start_idx
+
+                    # Load the modified state
+                    dataset.load_state_dict(state)
+                    logger.info(f"Positioned dataset at index {start_idx} using state_dict")
+                    return dataset
+                except Exception as e:
+                    logger.debug(f"Could not use state_dict approach: {e}")
+
+            # Fall back to skip() for large skips
+            if start_idx > 0:
+                logger.info(f"Using skip() to position dataset at index {start_idx}")
+                dataset = dataset.skip(start_idx)
+
+            return dataset
+
+        except Exception as e:
+            logger.warning(f"Error creating positioned dataset: {e}")
+            return None
+
     def _iterate_hf_dataset_shard_with_metadata(
         self, shard_url: str, processed_keys: Optional[set] = None
     ) -> Generator[Tuple[str, str, bytes, Dict[str, Any]], None, None]:
@@ -248,7 +296,65 @@ class DatasetLoader:
         )
 
         try:
-            # Load dataset in streaming mode
+            # Try optimized approach for large skips
+            if start_idx > 100:
+                dataset = self._create_dataset_at_position(dataset_path, self.split, start_idx)
+                if dataset:
+                    items_processed = 0
+
+                    for item in dataset:
+                        # Stop after processing chunk_size items
+                        if items_processed >= chunk_size:
+                            break
+
+                        # Generate a unique key for this item
+                        key = f"{dataset_path.replace('/', '_')}_{start_idx + items_processed:08d}"
+
+                        if key in processed_keys:
+                            items_processed += 1
+                            continue
+
+                        try:
+                            # Extract image data
+                            if self.image_column in item:
+                                img_data = item[self.image_column]
+
+                                # Process image to bytes
+                                image_bytes = ImageProcessor.process_image_data(img_data)
+
+                                if image_bytes:
+                                    # Extract all metadata (excluding the image column)
+                                    metadata = {
+                                        k: v for k, v in item.items() if k != self.image_column
+                                    }
+
+                                    # URL is virtual for HF datasets
+                                    url = f"hf://{dataset_path}#{start_idx + items_processed}"
+                                    items_processed += 1
+                                    yield key, url, image_bytes, metadata
+                                else:
+                                    logger.warning(
+                                        f"Failed to process image for item at index {start_idx + items_processed}"
+                                    )
+                                    items_processed += 1
+                                    continue
+                            else:
+                                logger.warning(
+                                    f"No image column '{self.image_column}' found in item at index {start_idx + items_processed}. "
+                                    f"Available columns: {list(item.keys())}"
+                                )
+                                items_processed += 1
+
+                        except Exception as e:
+                            logger.error(
+                                f"Error processing item at index {start_idx + items_processed}: {e}"
+                            )
+                            items_processed += 1
+                            continue
+
+                    return
+
+            # Fall back to regular approach for small skips or if StatefulDataLoader not available
             dataset = load_dataset(
                 dataset_path,
                 split=self.split,
@@ -256,7 +362,7 @@ class DatasetLoader:
                 token=self.token,
             )
 
-            # Skip to start index if needed - CONSISTENT WITH OTHER METHOD
+            # Skip to start index if needed
             if start_idx > 0:
                 dataset = dataset.skip(start_idx)
 
@@ -267,7 +373,7 @@ class DatasetLoader:
                 if items_processed >= chunk_size:
                     break
 
-                # Generate a unique key for this item - CONSISTENT FORMAT
+                # Generate a unique key for this item
                 key = f"{dataset_path.replace('/', '_')}_{start_idx + items_processed:08d}"
 
                 if key in processed_keys:
@@ -337,7 +443,76 @@ class DatasetLoader:
         )
 
         try:
-            # Load dataset in streaming mode
+            # Try optimized approach for large skips
+            if start_idx > 100:
+                dataset = self._create_dataset_at_position(dataset_path, self.split, start_idx)
+                if dataset:
+                    items_processed = 0
+
+                    for item in dataset:
+                        # Stop after processing chunk_size items
+                        if items_processed >= chunk_size:
+                            logger.info(f"Completed chunk: processed {items_processed} items")
+                            break
+
+                        # Also stop if we've reached the dataset end
+                        if (
+                            self._hf_total_items
+                            and (start_idx + items_processed) >= self._hf_total_items
+                        ):
+                            logger.info(
+                                f"Reached dataset end at item {start_idx + items_processed} "
+                                f"(total: {self._hf_total_items})"
+                            )
+                            break
+
+                        # Generate a unique key for this item
+                        key = f"{dataset_path.replace('/', '_')}_{start_idx + items_processed:08d}"
+
+                        if key in processed_keys:
+                            items_processed += 1
+                            continue
+
+                        try:
+                            # Extract image data
+                            if self.image_column in item:
+                                img_data = item[self.image_column]
+
+                                # Delegate image processing to ImageProcessor
+                                image_bytes = ImageProcessor.process_image_data(img_data)
+
+                                if image_bytes:
+                                    # URL is virtual for HF datasets
+                                    url = f"hf://{dataset_path}#{start_idx + items_processed}"
+                                    items_processed += 1
+                                    yield key, url, image_bytes
+                                else:
+                                    logger.warning(
+                                        f"Failed to process image for item at index {start_idx + items_processed}"
+                                    )
+                                    items_processed += 1
+                                    continue
+                            else:
+                                logger.warning(
+                                    f"No image column '{self.image_column}' found in item at index {start_idx + items_processed}. "
+                                    f"Available columns: {list(item.keys())}"
+                                )
+                                items_processed += 1
+
+                        except Exception as e:
+                            logger.error(
+                                f"Error processing item at index {start_idx + items_processed}: {e}"
+                            )
+                            items_processed += 1
+                            continue
+
+                    logger.info(
+                        f"Virtual shard complete: processed {items_processed} items "
+                        f"(start_idx: {start_idx})"
+                    )
+                    return
+
+            # Fall back to regular approach for small skips or if StatefulDataLoader not available
             dataset = load_dataset(
                 dataset_path,
                 split=self.split,
