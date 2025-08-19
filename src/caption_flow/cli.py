@@ -124,7 +124,7 @@ def setup_logging(verbose: bool = False):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s %(message)s",
+        format="%(message)s",
         datefmt="[%Y-%m-%d %H:%M:%S]",
         handlers=[
             RichHandler(

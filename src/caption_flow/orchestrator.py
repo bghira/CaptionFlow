@@ -16,7 +16,7 @@ import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Set, Optional, Any, List, Deque
+from typing import Dict, Set, Optional, Any, List, Deque, Tuple
 from collections import deque, defaultdict
 import threading
 from queue import Queue, Empty
@@ -97,27 +97,9 @@ class ChunkManager:
         self.lock = threading.Lock()
         self.tracker = tracker  # Reference to chunk tracker
 
-    def create_chunks_from_shard(
-        self, shard_url: str, shard_name: str, total_items: int
-    ) -> List[ShardChunk]:
-        """Create chunks from a shard."""
-        chunks = []
-
-        for start_idx in range(0, total_items, self.chunk_size):
-            chunk = ShardChunk.create(
-                shard_url=shard_url,
-                shard_name=shard_name,
-                start_index=start_idx,
-                chunk_size=min(self.chunk_size, total_items - start_idx),
-            )
-
-            with self.lock:
-                self.chunks[chunk.chunk_id] = chunk
-                self.pending_chunks.append(chunk.chunk_id)
-
-            chunks.append(chunk)
-
-        return chunks
+        # NEW: Track assigned ranges to prevent double allocation
+        # Format: {chunk_id: {(start, end): worker_id}}
+        self.assigned_ranges: Dict[str, Dict[Tuple[int, int], str]] = defaultdict(dict)
 
     def get_chunks_for_worker(
         self, worker_id: str, count: int = 1, tracker: Optional["ChunkTracker"] = None
@@ -127,7 +109,6 @@ class ChunkManager:
 
         with self.lock:
             # FIRST PRIORITY: Check if this worker already has assigned chunks
-            # Workers should complete their current chunks before getting new ones
             if worker_id in self.assigned_chunks:
                 existing_chunk_ids = list(self.assigned_chunks[worker_id])
                 for chunk_id in existing_chunk_ids:
@@ -142,12 +123,29 @@ class ChunkManager:
                     if tracker:
                         chunk_info = tracker.get_chunk_with_unprocessed_items(chunk_id)
                         if chunk_info and chunk_info["unprocessed_ranges"]:
-                            assigned.append(
-                                {
-                                    "chunk": chunk,
-                                    "unprocessed_ranges": chunk_info["unprocessed_ranges"],
-                                }
-                            )
+                            # Filter out ranges that are assigned to other workers
+                            clean_ranges = []
+                            for start, end in chunk_info["unprocessed_ranges"]:
+                                range_key = (start, end)
+                                if range_key in self.assigned_ranges[chunk_id]:
+                                    assigned_worker = self.assigned_ranges[chunk_id][range_key]
+                                    if assigned_worker != worker_id:
+                                        # Skip this range - it's assigned to another worker
+                                        logger.warning(
+                                            f"Skipping range {start}-{end} in chunk {chunk_id} "
+                                            f"(assigned to {assigned_worker}, not {worker_id})"
+                                        )
+                                        continue
+                                    # else: this worker already owns this range, include it
+                                clean_ranges.append((start, end))
+
+                            if clean_ranges:
+                                assigned.append(
+                                    {
+                                        "chunk": chunk,
+                                        "unprocessed_ranges": clean_ranges,
+                                    }
+                                )
                     else:
                         # No tracker, assume chunk needs processing
                         assigned.append(
@@ -158,7 +156,6 @@ class ChunkManager:
                         )
 
             # SECOND PRIORITY: Get new pending chunks
-            # Only if worker doesn't have enough chunks already
             while len(assigned) < count and self.pending_chunks:
                 chunk_id = self.pending_chunks.popleft()
                 chunk = self.chunks.get(chunk_id)
@@ -166,7 +163,7 @@ class ChunkManager:
                 if not chunk:
                     continue
 
-                # Verify chunk is truly pending (defensive check)
+                # Verify chunk is truly pending
                 if chunk.status != "pending" or chunk.assigned_to is not None:
                     logger.warning(
                         f"Chunk {chunk_id} in pending queue but status={chunk.status}, assigned_to={chunk.assigned_to}"
@@ -179,15 +176,48 @@ class ChunkManager:
                 chunk.assigned_at = datetime.utcnow()
                 self.assigned_chunks[worker_id].add(chunk_id)
 
-                # Get unprocessed ranges
+                # Get unprocessed ranges and filter out any that are somehow already assigned
                 unprocessed_ranges = [(0, chunk.chunk_size - 1)]  # Default
                 if tracker:
                     chunk_info = tracker.get_chunk_with_unprocessed_items(chunk_id)
                     if chunk_info:
-                        unprocessed_ranges = chunk_info["unprocessed_ranges"]
+                        # Filter out any ranges that are already assigned (shouldn't happen for new chunks)
+                        clean_ranges = []
+                        for start, end in chunk_info["unprocessed_ranges"]:
+                            range_key = (start, end)
+                            if range_key not in self.assigned_ranges[chunk_id]:
+                                clean_ranges.append((start, end))
+                            else:
+                                logger.error(
+                                    f"Range {start}-{end} in newly assigned chunk {chunk_id} "
+                                    f"is already assigned to {self.assigned_ranges[chunk_id][range_key]}!"
+                                )
+                        unprocessed_ranges = clean_ranges if clean_ranges else []
+
                     tracker.mark_assigned(chunk_id, worker_id)
 
-                assigned.append({"chunk": chunk, "unprocessed_ranges": unprocessed_ranges})
+                if unprocessed_ranges:
+                    assigned.append({"chunk": chunk, "unprocessed_ranges": unprocessed_ranges})
+
+        # Track assigned ranges and verify no double allocation
+        for info in assigned:
+            chunk_id = info["chunk"].chunk_id
+            for start, end in info["unprocessed_ranges"]:
+                range_key = (start, end)
+
+                # Check if this range is already assigned
+                if range_key in self.assigned_ranges[chunk_id]:
+                    existing_worker = self.assigned_ranges[chunk_id][range_key]
+                    if existing_worker != worker_id:
+                        # This should never happen - raise assertion
+                        raise AssertionError(
+                            f"CRITICAL: Attempting to assign range {start}-{end} in chunk {chunk_id} "
+                            f"to worker {worker_id}, but it's already assigned to {existing_worker}! "
+                            f"This would cause duplicate processing."
+                        )
+
+                # Track this assignment
+                self.assigned_ranges[chunk_id][range_key] = worker_id
 
         # Log what we're assigning
         if assigned:
@@ -198,6 +228,12 @@ class ChunkManager:
                 ]
             )
             logger.info(f"Assigning to worker {worker_id}: {chunk_summary}")
+
+            # Detailed range logging for debugging
+            for info in assigned:
+                chunk_id = info["chunk"].chunk_id
+                ranges_str = ", ".join([f"{s}-{e}" for s, e in info["unprocessed_ranges"]])
+                logger.debug(f"  Chunk {chunk_id} ranges: {ranges_str}")
 
         return assigned
 
@@ -210,6 +246,16 @@ class ChunkManager:
                     chunk.status = "completed"
                     chunk.completed_at = datetime.utcnow()
                     self.assigned_chunks[worker_id].discard(chunk_id)
+
+                    # Clear assigned ranges for this chunk
+                    if chunk_id in self.assigned_ranges:
+                        # Log what ranges we're clearing
+                        ranges_to_clear = list(self.assigned_ranges[chunk_id].keys())
+                        logger.debug(
+                            f"Clearing {len(ranges_to_clear)} assigned ranges for completed chunk {chunk_id}"
+                        )
+                        del self.assigned_ranges[chunk_id]
+
                     return True
         return False
 
@@ -224,6 +270,20 @@ class ChunkManager:
                     chunk.assigned_at = None
                     self.assigned_chunks[worker_id].discard(chunk_id)
                     self.pending_chunks.append(chunk_id)
+
+                    # Clear assigned ranges for this chunk/worker
+                    if chunk_id in self.assigned_ranges:
+                        ranges_to_clear = [
+                            range_key
+                            for range_key, assigned_worker in self.assigned_ranges[chunk_id].items()
+                            if assigned_worker == worker_id
+                        ]
+                        for range_key in ranges_to_clear:
+                            del self.assigned_ranges[chunk_id][range_key]
+                        logger.debug(
+                            f"Cleared {len(ranges_to_clear)} assigned ranges for failed chunk {chunk_id}"
+                        )
+
                     return True
         return False
 
@@ -240,18 +300,62 @@ class ChunkManager:
                         chunk.assigned_at = None
                         self.pending_chunks.append(chunk_id)
 
+                        # Clear assigned ranges for this worker
+                        if chunk_id in self.assigned_ranges:
+                            ranges_to_clear = [
+                                range_key
+                                for range_key, assigned_worker in self.assigned_ranges[
+                                    chunk_id
+                                ].items()
+                                if assigned_worker == worker_id
+                            ]
+                            for range_key in ranges_to_clear:
+                                del self.assigned_ranges[chunk_id][range_key]
+
+                            if ranges_to_clear:
+                                logger.info(
+                                    f"Released {len(ranges_to_clear)} ranges from chunk {chunk_id} "
+                                    f"previously assigned to disconnected worker {worker_id}"
+                                )
+
             if worker_id in self.assigned_chunks:
                 del self.assigned_chunks[worker_id]
+
+    def mark_ranges_processed(
+        self, chunk_id: str, processed_ranges: List[Tuple[int, int]], worker_id: str
+    ):
+        """Remove ranges from assignment tracking once they're processed."""
+        with self.lock:
+            if chunk_id in self.assigned_ranges:
+                for start, end in processed_ranges:
+                    range_key = (start, end)
+                    if range_key in self.assigned_ranges[chunk_id]:
+                        assigned_worker = self.assigned_ranges[chunk_id][range_key]
+                        if assigned_worker == worker_id:
+                            del self.assigned_ranges[chunk_id][range_key]
+                            logger.debug(
+                                f"Cleared assignment of range {start}-{end} in chunk {chunk_id} "
+                                f"after processing by {worker_id}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Worker {worker_id} claims to have processed range {start}-{end} "
+                                f"in chunk {chunk_id}, but it was assigned to {assigned_worker}"
+                            )
 
     def get_stats(self) -> Dict[str, int]:
         """Get chunk statistics."""
         with self.lock:
+            # Count total assigned ranges
+            total_assigned_ranges = sum(len(ranges) for ranges in self.assigned_ranges.values())
+
             stats = {
                 "total": len(self.chunks),
                 "pending": len(self.pending_chunks),
                 "assigned": sum(len(chunks) for chunks in self.assigned_chunks.values()),
                 "completed": sum(1 for c in self.chunks.values() if c.status == "completed"),
                 "failed": sum(1 for c in self.chunks.values() if c.status == "failed"),
+                "assigned_ranges": total_assigned_ranges,
             }
         return stats
 
@@ -491,13 +595,15 @@ class Orchestrator:
             with self.chunk_manager.lock:
                 for chunk_state in shard_info["chunks"]:
                     if chunk_state.status in ["pending", "failed", "assigned"]:
-                        # ChunkState already has shard_url stored
+                        # For assigned chunks, reset them to pending since workers don't exist
                         chunk = ShardChunk(
                             chunk_id=chunk_state.chunk_id,
                             shard_url=chunk_state.shard_url,
                             shard_name=chunk_state.shard_name,
                             start_index=chunk_state.start_index,
                             chunk_size=chunk_state.chunk_size,
+                            status="pending",  # Reset to pending
+                            assigned_to=None,  # Clear assignment
                         )
                         self.chunk_manager.chunks[chunk_state.chunk_id] = chunk
                         self.chunk_manager.pending_chunks.append(chunk_state.chunk_id)
@@ -1811,9 +1917,23 @@ class Orchestrator:
                 # Don't forget the last range
                 ranges.append((start, end))
 
-                # Mark ranges as processed (mark_items_processed expects absolute indices)
+                # Mark ranges as processed
                 for start_idx, end_idx in ranges:
                     self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
+
+                with self.chunk_manager.lock:
+                    if chunk_id in self.chunk_manager.assigned_ranges:
+                        for start_idx, end_idx in ranges:
+                            # Clear any assignments in this range
+                            to_remove = []
+                            for range_start, range_end in self.chunk_manager.assigned_ranges[
+                                chunk_id
+                            ]:
+                                if range_start >= start_idx and range_end <= end_idx:
+                                    to_remove.append((range_start, range_end))
+
+                            for range_key in to_remove:
+                                del self.chunk_manager.assigned_ranges[chunk_id][range_key]
 
             # Clear pending items
             self.pending_processed_items.clear()
@@ -2027,15 +2147,15 @@ class Orchestrator:
                 last_known_total = current_total_outputs
 
             # Log rate information when workers are connected
-            if (
-                worker_count > 0 and self.rate_tracker["current_rate"] >= 0
-            ):  # Only log non-negative rates
-                logger.info(
-                    f"Rate: {self.rate_tracker['current_rate']:.1f} outputs/min "
-                    f"(avg: {self.rate_tracker['average_rate']:.1f}, "
-                    f"expected: {self.rate_tracker['expected_rate']:.1f}) | "
-                    f"Workers: {worker_count}, Chunks: {active_chunks}/{target_buffer}"
-                )
+            # if (
+            #     worker_count > 0 and self.rate_tracker["current_rate"] >= 0
+            # ):  # Only log non-negative rates
+            #     logger.info(
+            #         f"Rate: {self.rate_tracker['current_rate']:.1f} outputs/min "
+            #         f"(avg: {self.rate_tracker['average_rate']:.1f}, "
+            #         f"expected: {self.rate_tracker['expected_rate']:.1f}) | "
+            #         f"Workers: {worker_count}, Chunks: {active_chunks}/{target_buffer}"
+            #     )
 
             await self._broadcast_stats()
 
