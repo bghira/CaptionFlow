@@ -441,9 +441,27 @@ class ChunkTracker(CheckpointTracker):
         )
 
     def get_chunk_with_unprocessed_items(self, chunk_id: str) -> Optional[Dict[str, Any]]:
-        """Get chunk info including unprocessed ranges."""
-        if chunk_id not in self.chunks:
+        """Get chunk info with unprocessed item ranges."""
+        chunk_state = self.chunks.get(chunk_id)
+        if not chunk_state:
             return None
 
-        chunk = self.chunks[chunk_id]
-        return {"chunk": chunk.to_dict(), "unprocessed_ranges": chunk.get_unprocessed_ranges()}
+        # During startup or if no worker is assigned, treat all unprocessed as available
+        if not hasattr(self, "_startup_complete"):
+            self._startup_complete = False
+
+        if not self._startup_complete or not chunk_state.assigned_to:
+            # Return all unprocessed ranges
+            return {
+                "chunk_id": chunk_id,
+                "unprocessed_ranges": chunk_state.get_unprocessed_ranges(),
+                "status": chunk_state.status,
+            }
+
+        # Normal operation - only return ranges not being worked on
+        # This would need more complex tracking of which ranges each worker is processing
+        return {
+            "chunk_id": chunk_id,
+            "unprocessed_ranges": chunk_state.get_unprocessed_ranges(),
+            "status": chunk_state.status,
+        }
