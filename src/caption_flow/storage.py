@@ -386,10 +386,15 @@ class StorageManager:
 
             # Filter new data to exclude duplicates
             new_rows = []
+            duplicate_rows = []
             for row in prepared_buffer:
                 if row["job_id"] not in existing_job_ids:
                     new_rows.append(row)
+                elif row not in duplicate_rows:
+                    duplicate_rows.append(row)
 
+            if duplicate_rows:
+                logger.info(f"Example duplicate row: {duplicate_rows[0]}")
             if new_rows:
                 # Create table from new rows only
                 new_table = pa.Table.from_pylist(new_rows, schema=self.caption_schema)

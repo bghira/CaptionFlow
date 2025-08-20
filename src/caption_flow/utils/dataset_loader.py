@@ -216,127 +216,6 @@ class DatasetLoader:
 
         return dataset_path, start_idx, chunk_size
 
-    def _iterate_hf_dataset_shard(
-        self,
-        shard_url: str,
-        processed_keys: Optional[set] = None,
-        assigned_ranges: Optional[List[Tuple[int, int]]] = None,
-    ) -> Generator[Tuple[str, str, bytes], None, None]:
-        """
-        Iterate over a virtual HuggingFace dataset shard.
-
-        Args:
-            shard_url: The shard URL
-            processed_keys: Already processed keys to skip
-            assigned_ranges: The specific ranges THIS worker should process
-                            (in chunk-relative coordinates)
-        """
-        if processed_keys is None:
-            processed_keys = set()
-
-        dataset_path, start_idx, chunk_size = self._parse_virtual_shard(shard_url)
-
-        # If no ranges specified, process the entire chunk
-        if not assigned_ranges:
-            assigned_ranges = [(0, chunk_size - 1)]
-
-        # Check bounds
-        if self._hf_total_items is not None and start_idx >= self._hf_total_items:
-            logger.warning(
-                f"Virtual shard starts at index {start_idx} but dataset only has "
-                f"{self._hf_total_items} items. Skipping this shard."
-            )
-            return
-
-        logger.info(
-            f"Loading HuggingFace dataset: {dataset_path} "
-            f"(chunk start: {start_idx}, assigned ranges: {assigned_ranges})"
-        )
-
-        try:
-            # Convert relative ranges to absolute indices for faster lookup
-            assigned_absolute_indices = set()
-            for rel_start, rel_end in assigned_ranges:
-                for rel_idx in range(rel_start, rel_end + 1):
-                    abs_idx = start_idx + rel_idx
-                    if abs_idx < (start_idx + chunk_size):
-                        assigned_absolute_indices.add(abs_idx)
-
-            logger.info(
-                f"Worker will process {len(assigned_absolute_indices)} items "
-                f"from ranges: {assigned_ranges}"
-            )
-
-            # Find the earliest index we need to process
-            min_abs_index = (
-                min(assigned_absolute_indices) if assigned_absolute_indices else start_idx
-            )
-
-            # Load dataset and skip to the first index we need
-            dataset = load_dataset(
-                dataset_path,
-                split=self.split,
-                streaming=True,
-                token=self.token,
-            )
-
-            # Skip to the minimum index we need to process
-            if min_abs_index > 0:
-                logger.info(f"Skipping to index {min_abs_index}")
-                dataset = dataset.skip(min_abs_index)
-
-            items_processed = 0
-            current_abs_index = min_abs_index
-
-            for item in dataset:
-                # Stop if we've processed all assigned indices
-                if not assigned_absolute_indices:
-                    logger.info("All assigned indices processed")
-                    break
-
-                # Stop if beyond dataset bounds
-                if self._hf_total_items and current_abs_index >= self._hf_total_items:
-                    logger.info(f"Reached dataset end at index {current_abs_index}")
-                    break
-
-                # Only process if this index is assigned to us
-                if current_abs_index in assigned_absolute_indices:
-                    # Generate key
-                    key = f"{dataset_path.replace('/', '_')}_{current_abs_index:08d}"
-
-                    # Skip if already processed
-                    if key not in processed_keys:
-                        try:
-                            if self.image_column in item:
-                                img_data = item[self.image_column]
-                                image_bytes = ImageProcessor.process_image_data(img_data)
-
-                                if image_bytes:
-                                    url = f"hf://{dataset_path}#{current_abs_index}"
-                                    items_processed += 1
-                                    yield key, url, image_bytes
-                                else:
-                                    logger.warning(
-                                        f"Failed to process image at index {current_abs_index}"
-                                    )
-                            else:
-                                logger.warning(
-                                    f"No image column '{self.image_column}' at index {current_abs_index}"
-                                )
-                        except Exception as e:
-                            logger.error(f"Error processing index {current_abs_index}: {e}")
-
-                    # Remove from set since we've handled it
-                    assigned_absolute_indices.remove(current_abs_index)
-
-                current_abs_index += 1
-
-            logger.info(f"Shard iteration complete: processed {items_processed} items")
-
-        except Exception as e:
-            logger.error(f"Error in HF dataset iteration: {e}")
-            return
-
     def iterate_shard(
         self,
         shard_url: str,
@@ -355,7 +234,9 @@ class DatasetLoader:
             Tuple of (key, url, image_bytes)
         """
         if shard_url.startswith("hf_dataset:"):
-            yield from self._iterate_hf_dataset_shard(shard_url, processed_keys, unprocessed_ranges)
+            raise ValueError(
+                "Virtual HuggingFace dataset shards should use iterate_shard_with_metadata()"
+            )
         else:
             # Regular WebDataset shard
             ds = self.load_shard(shard_url, processed_keys)
@@ -424,129 +305,69 @@ class DatasetLoader:
         )
 
         try:
-            # Try optimized approach for large skips
-            if start_idx > 100:
-                dataset = self._create_dataset_at_position(dataset_path, self.split, start_idx)
-                if dataset:
-                    items_processed = 0
-
-                    for item in dataset:
-                        # Stop after processing chunk_size items
-                        if items_processed >= chunk_size:
-                            break
-
-                        # Generate a unique key for this item
-                        key = f"{dataset_path.replace('/', '_')}_{start_idx + items_processed:08d}"
-
-                        if key in processed_keys:
-                            items_processed += 1
-                            logger.warning(f"Skipping {key} - already processed")
-                            continue
-
-                        try:
-                            # Extract image data
-                            if self.image_column in item:
-                                img_data = item[self.image_column]
-
-                                # Process image to bytes
-                                image_bytes = ImageProcessor.process_image_data(img_data)
-
-                                if image_bytes:
-                                    # Extract all metadata (excluding the image column)
-                                    metadata = {
-                                        k: v for k, v in item.items() if k != self.image_column
-                                    }
-
-                                    # URL is virtual for HF datasets
-                                    url = f"hf://{dataset_path}#{start_idx + items_processed}"
-                                    items_processed += 1
-                                    yield key, url, image_bytes, metadata
-                                else:
-                                    logger.warning(
-                                        f"Failed to process image for item at index {start_idx + items_processed}"
-                                    )
-                                    items_processed += 1
-                                    continue
-                            else:
-                                logger.warning(
-                                    f"No image column '{self.image_column}' found in item at index {start_idx + items_processed}. "
-                                    f"Available columns: {list(item.keys())}"
-                                )
-                                items_processed += 1
-
-                        except Exception as e:
-                            logger.error(
-                                f"Error processing item at index {start_idx + items_processed}: {e}"
-                            )
-                            items_processed += 1
-                            continue
-
-                    return
-
-            # Fall back to regular approach for small skips or if StatefulDataLoader not available
-            dataset = load_dataset(
-                dataset_path,
-                split=self.split,
-                streaming=True,
-                token=self.token,
-            )
-
-            # Skip to start index if needed
-            if start_idx > 0:
-                dataset = dataset.skip(start_idx)
-
+            # For HF datasets, we iterate through the full chunk range
+            # The actual range filtering happens in the shard processor
             items_processed = 0
+            current_abs_idx = start_idx
 
-            for item in dataset:
-                # Stop after processing chunk_size items
-                if items_processed >= chunk_size:
-                    logger.warning(f"Reached end of chunk")
-                    break
+            while items_processed < chunk_size:
+                # Create a fresh dataset iterator for each batch
+                # This avoids issues with stateful iterators
+                batch_size = min(1000, chunk_size - items_processed)  # Process in smaller batches
 
-                # Generate a unique key for this item
-                key = f"{dataset_path.replace('/', '_')}_{start_idx + items_processed:08d}"
+                dataset = load_dataset(
+                    dataset_path,
+                    split=self.split,
+                    streaming=True,
+                    token=self.token,
+                )
 
-                if key in processed_keys:
-                    items_processed += 1
-                    logger.warning(f"Skipping {key} - already processed")
-                    continue
+                # Skip to current position
+                if current_abs_idx > 0:
+                    dataset = dataset.skip(current_abs_idx)
 
-                try:
-                    # Extract image data
-                    if self.image_column in item:
-                        img_data = item[self.image_column]
+                batch_processed = 0
+                for item in dataset:
+                    if batch_processed >= batch_size or items_processed >= chunk_size:
+                        break
 
-                        # Process image to bytes
-                        image_bytes = ImageProcessor.process_image_data(img_data)
+                    # Generate key
+                    key = f"{dataset_path.replace('/', '_')}_{current_abs_idx:08d}"
 
-                        if image_bytes:
-                            # Extract all metadata (excluding the image column)
-                            metadata = {k: v for k, v in item.items() if k != self.image_column}
+                    if key in processed_keys:
+                        current_abs_idx += 1
+                        batch_processed += 1
+                        items_processed += 1
+                        continue
 
-                            # URL is virtual for HF datasets
-                            url = f"hf://{dataset_path}#{start_idx + items_processed}"
+                    try:
+                        if self.image_column in item:
+                            img_data = item[self.image_column]
+                            image_bytes = ImageProcessor.process_image_data(img_data)
+
+                            if image_bytes:
+                                metadata = {k: v for k, v in item.items() if k != self.image_column}
+                                url = f"hf://{dataset_path}#{current_abs_idx}"
+
+                                yield key, url, image_bytes, metadata
+
+                            current_abs_idx += 1
+                            batch_processed += 1
                             items_processed += 1
-                            logger.info(f"Processing {key} - already processed")
-                            yield key, url, image_bytes, metadata
                         else:
                             logger.warning(
-                                f"Failed to process image for item at index {start_idx + items_processed}"
+                                f"No image column '{self.image_column}' at index {current_abs_idx}"
                             )
+                            current_abs_idx += 1
+                            batch_processed += 1
                             items_processed += 1
-                            continue
-                    else:
-                        logger.warning(
-                            f"No image column '{self.image_column}' found in item at index {start_idx + items_processed}. "
-                            f"Available columns: {list(item.keys())}"
-                        )
-                        items_processed += 1
 
-                except Exception as e:
-                    logger.error(
-                        f"Error processing item at index {start_idx + items_processed}: {e}"
-                    )
-                    items_processed += 1
-                    continue
+                    except Exception as e:
+                        logger.error(f"Error processing item at index {current_abs_idx}: {e}")
+                        current_abs_idx += 1
+                        batch_processed += 1
+                        items_processed += 1
+                        continue
 
         except Exception as e:
             logger.error(f"Error loading HuggingFace dataset: {e}")
