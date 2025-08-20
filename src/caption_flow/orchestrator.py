@@ -199,25 +199,25 @@ class ChunkManager:
                 if unprocessed_ranges:
                     assigned.append({"chunk": chunk, "unprocessed_ranges": unprocessed_ranges})
 
-        # Track assigned ranges and verify no double allocation
-        for info in assigned:
-            chunk_id = info["chunk"].chunk_id
-            for start, end in info["unprocessed_ranges"]:
-                range_key = (start, end)
+            # Track assigned ranges and verify no double allocation
+            for info in assigned:
+                chunk_id = info["chunk"].chunk_id
+                for start, end in info["unprocessed_ranges"]:
+                    range_key = (start, end)
 
-                # Check if this range is already assigned
-                if range_key in self.assigned_ranges[chunk_id]:
-                    existing_worker = self.assigned_ranges[chunk_id][range_key]
-                    if existing_worker != worker_id:
-                        # This should never happen - raise assertion
-                        raise AssertionError(
-                            f"CRITICAL: Attempting to assign range {start}-{end} in chunk {chunk_id} "
-                            f"to worker {worker_id}, but it's already assigned to {existing_worker}! "
-                            f"This would cause duplicate processing."
-                        )
+                    # Check if this range is already assigned
+                    if range_key in self.assigned_ranges[chunk_id]:
+                        existing_worker = self.assigned_ranges[chunk_id][range_key]
+                        if existing_worker != worker_id:
+                            # This should never happen - raise assertion
+                            raise AssertionError(
+                                f"CRITICAL: Attempting to assign range {start}-{end} in chunk {chunk_id} "
+                                f"to worker {worker_id}, but it's already assigned to {existing_worker}! "
+                                f"This would cause duplicate processing."
+                            )
 
-                # Track this assignment
-                self.assigned_ranges[chunk_id][range_key] = worker_id
+                    # Track this assignment
+                    self.assigned_ranges[chunk_id][range_key] = worker_id
 
         # Log what we're assigning
         if assigned:
