@@ -502,39 +502,49 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
     ) -> Iterator[Tuple[str, str, bytes, Dict]]:
         """Iterate through a shard with metadata."""
         logger.debug("Iterating shard with metadata: %s", shard_url)
-        for item in self.dataset_loader.iterate_shard(shard_url):
-            # Extract components based on dataset type
-            if isinstance(item, dict):
-                # WebDataset format
-                key = item.get("__key__", "unknown")
-                url = item.get("__url__", shard_url)
 
-                logger.debug(f"{key=}: {url=}")
+        if not self.dataset_loader:
+            logger.error("Dataset loader not initialized")
+            return
 
-                # Find image data
-                image_data = None
-                for ext in ["jpg", "jpeg", "png", "webp", "bmp"]:
-                    if ext in item:
-                        image_data = item[ext]
-                        break
+        # Use the updated DatasetLoader that returns full samples
+        for sample in self.dataset_loader.iterate_shard(shard_url):
+            if not isinstance(sample, dict):
+                logger.warning("Unexpected sample format: %s", type(sample))
+                continue
 
-                if not image_data:
-                    logger.debug("No image data found for item key=%s", key)
-                    continue
+            key = sample.get("__key__", "unknown")
+            url = sample.get("__url__", shard_url)
 
-                # Extract metadata
-                metadata = {
-                    k: v
-                    for k, v in item.items()
-                    if not k.startswith("__") and k not in ["jpg", "jpeg", "png", "webp", "bmp"]
-                }
+            # Find image data
+            image_data = None
+            image_ext = None
+            for ext in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]:
+                if ext in sample:
+                    image_data = sample[ext]
+                    image_ext = ext
+                    break
 
-                yield key, url, image_data, metadata
-            elif isinstance(item, tuple):
-                logger.debug(f"Tuple has {len(item)} elements, first is {item[0]}")
-            else:
-                logger.error(f"Encountered unexpected record format: {item}")
-            raise ValueError("Unexpected record format in shard")
+            if not image_data:
+                logger.debug(
+                    "No image data found for item key=%s, available keys: %s",
+                    key,
+                    list(sample.keys()),
+                )
+                continue
+
+            # Extract metadata (all non-system and non-image keys)
+            metadata = {
+                k: v
+                for k, v in sample.items()
+                if not k.startswith("__") and k not in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]
+            }
+
+            # Add some useful metadata
+            metadata["_image_format"] = image_ext
+            metadata["_shard_url"] = shard_url
+
+            yield key, url, image_data, metadata
 
     def prepare_result(
         self, unit: WorkUnit, outputs: List[Dict[str, Any]], processing_time_ms: float
