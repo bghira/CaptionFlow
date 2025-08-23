@@ -797,6 +797,7 @@ class CaptionWorker(BaseWorker):
                     work_result = WorkResult(
                         unit_id=item.unit_id,
                         source_id=item.metadata.get("shard_name", "unknown"),
+                        sample_id=f"{item.item_key}-{item.item_index}",
                         outputs=outputs,
                         metadata={
                             "item_key": item.item_key,
@@ -816,6 +817,7 @@ class CaptionWorker(BaseWorker):
                             {
                                 "type": "submit_results",
                                 "unit_id": work_result.unit_id,
+                                "sample_id": work_result.sample_id,
                                 "source_id": work_result.source_id,
                                 "outputs": work_result.outputs,
                                 "metadata": work_result.metadata,
