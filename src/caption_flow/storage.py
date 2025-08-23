@@ -505,7 +505,7 @@ class StorageManager:
 
                 for value in df.loc[non_null_mask, field_name]:
                     # list or array-like
-                    if isinstance(value, list) or isinstance(value, pd.Series):
+                    if isinstance(value, list):
                         length = len(value)
                         field_total += length
                         field_lengths.append(length)
