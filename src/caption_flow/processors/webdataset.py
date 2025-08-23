@@ -492,6 +492,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 yield {
                     "image": image,
                     "item_key": key,
+                    "item_index": idx,
                     "metadata": clean_metadata,
                 }
 

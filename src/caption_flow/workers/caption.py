@@ -507,6 +507,7 @@ class CaptionWorker(BaseWorker):
                 item = ProcessingItem(
                     unit_id=unit.unit_id,
                     item_key=item_data["item_key"],
+                    item_index=item_data["item_index"],
                     image=item_data["image"],
                     image_data=item_data.get("image_data", b""),
                     metadata=item_data.get("metadata", {}),
