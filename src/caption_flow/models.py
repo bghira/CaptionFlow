@@ -1,9 +1,11 @@
 """Data models for CaptionFlow."""
 
+import PIL
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from PIL import Image
 
 
 class JobStatus(Enum):
@@ -82,3 +84,70 @@ class Contributor:
     name: str
     total_captions: int = 0
     trust_level: int = 1
+
+
+@dataclass
+class ProcessingStage:
+    """Configuration for a single processing stage."""
+
+    name: str
+    model: str
+    prompts: List[str]
+    output_field: str
+    requires: List[str] = field(default_factory=list)
+    sampling: Optional[Dict[str, Any]] = None
+
+    # Model-specific overrides
+    tensor_parallel_size: Optional[int] = None
+    max_model_len: Optional[int] = None
+    dtype: Optional[str] = None
+    gpu_memory_utilization: Optional[float] = None
+
+
+@dataclass
+class StageResult:
+    """Results from a single stage."""
+
+    stage_name: str
+    output_field: str
+    outputs: List[str]  # Multiple outputs from multiple prompts
+
+
+@dataclass
+class ShardChunk:
+    """Shard chunk assignment with unprocessed ranges."""
+
+    chunk_id: str
+    shard_url: str
+    shard_name: str
+    start_index: int
+    chunk_size: int
+    unprocessed_ranges: List[Tuple[int, int]] = field(default_factory=list)
+
+
+@dataclass
+class ProcessingItem:
+    """Item being processed."""
+
+    chunk_id: str
+    item_key: str
+    image: Image.Image
+    image_data: bytes
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    stage_results: Dict[str, StageResult] = field(default_factory=dict)  # Accumulated results
+
+
+@dataclass
+class ProcessedResult:
+    """Result with multi-stage outputs."""
+
+    chunk_id: str
+    shard_name: str
+    item_key: str
+    outputs: Dict[str, List[str]]  # field_name -> list of outputs
+    image_width: int
+    image_height: int
+    image_format: str
+    file_size: int
+    processing_time_ms: float
+    metadata: Dict[str, Any] = field(default_factory=dict)

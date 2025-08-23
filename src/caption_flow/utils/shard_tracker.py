@@ -61,11 +61,7 @@ class ShardTracker(CheckpointTracker):
         """Get list of shards that still need processing."""
         remaining = []
         for s in all_shards:
-            # Extract shard name properly for both regular and virtual shards
-            if s.startswith("hf_dataset:"):
-                shard_name = s  # Use full virtual shard ID
-            else:
-                shard_name = Path(s).stem
+            shard_name = Path(s).stem
 
             if shard_name not in self.completed_shards:
                 remaining.append(s)

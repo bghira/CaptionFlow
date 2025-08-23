@@ -22,82 +22,14 @@ import numpy as np
 from huggingface_hub import get_token
 
 from .base import BaseWorker
-from ..models import JobStatus, Job
-from ..utils import CaptionUtils
 from ..utils.dataset_loader import DatasetLoader
 from ..utils.vllm_config import VLLMConfigManager
 from ..utils.image_processor import ImageProcessor
-from ..utils.shard_processor import HFDatasetShardProcessor, WebDatasetShardProcessor
+from ..utils.shard_processor import WebDatasetShardProcessor
 from ..utils.prompt_template import PromptTemplateManager
+from ..models import ProcessingStage, StageResult, ShardChunk, ProcessingItem, ProcessedResult
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ProcessingStage:
-    """Configuration for a single processing stage."""
-
-    name: str
-    model: str
-    prompts: List[str]
-    output_field: str
-    requires: List[str] = field(default_factory=list)
-    sampling: Optional[Dict[str, Any]] = None
-
-    # Model-specific overrides
-    tensor_parallel_size: Optional[int] = None
-    max_model_len: Optional[int] = None
-    dtype: Optional[str] = None
-    gpu_memory_utilization: Optional[float] = None
-
-
-@dataclass
-class StageResult:
-    """Results from a single stage."""
-
-    stage_name: str
-    output_field: str
-    outputs: List[str]  # Multiple outputs from multiple prompts
-
-
-@dataclass
-class ShardChunk:
-    """Shard chunk assignment with unprocessed ranges."""
-
-    chunk_id: str
-    shard_url: str
-    shard_name: str
-    start_index: int
-    chunk_size: int
-    unprocessed_ranges: List[Tuple[int, int]] = field(default_factory=list)
-
-
-@dataclass
-class ProcessingItem:
-    """Item being processed."""
-
-    chunk_id: str
-    item_key: str
-    image: Image.Image
-    image_data: bytes
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    stage_results: Dict[str, StageResult] = field(default_factory=dict)  # Accumulated results
-
-
-@dataclass
-class ProcessedResult:
-    """Result with multi-stage outputs."""
-
-    chunk_id: str
-    shard_name: str
-    item_key: str
-    outputs: Dict[str, List[str]]  # field_name -> list of outputs
-    image_width: int
-    image_height: int
-    image_format: str
-    file_size: int
-    processing_time_ms: float
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class MultiStageVLLMManager:
@@ -248,7 +180,6 @@ class CaptionWorker(BaseWorker):
             self.image_processor = ImageProcessor()
 
         # Shard chunk processing
-        self.hf_processor = HFDatasetShardProcessor()
         self.webdataset_processor = WebDatasetShardProcessor(
             hf_token=self.hf_token, dataset_type=self.dataset_type
         )
@@ -700,12 +631,7 @@ class CaptionWorker(BaseWorker):
         logger.info(
             f"Processing shard {chunk.shard_name} with unprocessed ranges: {chunk.unprocessed_ranges}"
         )
-
-        # Select appropriate processor
-        if chunk.shard_url.startswith("hf_dataset:"):
-            processor = self.hf_processor
-        else:
-            processor = self.webdataset_processor
+        processor = self.webdataset_processor
 
         items_processed = 0
 
@@ -874,88 +800,6 @@ class CaptionWorker(BaseWorker):
 
                 with self.chunk_lock:
                     self.current_chunk = None
-
-    async def _result_sender(self):
-        """Send results back to orchestrator with item index."""
-        pending_results = []
-
-        try:
-            while self.running and self.connected.is_set():
-                try:
-                    # Get result with timeout
-                    try:
-                        result = await asyncio.get_event_loop().run_in_executor(
-                            None, self.result_queue.get, True, 1
-                        )
-                        pending_results.append(result)
-                    except Empty:
-                        pass
-
-                    # Only try to send if connected
-                    if pending_results and self.websocket and self.connected.is_set():
-                        sent_results = []
-                        for result in pending_results:
-                            try:
-                                # Build message with item index
-                                message_data = {
-                                    "type": "submit_captions",
-                                    "chunk_id": result.chunk_id,
-                                    "dataset": self.dataset_config.get("dataset_path", "unknown"),
-                                    "shard": result.shard_name,
-                                    "item_key": result.item_key,
-                                    "item_index": result.item_index,  # NEW: Include index
-                                    "outputs": result.outputs,
-                                    "captions": result.outputs.get("captions", []),  # Compatibility
-                                    "caption_count": sum(len(v) for v in result.outputs.values()),
-                                    "image_width": result.image_width,
-                                    "image_height": result.image_height,
-                                    "image_format": result.image_format,
-                                    "file_size": result.file_size,
-                                    "processing_time_ms": result.processing_time_ms,
-                                    "metadata": result.metadata,
-                                }
-
-                                await self.websocket.send(json.dumps(message_data))
-                                sent_results.append(result)
-
-                                if self.items_processed % 100 == 0:
-                                    total_outputs = sum(
-                                        len(outputs) for outputs in result.outputs.values()
-                                    )
-                                    logger.info(
-                                        f"Processed {self.items_processed} items "
-                                        f"(~{total_outputs} outputs across {len(result.outputs)} fields)"
-                                    )
-
-                            except websockets.exceptions.ConnectionClosed as e:
-                                logger.warning(f"Connection lost while sending result: {e}")
-                                raise
-                            except Exception as e:
-                                logger.error(f"Error sending result: {e}")
-                                break
-
-                        # Remove successfully sent results
-                        for result in sent_results:
-                            pending_results.remove(result)
-
-                    # Clear pending results if disconnected and buffer is too large
-                    if not self.connected.is_set() and len(pending_results) > 1000:
-                        logger.warning(
-                            f"Clearing {len(pending_results)} pending results due to prolonged disconnection"
-                        )
-                        pending_results.clear()
-
-                    await asyncio.sleep(0.1)
-
-                except Exception as e:
-                    if isinstance(e, websockets.exceptions.ConnectionClosed):
-                        raise
-                    logger.error(f"Unexpected error in result sender: {e}")
-                    await asyncio.sleep(1)
-
-        except asyncio.CancelledError:
-            logger.debug("Result sender cancelled")
-            raise
 
     def _batch_for_inference(self):
         """Batch items from readahead queue for inference."""

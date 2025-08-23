@@ -269,60 +269,6 @@ class StorageManager:
         if len(self.caption_buffer) >= self.caption_buffer_size:
             await self._flush_captions()
 
-    async def save_captions(self, caption_data: Dict[str, Any]):
-        """Save captions for an image - compatible with dict input."""
-        job_id = caption_data["job_id"]
-
-        # Check if we already have captions for this job_id
-        if job_id in self.existing_caption_job_ids:
-            self.duplicates_skipped += 1
-            logger.debug(f"Skipping duplicate captions for job_id: {job_id}")
-            return
-
-        # Check if it's already in the buffer
-        for buffered in self.caption_buffer:
-            if buffered["job_id"] == job_id:
-                logger.debug(f"Captions for job_id {job_id} already in buffer")
-                return
-
-        # Handle outputs if present
-        if "outputs" in caption_data:
-            outputs = caption_data.pop("outputs")
-            # Add each output field directly to caption_data
-            for field_name, field_values in outputs.items():
-                caption_data[field_name] = field_values
-                if field_name not in self.known_output_fields:
-                    self.known_output_fields.add(field_name)
-                    logger.info(f"New output field detected: {field_name}")
-
-        # Handle legacy captions field
-        if "captions" in caption_data and "captions" not in self.known_output_fields:
-            self.known_output_fields.add("captions")
-
-        # Count all outputs
-        caption_count = 0
-        for field_name in self.known_output_fields:
-            if field_name in caption_data and isinstance(caption_data[field_name], list):
-                caption_count += len(caption_data[field_name])
-
-        caption_data["caption_count"] = caption_count
-
-        # Add default values for optional fields
-        if "quality_scores" not in caption_data:
-            caption_data["quality_scores"] = None
-
-        if "metadata" in caption_data and isinstance(caption_data["metadata"], dict):
-            caption_data["metadata"] = json.dumps(caption_data["metadata"])
-        elif "metadata" not in caption_data:
-            caption_data["metadata"] = "{}"
-
-        self.caption_buffer.append(caption_data)
-        self.existing_caption_job_ids.add(job_id)
-
-        # Flush if buffer is large enough
-        if len(self.caption_buffer) >= self.caption_buffer_size:
-            await self._flush_captions()
-
     async def _flush_captions(self):
         """Write caption buffer to parquet with dynamic schema."""
         if not self.caption_buffer:
@@ -447,58 +393,6 @@ class StorageManager:
         pq.write_table(evolved_table, self.captions_path, compression="snappy")
         logger.info("Schema evolution complete")
 
-    async def get_captions(self, job_id: str) -> Optional[Dict[str, List[str]]]:
-        """Retrieve all output fields for a specific job_id."""
-        # Check buffer first
-        for buffered in self.caption_buffer:
-            if buffered["job_id"] == job_id:
-                outputs = {}
-                for field_name in self.known_output_fields:
-                    if field_name in buffered and buffered[field_name]:
-                        outputs[field_name] = buffered[field_name]
-                return outputs
-
-        if not self.captions_path.exists():
-            return None
-
-        table = pq.read_table(self.captions_path)
-        df = table.to_pandas()
-
-        row = df[df["job_id"] == job_id]
-        if row.empty:
-            return None
-
-        # Collect all output fields
-        outputs = {}
-        for field_name in self.known_output_fields:
-            if field_name in row.columns:
-                value = row.iloc[0][field_name]
-                if pd.notna(value) and value is not None:
-                    outputs[field_name] = value
-
-        return outputs if outputs else None
-
-    async def save_job(self, job: Job):
-        """Save or update a job - buffers until batch size reached."""
-        # For updates, we still add to buffer (will be handled in flush)
-        self.job_buffer.append(
-            {
-                "job_id": job.job_id,
-                "dataset": job.dataset,
-                "shard": job.shard,
-                "item_key": job.item_key,
-                "status": job.status.value,
-                "assigned_to": job.assigned_to,
-                "created_at": job.created_at,
-                "updated_at": datetime.utcnow(),
-            }
-        )
-
-        self.existing_job_ids.add(job.job_id)
-
-        if len(self.job_buffer) >= self.job_buffer_size:
-            await self._flush_jobs()
-
     async def save_contributor(self, contributor: Contributor):
         """Save or update contributor stats - buffers until batch size reached."""
         self.contributor_buffer.append(asdict(contributor))
@@ -581,79 +475,6 @@ class StorageManager:
             f"Duplicates skipped: {self.duplicates_skipped}"
         )
 
-    async def job_exists(self, job_id: str) -> bool:
-        """Check if a job already exists in storage or buffer."""
-        if job_id in self.existing_job_ids:
-            return True
-
-        # Check buffer
-        for buffered in self.job_buffer:
-            if buffered["job_id"] == job_id:
-                return True
-
-        return False
-
-    async def get_job(self, job_id: str) -> Optional[Job]:
-        """Retrieve a job by ID."""
-        # Check buffer first
-        for buffered in self.job_buffer:
-            if buffered["job_id"] == job_id:
-                return Job(
-                    job_id=buffered["job_id"],
-                    dataset=buffered["dataset"],
-                    shard=buffered["shard"],
-                    item_key=buffered["item_key"],
-                    status=JobStatus(buffered["status"]),
-                    assigned_to=buffered["assigned_to"],
-                    created_at=buffered["created_at"],
-                )
-
-        if not self.jobs_path.exists():
-            return None
-
-        table = pq.read_table(self.jobs_path)
-        df = table.to_pandas()
-
-        row = df[df["job_id"] == job_id]
-        if row.empty:
-            return None
-
-        return Job(
-            job_id=row.iloc[0]["job_id"],
-            dataset=row.iloc[0]["dataset"],
-            shard=row.iloc[0]["shard"],
-            item_key=row.iloc[0]["item_key"],
-            status=JobStatus(row.iloc[0]["status"]),
-            assigned_to=row.iloc[0]["assigned_to"],
-            created_at=row.iloc[0]["created_at"],
-        )
-
-    async def get_jobs_by_worker(self, worker_id: str) -> List[Job]:
-        """Get all jobs assigned to a worker."""
-        if not self.jobs_path.exists():
-            return []
-
-        table = pq.read_table(self.jobs_path)
-        df = table.to_pandas()
-
-        rows = df[df["assigned_to"] == worker_id]
-
-        jobs = []
-        for _, row in rows.iterrows():
-            jobs.append(
-                Job(
-                    job_id=row["job_id"],
-                    dataset=row["dataset"],
-                    shard=row["shard"],
-                    item_key=row["item_key"],
-                    status=JobStatus(row["status"]),
-                    assigned_to=row["assigned_to"],
-                    created_at=row["created_at"],
-                )
-            )
-
-        return jobs
-
     async def get_caption_stats(self) -> Dict[str, Any]:
         """Get statistics about stored captions including field-specific stats."""
         if not self.captions_path.exists():
@@ -683,11 +504,12 @@ class StorageManager:
                 field_lengths = []
 
                 for value in df.loc[non_null_mask, field_name]:
-                    if isinstance(value, list):
+                    # list or array-like
+                    if isinstance(value, list) or isinstance(value, pd.Series):
                         length = len(value)
                         field_total += length
                         field_lengths.append(length)
-                    elif pd.notna(value):
+                    elif value.any():
                         length = 1
                         field_total += length
                         field_lengths.append(length)
@@ -718,46 +540,6 @@ class StorageManager:
                 "max": df["caption_count"].max() if "caption_count" in df.columns else 0,
             },
         }
-
-    async def get_sample_captions(self, n: int = 5) -> List[Dict[str, Any]]:
-        """Get a sample of caption entries showing all output fields."""
-        if not self.captions_path.exists():
-            return []
-
-        table = pq.read_table(self.captions_path)
-        df = table.to_pandas()
-
-        if len(df) == 0:
-            return []
-
-        sample_df = df.sample(min(n, len(df)))
-        samples = []
-
-        for _, row in sample_df.iterrows():
-            # Collect outputs from dynamic columns
-            outputs = {}
-            total_outputs = 0
-
-            for field_name in self.known_output_fields:
-                if field_name in row and pd.notna(row[field_name]):
-                    value = row[field_name]
-                    outputs[field_name] = value
-                    if isinstance(value, list):
-                        total_outputs += len(value)
-
-            samples.append(
-                {
-                    "job_id": row["job_id"],
-                    "item_key": row["item_key"],
-                    "outputs": outputs,
-                    "field_count": len(outputs),
-                    "total_outputs": total_outputs,
-                    "image_dims": f"{row.get('image_width', 'N/A')}x{row.get('image_height', 'N/A')}",
-                    "has_metadata": bool(row.get("metadata") and row["metadata"] != "{}"),
-                }
-            )
-
-        return samples
 
     async def count_captions(self) -> int:
         """Count total outputs across all dynamic fields."""
@@ -887,134 +669,6 @@ class StorageManager:
             "total_outputs": total_outputs,
             "fields": sorted(list(field_counts.keys())),
         }
-
-    async def get_captions_with_field(
-        self, field_name: str, limit: int = 100
-    ) -> List[Dict[str, Any]]:
-        """Get captions that have a specific output field."""
-        if not self.captions_path.exists():
-            return []
-
-        if field_name not in self.known_output_fields:
-            logger.warning(f"Field '{field_name}' not found in known output fields")
-            return []
-
-        # Check if the field actually exists in the file
-        existing_output_columns = self._get_existing_output_columns()
-        if field_name not in existing_output_columns:
-            logger.warning(
-                f"Field '{field_name}' exists in known fields but not in parquet file yet"
-            )
-            return []
-
-        # Only read necessary columns
-        columns_to_read = ["job_id", "item_key", field_name]
-
-        try:
-            table = pq.read_table(self.captions_path, columns=columns_to_read)
-        except Exception as e:
-            logger.error(f"Error reading field '{field_name}': {e}")
-            return []
-
-        df = table.to_pandas()
-
-        # Filter rows where field has data
-        mask = df[field_name].notna()
-        filtered_df = df[mask].head(limit)
-
-        results = []
-        for _, row in filtered_df.iterrows():
-            results.append(
-                {
-                    "job_id": row["job_id"],
-                    "item_key": row["item_key"],
-                    field_name: row[field_name],
-                    "value_count": len(row[field_name]) if isinstance(row[field_name], list) else 1,
-                }
-            )
-
-        return results
-
-    async def export_by_field(self, field_name: str, output_path: Path, format: str = "jsonl"):
-        """Export all captions for a specific field."""
-        if not self.captions_path.exists():
-            logger.warning("No captions to export")
-            return 0
-
-        if field_name not in self.known_output_fields:
-            logger.warning(f"Field '{field_name}' not found in known output fields")
-            return 0
-
-        # Check if the field actually exists in the file
-        existing_output_columns = self._get_existing_output_columns()
-        if field_name not in existing_output_columns:
-            logger.warning(f"Field '{field_name}' not found in parquet file")
-            return 0
-
-        # Read only necessary columns
-        columns_to_read = ["item_key", "dataset", field_name]
-        table = pq.read_table(self.captions_path, columns=columns_to_read)
-        df = table.to_pandas()
-
-        exported = 0
-        with open(output_path, "w") as f:
-            for _, row in df.iterrows():
-                if pd.notna(row[field_name]) and row[field_name]:
-                    if format == "jsonl":
-                        record = {
-                            "item_key": row["item_key"],
-                            "dataset": row["dataset"],
-                            field_name: row[field_name],
-                        }
-                        f.write(json.dumps(record) + "\n")
-                        exported += 1
-
-        logger.info(f"Exported {exported} items with field '{field_name}' to {output_path}")
-        return exported
-
-    async def get_pending_jobs(self) -> List[Job]:
-        """Get all pending jobs for restoration on startup."""
-        if not self.jobs_path.exists():
-            return []
-
-        table = pq.read_table(self.jobs_path)
-        df = table.to_pandas()
-
-        # Get jobs with PENDING or PROCESSING status
-        pending_df = df[df["status"].isin([JobStatus.PENDING.value, JobStatus.PROCESSING.value])]
-
-        jobs = []
-        for _, row in pending_df.iterrows():
-            jobs.append(
-                Job(
-                    job_id=row["job_id"],
-                    dataset=row["dataset"],
-                    shard=row["shard"],
-                    item_key=row["item_key"],
-                    status=JobStatus(row["status"]),
-                    assigned_to=row.get("assigned_to"),
-                    created_at=row["created_at"],
-                )
-            )
-
-        return jobs
-
-    async def count_jobs(self) -> int:
-        """Count total jobs."""
-        if not self.jobs_path.exists():
-            return 0
-
-        table = pq.read_table(self.jobs_path)
-        return len(table)
-
-    async def count_completed_jobs(self) -> int:
-        """Count completed jobs."""
-        if not self.jobs_path.exists():
-            return 0
-
-        table = pq.read_table(self.jobs_path)
-        df = table.to_pandas()
-        return len(df[df["status"] == JobStatus.COMPLETED.value])
 
     async def close(self):
         """Close storage and flush buffers."""

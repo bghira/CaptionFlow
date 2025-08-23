@@ -58,11 +58,15 @@ class ChunkState:
     def get_unprocessed_ranges(self) -> List[Tuple[int, int]]:
         """Get ranges that haven't been processed yet."""
         if not self.processed_ranges:
+            logger.info(f"Chunk {self.chunk_id} has no processed ranges, returning full range")
             return [(0, self.chunk_size - 1)]
 
         unprocessed = []
         current = 0
 
+        logger.info(
+            f"Processing {len(self.processed_ranges)} processed ranges for chunk {self.chunk_id}"
+        )
         for start, end in self.processed_ranges:
             if current < start:
                 unprocessed.append((current, start - 1))
@@ -236,20 +240,8 @@ class ChunkTracker(CheckpointTracker):
 
         for chunk_id, chunk_state in self.chunks.items():
             shard_name = chunk_state.shard_name
-
-            # For virtual HF dataset shards, normalize the shard name
-            if shard_name.startswith("hf_dataset:"):
-                parts = shard_name.split(":")
-                if len(parts) >= 4 and parts[2] == "chunk":
-                    # Use just the dataset identifier as the shard name
-                    normalized_shard_name = ":".join(parts[:2])
-                else:
-                    normalized_shard_name = shard_name
-            else:
-                normalized_shard_name = shard_name
-
-            if normalized_shard_name not in shards:
-                shards[normalized_shard_name] = {
+            if shard_name not in shards:
+                shards[shard_name] = {
                     "total_chunks": 0,
                     "completed_chunks": 0,
                     "pending_chunks": 0,
@@ -259,20 +251,20 @@ class ChunkTracker(CheckpointTracker):
                     "chunks": [],
                 }
 
-            shards[normalized_shard_name]["chunks"].append(chunk_state)
-            shards[normalized_shard_name]["total_chunks"] += 1
+            shards[shard_name]["chunks"].append(chunk_state)
+            shards[shard_name]["total_chunks"] += 1
 
             if chunk_state.status == "completed":
-                shards[normalized_shard_name]["completed_chunks"] += 1
+                shards[shard_name]["completed_chunks"] += 1
             elif chunk_state.status == "pending":
-                shards[normalized_shard_name]["pending_chunks"] += 1
-                shards[normalized_shard_name]["is_complete"] = False
+                shards[shard_name]["pending_chunks"] += 1
+                shards[shard_name]["is_complete"] = False
             elif chunk_state.status == "assigned":
-                shards[normalized_shard_name]["assigned_chunks"] += 1
-                shards[normalized_shard_name]["is_complete"] = False
+                shards[shard_name]["assigned_chunks"] += 1
+                shards[shard_name]["is_complete"] = False
             elif chunk_state.status == "failed":
-                shards[normalized_shard_name]["failed_chunks"] += 1
-                shards[normalized_shard_name]["is_complete"] = False
+                shards[shard_name]["failed_chunks"] += 1
+                shards[shard_name]["is_complete"] = False
 
         return shards
 
@@ -322,13 +314,7 @@ class ChunkTracker(CheckpointTracker):
                         continue
 
                     # Infer shard URL and create chunk with default size
-                    if shard_name.replace("_", "/") in chunk_id or "_" in shard_name:
-                        # HF dataset
-                        dataset_path = shard_name.replace("_", "/")
-                        shard_url = f"hf_dataset:{dataset_path}:chunk:{start_idx}"
-                    else:
-                        # WebDataset
-                        shard_url = f"unknown://{shard_name}.tar"
+                    shard_url = f"unknown://{shard_name}.tar"
 
                     self.chunks[chunk_id] = ChunkState(
                         chunk_id=chunk_id,

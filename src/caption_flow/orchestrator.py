@@ -29,7 +29,7 @@ from .storage import StorageManager
 from .models import Caption, Contributor
 from .utils.auth import AuthManager
 from .utils import DatasetLoader, ShardTracker, ChunkTracker
-from .utils.json_utils import safe_dict, safe_json_dumps, to_json_dict
+from .utils.json_utils import safe_json_dumps
 
 logger = logging.getLogger(__name__)
 
@@ -53,15 +53,7 @@ class ShardChunk:
         cls, shard_url: str, shard_name: str, start_index: int, chunk_size: int
     ) -> "ShardChunk":
         """Factory method to create a chunk with consistent ID."""
-        # Always use consistent format: dataset_chunk_startindex
-        if shard_url.startswith("hf_dataset:"):
-            # Extract dataset path
-            parts = shard_url.split(":")
-            dataset_path = parts[1] if len(parts) > 1 else "unknown"
-            chunk_id = f"{dataset_path.replace('/', '_')}_chunk_{start_index}"
-        else:
-            # WebDataset format
-            chunk_id = f"{shard_name}_chunk_{start_index}"
+        chunk_id = f"{shard_name}_chunk_{start_index}"
 
         return cls(
             chunk_id=chunk_id,
@@ -383,14 +375,15 @@ class Orchestrator:
         self.chunk_tracker = None
 
         if self.dataset_path:
-            self.dataset_loader = DatasetLoader(
-                self.dataset_path,
-                self.dataset_type,
-                self.dataset_split,
-                self.dataset_image_column,
-            )
             checkpoint_dir = Path(config.get("storage", {}).get("checkpoint_dir", "./checkpoints"))
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self.dataset_loader = DatasetLoader(
+                dataset_path=self.dataset_path,
+                dataset_type=self.dataset_type,
+                split=self.dataset_split,
+                image_column=self.dataset_image_column,
+                cache_dir=checkpoint_dir,
+            )
             self.shard_tracker = ShardTracker(checkpoint_dir / "shards.json")
             self.chunk_tracker = ChunkTracker(checkpoint_dir / "chunks.json")
 
@@ -445,9 +438,11 @@ class Orchestrator:
         self.chunk_tracker = None
 
         if self.dataset_path:
-            self.dataset_loader = DatasetLoader(self.dataset_path, self.dataset_type)
             checkpoint_dir = Path(config.get("storage", {}).get("checkpoint_dir", "./checkpoints"))
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self.dataset_loader = DatasetLoader(
+                self.dataset_path, self.dataset_type, cache_dir=checkpoint_dir
+            )
             self.shard_tracker = ShardTracker(checkpoint_dir / "shards.json")
             self.chunk_tracker = ChunkTracker(checkpoint_dir / "chunks.json")
 
@@ -542,14 +537,6 @@ class Orchestrator:
         self.all_shards = self.dataset_loader.get_shard_list()
         self.stats["total_shards"] = len(self.all_shards)
 
-        # For HuggingFace datasets, we might need to dynamically create more shards
-        if dataset_format == "huggingface_datasets":
-            self._is_hf_dataset = True
-            self._hf_chunk_size = 10000  # Items per virtual shard
-            self._next_hf_shard_index = len(self.all_shards)  # For creating new virtual shards
-        else:
-            self._is_hf_dataset = False
-
         # Get shard status from ChunkTracker
         shards_summary = self.chunk_tracker.get_shards_summary() if self.chunk_tracker else {}
         completed_shards = {
@@ -572,10 +559,7 @@ class Orchestrator:
 
         # Filter out shards that already have chunks created
         remaining_shards = [
-            shard
-            for shard in remaining_shards
-            if (shard if shard.startswith("hf_dataset:") else Path(shard).stem)
-            not in shards_with_chunks
+            shard for shard in remaining_shards if Path(shard).stem not in shards_with_chunks
         ]
 
         self.stats["completed_shards"] = len(completed_shards)
@@ -608,6 +592,11 @@ class Orchestrator:
                         self.chunk_manager.chunks[chunk_state.chunk_id] = chunk
                         self.chunk_manager.pending_chunks.append(chunk_state.chunk_id)
                         requeued_chunks_by_shard[shard_name].append(chunk_state.chunk_id)
+
+                        # Clear any stale range assignments for this chunk
+                        if chunk_state.chunk_id in self.chunk_manager.assigned_ranges:
+                            del self.chunk_manager.assigned_ranges[chunk_state.chunk_id]
+
                         initial_pending += 1
 
         logger.info(f"Re-queued {initial_pending} existing pending chunks")
@@ -660,12 +649,7 @@ class Orchestrator:
                 if current_shard_url is None or current_shard_index >= current_shard_items:
                     try:
                         current_shard_url = next(shard_iter)
-
-                        # Extract shard name based on type
-                        if current_shard_url.startswith("hf_dataset:"):
-                            current_shard_name = current_shard_url  # Use full ID for virtual shards
-                        else:
-                            current_shard_name = Path(current_shard_url).stem
+                        current_shard_name = Path(current_shard_url).stem
 
                         self.stats["current_shard"] = current_shard_name
 
@@ -680,69 +664,15 @@ class Orchestrator:
                         # Count items in new shard
                         logger.info(f"Loading new shard {current_shard_name}")
 
-                        # For virtual HF dataset shards, use the chunk size directly
-                        if current_shard_url.startswith("hf_dataset:"):
-                            current_shard_items = self.dataset_loader.count_shard_items(
-                                current_shard_url
-                            )
-                            logger.info(
-                                f"Virtual shard {current_shard_name} has {current_shard_items} items"
-                            )
-                        else:
-                            # For WebDataset, actually count items
-                            current_shard_items = sum(
-                                1 for _ in self.dataset_loader.iterate_shard(current_shard_url)
-                            )
-                            logger.info(
-                                f"Shard {current_shard_name} has {current_shard_items} items"
-                            )
+                        # Only WebDataset logic remains
+                        current_shard_items = sum(
+                            1 for _ in self.dataset_loader.iterate_shard(current_shard_url)
+                        )
+                        logger.info(f"Shard {current_shard_name} has {current_shard_items} items")
 
                         current_shard_index = 0
 
                     except StopIteration:
-                        # No more shards in the iterator
-                        if self._is_hf_dataset:
-                            # Before creating new virtual shards, check if we have pending chunks
-                            with self.chunk_manager.lock:
-                                pending_count = len(self.chunk_manager.pending_chunks)
-
-                            if pending_count > 0:
-                                # Don't create new shards if we have pending chunks
-                                logger.debug(
-                                    f"Have {pending_count} pending chunks, not creating new virtual shards yet"
-                                )
-                                current_shard_url = None
-                                time.sleep(2)
-                                continue
-
-                            # For HF datasets, we can create more virtual shards on demand
-                            logger.info(
-                                "Creating additional virtual shards for HuggingFace dataset"
-                            )
-
-                            # Create 10 more virtual shards
-                            new_shards = []
-                            for i in range(10):
-                                shard_id = f"hf_dataset:{self.dataset_path}:chunk:{self._next_hf_shard_index * self._hf_chunk_size}"
-                                new_shards.append(shard_id)
-                                self._next_hf_shard_index += 1
-
-                            # Add to all_shards and create new iterator
-                            self.all_shards.extend(new_shards)
-                            self.stats["total_shards"] = len(self.all_shards)
-
-                            # Filter for unprocessed shards
-                            remaining_new_shards = [
-                                s
-                                for s in new_shards
-                                if s not in shards_summary and s not in completed_shards
-                            ]
-
-                            if remaining_new_shards:
-                                shard_iter = iter(remaining_new_shards)
-                                logger.info(f"Added {len(remaining_new_shards)} new virtual shards")
-                                continue
-
                         # No more shards to process
                         logger.info("No more shards to process")
                         break
@@ -754,20 +684,8 @@ class Orchestrator:
 
                 # Create a chunk from current shard
                 if current_shard_url and current_shard_index < current_shard_items:
-                    # Calculate the absolute dataset index for this chunk
-                    if current_shard_url.startswith("hf_dataset:"):
-                        # Parse the virtual shard URL to get the base start index
-                        parts = current_shard_url.split(":")
-                        if len(parts) >= 4 and parts[2] == "chunk":
-                            shard_base_index = int(parts[3])
-                        else:
-                            shard_base_index = 0
-
-                        # The absolute start index for this chunk in the dataset
-                        absolute_start_index = shard_base_index + current_shard_index
-                    else:
-                        # For WebDataset, current_shard_index is already absolute
-                        absolute_start_index = current_shard_index
+                    # For WebDataset, current_shard_index is already absolute
+                    absolute_start_index = current_shard_index
 
                     # Create chunk with absolute index
                     chunk = ShardChunk.create(
@@ -797,14 +715,10 @@ class Orchestrator:
             if chunks_created > 0:
                 logger.info(f"Created {chunks_created} chunks on demand")
 
-            # If we couldn't create any chunks and there are no more shards, check if it's HF dataset
+            # If we couldn't create any chunks and there are no more shards, just break
             if chunks_created == 0 and current_shard_url is None:
-                if self._is_hf_dataset:
-                    # We can always create more virtual shards for HF datasets
-                    logger.debug("Will create more virtual shards on next iteration")
-                else:
-                    logger.info("All shards processed, chunk creation complete")
-                    break
+                logger.info("All shards processed, chunk creation complete")
+                break
 
             # Brief pause to avoid spinning
             time.sleep(1)
@@ -1147,8 +1061,6 @@ class Orchestrator:
 
             logger.info(f"Configuration reloaded. Updated sections: {', '.join(updated_sections)}")
 
-            # Broadcast stats update to monitors
-            await self._broadcast_stats()
             await self._send_activity(
                 f"Configuration reloaded by admin: {', '.join(updated_sections)}"
             )
@@ -1189,7 +1101,6 @@ class Orchestrator:
             await self.storage.save_contributor(contributor)
 
         logger.info(f"Worker {worker_id} (user: {worker_user}) connected")
-        await self._broadcast_stats()
         await self._send_activity(f"Worker {worker_id} (user: {worker_user}) connected")
 
         try:
@@ -1238,7 +1149,6 @@ class Orchestrator:
                     f"Released {len(released_chunks) if released_chunks is not None else 0} chunks from worker {worker_id}"
                 )
 
-            await self._broadcast_stats()
             await self._send_activity(f"Worker {worker_id} (user: {worker_user}) disconnected")
 
     async def _process_worker_message(self, worker_id: str, data: Dict):
@@ -1407,9 +1317,6 @@ class Orchestrator:
             contributor.total_captions += total_outputs
             await self.storage.save_contributor(contributor)
 
-        # Broadcast updated stats
-        await self._broadcast_stats()
-
         # Log progress periodically
         total_outputs = self.stats.get("total_outputs", 0)
         if total_outputs > 0 and total_outputs % 100 == 0:
@@ -1441,9 +1348,7 @@ class Orchestrator:
 
         if len(completed_chunks) == len(shard_chunks) and len(shard_chunks) > 0:
             logger.info(f"Shard {shard_name} complete!")
-            # Don't mark virtual shards as complete in ShardTracker
-            if not shard_name.startswith("hf_dataset:"):
-                self.shard_tracker.mark_complete(shard_name)
+            self.shard_tracker.mark_complete(shard_name)
             self.stats["completed_shards"] += 1
             await self._send_activity(f"Shard {shard_name} completed!")
 
@@ -2020,7 +1925,6 @@ class Orchestrator:
                                     del self.workers_by_user[worker_user]
 
                         # Notify monitors
-                        await self._broadcast_stats()
                         await self._send_activity(
                             f"Worker {worker_id} removed due to heartbeat timeout"
                         )
@@ -2050,7 +1954,6 @@ class Orchestrator:
                 self.stats["last_checkpoint"] = datetime.utcnow().isoformat()
                 # No need to update total_written or buffer_size - they come from storage
 
-                await self._broadcast_stats()
                 logger.info(
                     f"Checkpoint complete. Total written to disk: {storage_stats['total_written']}"
                 )
@@ -2147,15 +2050,15 @@ class Orchestrator:
                 last_known_total = current_total_outputs
 
             # Log rate information when workers are connected
-            # if (
-            #     worker_count > 0 and self.rate_tracker["current_rate"] >= 0
-            # ):  # Only log non-negative rates
-            #     logger.info(
-            #         f"Rate: {self.rate_tracker['current_rate']:.1f} outputs/min "
-            #         f"(avg: {self.rate_tracker['average_rate']:.1f}, "
-            #         f"expected: {self.rate_tracker['expected_rate']:.1f}) | "
-            #         f"Workers: {worker_count}, Chunks: {active_chunks}/{target_buffer}"
-            #     )
+            if (
+                worker_count > 0 and self.rate_tracker["current_rate"] >= 0
+            ):  # Only log non-negative rates
+                logger.info(
+                    f"Rate: {self.rate_tracker['current_rate']:.1f} outputs/min "
+                    f"(avg: {self.rate_tracker['average_rate']:.1f}, "
+                    f"expected: {self.rate_tracker['expected_rate']:.1f}) | "
+                    f"Workers: {worker_count}, Chunks: {active_chunks}/{target_buffer}"
+                )
 
             await self._broadcast_stats()
 
