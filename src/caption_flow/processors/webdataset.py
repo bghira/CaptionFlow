@@ -122,13 +122,16 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                                 "shard_url": chunk_state.shard_url,
                                 "start_index": chunk_state.start_index,
                                 "chunk_size": chunk_state.chunk_size,
-                                "unprocessed_ranges": chunk_state.unprocessed_ranges
-                                or [
-                                    (
-                                        chunk_state.start_index,
-                                        chunk_state.start_index + chunk_state.chunk_size - 1,
-                                    )
-                                ],
+                                "unprocessed_ranges": getattr(
+                                    chunk_state,
+                                    "unprocessed_ranges",
+                                    [
+                                        (
+                                            chunk_state.start_index,
+                                            chunk_state.start_index + chunk_state.chunk_size - 1,
+                                        )
+                                    ],
+                                ),
                             },
                             metadata={
                                 "shard_name": shard_name,
@@ -405,7 +408,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
     def initialize(self, config: ProcessorConfig) -> None:
         """Initialize WebDataset processor."""
         logger.debug("Initializing worker with config: %s", config.config)
-        cfg = config.config
+        cfg = config.config["dataset"]
 
         # Store config
         self.dataset_config = cfg

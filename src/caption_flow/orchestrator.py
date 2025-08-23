@@ -183,12 +183,15 @@ class Orchestrator:
 
         try:
             # Send welcome message with processor config
+            filtered_config = self.config.copy()
+            for unwanted_key in ["auth", "orchestrator", "storage"]:
+                filtered_config.pop(unwanted_key, None)
             welcome_message = {
                 "type": "welcome",
                 "worker_id": worker_id,
                 "user_id": worker_user,
                 "processor_type": self.config.get("processor_type", "webdataset"),
-                "processor_config": self.config,
+                "processor_config": filtered_config,
             }
             await websocket.send(safe_json_dumps(welcome_message))
 
