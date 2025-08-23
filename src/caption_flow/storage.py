@@ -226,8 +226,7 @@ class StorageManager:
         logger.info("Migration complete - outputs now stored in dynamic columns")
 
     async def save_caption(self, caption: Caption):
-        """Save a caption entry with dynamic output columns."""
-        # Convert to dict
+        """Save a caption entry, grouping outputs by job_id/item_key (not separating captions)."""
         caption_dict = asdict(caption)
 
         # Extract item_index from metadata if present
@@ -242,16 +241,37 @@ class StorageManager:
         # Remove old "captions" field if it exists (will be in outputs)
         caption_dict.pop("captions", None)
 
-        new_fields = set()
-        for field_name, field_values in outputs.items():
-            caption_dict[field_name] = field_values
-            if field_name not in self.known_output_fields:
-                new_fields.add(field_name)
-                self.known_output_fields.add(field_name)  # Add immediately
+        # Grouping key: (job_id, item_key)
+        group_key = (caption_dict.get("job_id"), caption_dict.get("item_key"))
 
-        if new_fields:
-            logger.info(f"New output fields detected: {sorted(new_fields)}")
-            logger.info(f"Total known output fields: {sorted(self.known_output_fields)}")
+        # Try to find existing buffered row for this group
+        for row in self.caption_buffer:
+            check_key = (row.get("job_id"), row.get("item_key"))
+            if check_key == group_key:
+                # Merge outputs into existing row
+                for field_name, field_values in outputs.items():
+                    if field_name not in self.known_output_fields:
+                        self.known_output_fields.add(field_name)
+                        logger.info(f"New output field detected: {field_name}")
+                    if field_name in row and isinstance(row[field_name], list):
+                        row[field_name].extend(field_values)
+                    else:
+                        row[field_name] = list(field_values)
+                # Optionally update other fields (e.g., caption_count)
+                if "caption_count" in caption_dict:
+                    row["caption_count"] = (
+                        row.get("caption_count", 0) + caption_dict["caption_count"]
+                    )
+                return  # Already merged, no need to add new row
+            else:
+                logger.warning(f"Caption row not found for group key: {group_key} vs {check_key}")
+
+        # If not found, create new row
+        for field_name, field_values in outputs.items():
+            if field_name not in self.known_output_fields:
+                self.known_output_fields.add(field_name)
+                logger.info(f"New output field detected: {field_name}")
+            caption_dict[field_name] = list(field_values)
 
         # Serialize metadata to JSON if present
         if "metadata" in caption_dict:
@@ -259,13 +279,9 @@ class StorageManager:
         else:
             caption_dict["metadata"] = "{}"
 
-        # Add to buffer
         self.caption_buffer.append(caption_dict)
-
-        # Log buffer status
         logger.debug(f"Caption buffer size: {len(self.caption_buffer)}/{self.caption_buffer_size}")
 
-        # Flush if buffer is large enough
         if len(self.caption_buffer) >= self.caption_buffer_size:
             await self._flush_captions()
 

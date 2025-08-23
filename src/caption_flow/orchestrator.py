@@ -356,7 +356,7 @@ class Orchestrator:
         total_outputs = sum(len(v) for v in result.outputs.values())
 
         caption = Caption(
-            job_id=f"{result.unit_id}_{datetime.utcnow().isoformat()}",
+            job_id=result.unit_id,
             dataset=processed.get("source_id", "unknown"),
             shard=processed.get("source_id", "unknown"),
             item_key=result.unit_id,
