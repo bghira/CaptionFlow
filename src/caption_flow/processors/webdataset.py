@@ -530,6 +530,9 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 }
 
                 yield key, url, image_data, metadata
+            else:
+                logger.error(f"Encountered unexpected record format: {item}")
+                raise ValueError("Unexpected record format in shard")
 
     def prepare_result(
         self, unit: WorkUnit, outputs: List[Dict[str, Any]], processing_time_ms: float
