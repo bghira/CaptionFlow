@@ -530,9 +530,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 }
 
                 yield key, url, image_data, metadata
+            elif isinstance(item, tuple):
+                logger.debug(f"Tuple has {len(item)} elements, first is {item[0]}")
             else:
                 logger.error(f"Encountered unexpected record format: {item}")
-                raise ValueError("Unexpected record format in shard")
+            raise ValueError("Unexpected record format in shard")
 
     def prepare_result(
         self, unit: WorkUnit, outputs: List[Dict[str, Any]], processing_time_ms: float
