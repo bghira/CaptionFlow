@@ -16,6 +16,7 @@ class WorkUnit:
     data: Dict[str, Any]
     metadata: Dict[str, Any] = field(default_factory=dict)
     priority: int = 0
+    sample_id: str = ""
 
     def get_size_hint(self) -> int:
         """Get estimated size/complexity of this work unit."""
@@ -79,6 +80,7 @@ class WorkResult:
 
     unit_id: str
     source_id: str
+    sample_id: str
     outputs: Dict[str, List[Any]]  # field_name -> list of outputs
     metadata: Dict[str, Any] = field(default_factory=dict)
     processing_time_ms: float = 0
@@ -179,6 +181,7 @@ class WorkerProcessor(ABC):
         return WorkResult(
             unit_id=unit.unit_id,
             source_id=unit.source_id,
+            sample_id=unit.sample_id,
             outputs=aggregated,
             metadata={"item_count": len(outputs), **unit.metadata},
             processing_time_ms=processing_time_ms,
