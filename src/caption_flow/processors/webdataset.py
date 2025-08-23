@@ -460,7 +460,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         ):
             # Skip if not in our chunk range
             if idx < start_index or idx >= start_index + chunk_size:
-                logger.debug(f"Skipping idx={idx} not in chunk range")
+                # logger.debug(f"Skipping idx={idx} not in chunk range")
                 continue
 
             # Skip if already processed

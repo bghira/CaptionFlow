@@ -243,28 +243,49 @@ class StorageManager:
 
         # Grouping key: (job_id, item_key)
         group_key = (caption_dict.get("job_id"), caption_dict.get("item_key"))
+        logger.debug(
+            f"save_caption: group_key={group_key}, outputs={list(outputs.keys())}, caption_count={caption_dict.get('caption_count')}, item_index={caption_dict.get('item_index')}"
+        )
 
         # Try to find existing buffered row for this group
-        for row in self.caption_buffer:
+        found_row = False
+        for idx, row in enumerate(self.caption_buffer):
             check_key = (row.get("job_id"), row.get("item_key"))
+            logger.debug(f"Checking buffer row {idx}: check_key={check_key}, group_key={group_key}")
             if check_key == group_key:
+                found_row = True
+                logger.debug(f"Found existing buffer row for group_key={group_key} at index {idx}")
                 # Merge outputs into existing row
                 for field_name, field_values in outputs.items():
                     if field_name not in self.known_output_fields:
                         self.known_output_fields.add(field_name)
                         logger.info(f"New output field detected: {field_name}")
                     if field_name in row and isinstance(row[field_name], list):
+                        logger.debug(
+                            f"Merging output field '{field_name}' into existing row: before={row[field_name]}, adding={field_values}"
+                        )
                         row[field_name].extend(field_values)
+                        logger.debug(f"After merge: {row[field_name]}")
                     else:
+                        logger.debug(
+                            f"Setting new output field '{field_name}' in existing row: {field_values}"
+                        )
                         row[field_name] = list(field_values)
                 # Optionally update other fields (e.g., caption_count)
                 if "caption_count" in caption_dict:
-                    row["caption_count"] = (
-                        row.get("caption_count", 0) + caption_dict["caption_count"]
+                    old_count = row.get("caption_count", 0)
+                    row["caption_count"] = old_count + caption_dict["caption_count"]
+                    logger.debug(
+                        f"Updated caption_count for group_key={group_key}: {old_count} + {caption_dict['caption_count']} = {row['caption_count']}"
                     )
                 return  # Already merged, no need to add new row
             else:
-                logger.warning(f"Caption row not found for group key: {group_key} vs {check_key}")
+                logger.debug(f"Caption row not found for group key: {group_key} vs {check_key}")
+
+        if not found_row:
+            logger.debug(
+                f"No existing buffer row found for group_key={group_key}, creating new row."
+            )
 
         # If not found, create new row
         for field_name, field_values in outputs.items():
@@ -272,6 +293,7 @@ class StorageManager:
                 self.known_output_fields.add(field_name)
                 logger.info(f"New output field detected: {field_name}")
             caption_dict[field_name] = list(field_values)
+            logger.debug(f"Adding output field '{field_name}' to new row: {field_values}")
 
         # Serialize metadata to JSON if present
         if "metadata" in caption_dict:
@@ -280,9 +302,12 @@ class StorageManager:
             caption_dict["metadata"] = "{}"
 
         self.caption_buffer.append(caption_dict)
-        logger.debug(f"Caption buffer size: {len(self.caption_buffer)}/{self.caption_buffer_size}")
+        logger.debug(
+            f"Appended new caption row for group_key={group_key}. Caption buffer size: {len(self.caption_buffer)}/{self.caption_buffer_size}"
+        )
 
         if len(self.caption_buffer) >= self.caption_buffer_size:
+            logger.debug("Caption buffer full, flushing captions.")
             await self._flush_captions()
 
     async def _flush_captions(self):
@@ -350,6 +375,7 @@ class StorageManager:
             new_rows = []
             duplicate_rows = []
             for row in prepared_buffer:
+                logger.debug(f"Inspecting prepared buffer row: {row}")
                 if row["job_id"] not in existing_job_ids:
                     new_rows.append(row)
                 elif row not in duplicate_rows:

@@ -341,9 +341,9 @@ class Orchestrator:
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
 
         # Create work result
-        logger.info(f"Worker result: {result}")
+        logger.info(f"Worker result: {data}")
         result = WorkResult(
-            unit_id=data["unit_id"],
+            unit_id=data["sample_id"],
             source_id=data.get("source_id", "unknown"),
             sample_id=data.get("sample_id", "unknown"),
             outputs=data["outputs"],
