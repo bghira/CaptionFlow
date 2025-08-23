@@ -460,9 +460,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         ):
             # Skip if not in our chunk range
             if idx < start_index or idx >= start_index + chunk_size:
-                logger.debug(
-                    f"Skipping idx={idx} not in chunk range: {idx} < {start_index} or {idx} >= {start_index + chunk_size}"
-                )
+                logger.debug(f"Skipping idx={idx} not in chunk range")
                 continue
 
             # Skip if already processed
@@ -474,18 +472,27 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 # Load image
                 image = Image.open(io.BytesIO(image_data))
 
+                # Clean metadata - remove sensitive and redundant fields
+                clean_metadata = {
+                    k: v
+                    for k, v in metadata.items()
+                    if k not in ["url", "_shard_url", "shard_name"]  # Remove these fields
+                }
+
+                # Add only necessary index information
+                clean_metadata.update(
+                    {
+                        "_item_index": idx,
+                        "_chunk_relative_index": idx - start_index,
+                    }
+                )
+
                 # Prepare item for captioning
                 logger.debug("Yielding item idx=%d key=%s", idx, key)
                 yield {
                     "image": image,
                     "item_key": key,
-                    "metadata": {
-                        **metadata,
-                        "_item_index": idx,
-                        "_chunk_relative_index": idx - start_index,
-                        "url": url,
-                        "shard_name": unit.metadata.get("shard_name"),
-                    },
+                    "metadata": clean_metadata,
                 }
 
                 processed_indices.append(idx)
@@ -507,14 +514,14 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             logger.error("Dataset loader not initialized")
             return
 
-        # Use the updated DatasetLoader that returns full samples
+        # Use the DatasetLoader that returns full samples
         for sample in self.dataset_loader.iterate_shard(shard_url):
             if not isinstance(sample, dict):
                 logger.warning("Unexpected sample format: %s", type(sample))
                 continue
 
             key = sample.get("__key__", "unknown")
-            url = sample.get("__url__", shard_url)
+            url = sample.get("__url__", "")  # Don't use shard_url as default
 
             # Find image data
             image_data = None
@@ -540,9 +547,9 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 if not k.startswith("__") and k not in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]
             }
 
-            # Add some useful metadata
-            metadata["_image_format"] = image_ext
-            metadata["_shard_url"] = shard_url
+            # Add image format but not URLs
+            if image_ext:
+                metadata["_image_format"] = image_ext
 
             yield key, url, image_data, metadata
 
