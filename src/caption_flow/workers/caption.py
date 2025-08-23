@@ -35,6 +35,7 @@ class ProcessingItem:
 
     unit_id: str
     item_key: str
+    item_index: int
     image: Image.Image
     image_data: bytes
     metadata: Dict[str, Any]
