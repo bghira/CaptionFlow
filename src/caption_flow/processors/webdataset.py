@@ -509,6 +509,8 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 key = item.get("__key__", "unknown")
                 url = item.get("__url__", shard_url)
 
+                logger.debug(f"{key=}: {url=}")
+
                 # Find image data
                 image_data = None
                 for ext in ["jpg", "jpeg", "png", "webp", "bmp"]:
