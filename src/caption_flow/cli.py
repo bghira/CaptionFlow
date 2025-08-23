@@ -161,6 +161,7 @@ def main(ctx, verbose: bool):
 @click.option("--key", help="SSL key path")
 @click.option("--no-ssl", is_flag=True, help="Disable SSL (development only)")
 @click.option("--vllm", is_flag=True, help="Use vLLM orchestrator for WebDataset/HF datasets")
+@click.option("--verbose", is_flag=True, help="Enable verbose logging")
 @click.pass_context
 def orchestrator(ctx, config: Optional[str], **kwargs):
     """Start the orchestrator server."""
