@@ -159,7 +159,9 @@ class BaseWorker(ABC):
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid message format: {e}")
                 except Exception as e:
+                    import traceback
                     logger.error(f"Error handling message: {e}")
+                    logger.error(traceback.format_exc())
 
         except websockets.exceptions.ConnectionClosed as e:
             logger.info(f"Connection closed by orchestrator: {e}")
