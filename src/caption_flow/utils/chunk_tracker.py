@@ -481,7 +481,9 @@ class ChunkTracker(CheckpointTracker):
         if not hasattr(self, "_startup_complete"):
             self._startup_complete = False
 
-        if not self._startup_complete or not chunk_state.assigned_to:
+        if not self._startup_complete or (
+            not chunk_state.assigned_to or chunk_state.completed_at is None
+        ):
             # Return all unprocessed ranges
             return {
                 "chunk_id": chunk_id,

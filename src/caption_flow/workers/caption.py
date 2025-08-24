@@ -29,6 +29,7 @@ from ..models import ProcessingStage, StageResult
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+
 @dataclass
 class ProcessingItem:
     """Item being processed through stages."""
@@ -553,6 +554,14 @@ class CaptionWorker(BaseWorker):
         # Process any remaining items
         if not self.should_stop_processing.is_set():
             self._batch_for_inference()
+            if self.connected.is_set():
+                # Notify orchestrator that unit is complete
+                asyncio.run_coroutine_threadsafe(
+                    self.websocket.send(
+                        json.dumps({"type": "work_complete", "unit_id": unit.unit_id})
+                    ),
+                    self.main_loop,
+                ).result(timeout=5)
 
         logger.info(f"Unit {unit.unit_id} processed {items_processed} items")
 

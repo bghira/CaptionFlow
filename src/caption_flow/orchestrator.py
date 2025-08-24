@@ -14,7 +14,7 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 from .storage import StorageManager
-from .models import Caption, Contributor
+from .models import Caption, Contributor, JobId
 from .utils.auth import AuthManager
 from .utils.json_utils import safe_json_dumps
 from .processors.base import ProcessorConfig, WorkAssignment, WorkResult, WorkUnit
@@ -354,14 +354,15 @@ class Orchestrator:
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
 
         # Create work result
-        job_id = data.get("job_id")
-        shard_name = job_id.split(":")[0]  # data-0000
-        chunk_name = job_id.split(":")[2]  # data-0000:chunk:0
-        logger.debug(f"({job_id=}) Worker result: {data}")
+        _job_id = data.get("job_id")
+        job_id = JobId.from_str(_job_id)
+        shard_name = job_id.shard_id  # >data-0000<
+        chunk_name = job_id.chunk_id  # data-0000:chunk:>0<
+        logger.debug(f"({job_id}) Worker result: {data}")
         result = WorkResult(
             unit_id=data["sample_id"],
             source_id=shard_name,
-            chunk_id=chunk_name,
+            chunk_id=job_id.get_chunk_str(),  # we want the full string here
             sample_id=data["sample_id"],
             dataset=data["dataset"],
             outputs=data["outputs"],

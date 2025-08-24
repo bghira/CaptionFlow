@@ -245,14 +245,17 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         logger.debug("Added work unit %s to pending_units", unit_id)
 
                     if self.chunk_tracker:
-                        self.chunk_tracker.add_chunk(
+                        added_chunk = self.chunk_tracker.add_chunk(
                             unit_id,
                             current_shard_name,
                             current_shard_url,
                             current_index,
                             chunk_size,
                         )
-                        logger.debug("Added chunk to chunk_tracker: %s", unit_id)
+                        if added_chunk:
+                            logger.debug("Added chunk to chunk_tracker: %s", unit_id)
+                        else:
+                            logger.debug("Chunk already exists in chunk_tracker: %s", unit_id)
 
                     units_created += 1
                     current_index += self.chunk_size
@@ -427,7 +430,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 # Mark ranges as processed
                 for start_idx, end_idx in ranges:
                     logger.debug(f"Marking chunk as processed: {result}")
-                    self.chunk_tracker.mark_items_processed(result.source_id, start_idx, end_idx)
+                    self.chunk_tracker.mark_items_processed(result.chunk_id, start_idx, end_idx)
                     logger.debug(
                         "Marked items processed for unit %s: %d-%d",
                         result.unit_id,
