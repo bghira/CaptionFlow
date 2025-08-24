@@ -160,6 +160,7 @@ class BaseWorker(ABC):
                     logger.error(f"Invalid message format: {e}")
                 except Exception as e:
                     import traceback
+
                     logger.error(f"Error handling message: {e}")
                     logger.error(traceback.format_exc())
 

@@ -59,6 +59,7 @@ class WorkAssignment:
         units = [
             WorkUnit(
                 unit_id=u["unit_id"],
+                chunk_id=u["chunk_id"],
                 source_id=u["source_id"],
                 data=u["data"],
                 metadata=u.get("metadata", {}),
