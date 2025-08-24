@@ -846,7 +846,10 @@ class CaptionWorker(BaseWorker):
             except Empty:
                 continue
             except Exception as e:
+                import traceback
+
                 logger.error(f"Error sending result: {e}")
+                logger.error(traceback.format_exc())
                 await asyncio.sleep(1)
 
     async def _on_disconnect(self):

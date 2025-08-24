@@ -312,6 +312,7 @@ class Orchestrator:
         if msg_type == "request_work":
             count = data.get("count", self.units_per_request)
             units = self.processor.get_work_units(count, worker_id)
+            logger.debug(f"Assigning units: {units}")
 
             if units:
                 # Create assignment
