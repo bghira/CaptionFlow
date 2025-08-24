@@ -404,6 +404,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         logger.debug("Initializing WebDatasetWorkerProcessor")
         self.dataset_loader: Optional[DatasetLoader] = None
         self.dataset_config: Dict[str, Any] = {}
+        self.dataset_name: Optional[str] = None
 
     def initialize(self, config: ProcessorConfig) -> None:
         """Initialize WebDataset processor."""
@@ -415,6 +416,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
 
         # Initialize dataset loader
         dataset_path = cfg.get("dataset_path")
+        self.dataset_path = dataset_path
         dataset_type = cfg.get("dataset_type", "huggingface")
         dataset_split = cfg.get("dataset_split", "train")
         image_column = cfg.get("dataset_image_column", "image")

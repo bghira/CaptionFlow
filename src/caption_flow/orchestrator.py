@@ -341,11 +341,25 @@ class Orchestrator:
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
 
         # Create work result
-        logger.info(f"Worker result: {data}")
+        job_id = data.get("job_id")
+        shard_name = None
+        if not job_id:
+            # Fallback for backwards compatibility
+            shard_name = data["source_id"]
+            item_index = data.get("metadata", {}).get("_item_index")
+            if item_index is not None:
+                job_id = f"{shard_name}:idx:{item_index}"
+            else:
+                job_id = f"{data.get('unit_id')}:{data.get('sample_id')}"
+        if not shard_name:
+            # split by : and grab first piece
+            shard_name = job_id.split(":")[0]
+        logger.info(f"({job_id=}) Worker result: {data}")
         result = WorkResult(
             unit_id=data["sample_id"],
-            source_id=data["source_id"],
+            source_id=shard_name,
             sample_id=data["sample_id"],
+            dataset=data["dataset"],
             outputs=data["outputs"],
             metadata=data.get("metadata", {}),
             processing_time_ms=data.get("processing_time_ms", 0),
@@ -356,15 +370,6 @@ class Orchestrator:
 
         # Create caption record for storage
         total_outputs = sum(len(v) for v in result.outputs.values())
-        job_id = data.get("job_id")
-        if not job_id:
-            # Fallback for backwards compatibility
-            shard_name = data["source_id"]
-            item_index = data.get("metadata", {}).get("_item_index")
-            if item_index is not None:
-                job_id = f"{shard_name}:idx:{item_index}"
-            else:
-                job_id = f"{data.get('unit_id')}:{data.get('sample_id')}"
 
         caption = Caption(
             job_id=job_id,

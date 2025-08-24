@@ -157,6 +157,7 @@ class CaptionWorker(BaseWorker):
         # Processor configuration - will be set from orchestrator
         self.processor_type = None
         self.processor: Optional[WebDatasetWorkerProcessor] = None
+        self.dataset_path: Optional[str] = None
 
         # vLLM configuration
         self.vllm_config = None
@@ -257,6 +258,7 @@ class CaptionWorker(BaseWorker):
             raise ValueError(f"Unknown processor type: {self.processor_type}")
 
         self.processor.initialize(processor_config)
+        self.dataset_path = self.processor.dataset_path
 
         # Update vLLM config if provided
         new_vllm_config = welcome_data.get("processor_config", {}).get("vllm")
@@ -823,6 +825,7 @@ class CaptionWorker(BaseWorker):
                                 "type": "submit_results",
                                 "unit_id": work_result.unit_id,
                                 "job_id": item.job_id,
+                                "dataset": self.dataset_path,
                                 "sample_id": work_result.sample_id,
                                 "source_id": work_result.source_id,
                                 "outputs": work_result.outputs,
