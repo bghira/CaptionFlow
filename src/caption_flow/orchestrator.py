@@ -356,9 +356,18 @@ class Orchestrator:
 
         # Create caption record for storage
         total_outputs = sum(len(v) for v in result.outputs.values())
+        job_id = data.get("job_id")
+        if not job_id:
+            # Fallback for backwards compatibility
+            shard_name = data.get("source_id", "unknown")
+            item_index = data.get("metadata", {}).get("_item_index")
+            if item_index is not None:
+                job_id = f"{shard_name}:idx:{item_index}"
+            else:
+                job_id = f"{data.get('unit_id')}:{data.get('sample_id')}"
 
         caption = Caption(
-            job_id=result.unit_id,
+            job_id=job_id,
             dataset=processed.get("source_id", "unknown"),
             shard=processed.get("source_id", "unknown"),
             item_key=result.unit_id,

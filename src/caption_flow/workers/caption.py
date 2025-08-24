@@ -34,6 +34,7 @@ class ProcessingItem:
     """Item being processed through stages."""
 
     unit_id: str
+    job_id: str
     item_key: str
     item_index: int
     image: Image.Image
@@ -506,6 +507,7 @@ class CaptionWorker(BaseWorker):
                 # Create processing item
                 item = ProcessingItem(
                     unit_id=unit.unit_id,
+                    job_id=item_data["job_id"],
                     item_key=item_data["item_key"],
                     item_index=item_data["item_index"],
                     image=item_data["image"],
@@ -819,6 +821,7 @@ class CaptionWorker(BaseWorker):
                             {
                                 "type": "submit_results",
                                 "unit_id": work_result.unit_id,
+                                "job_id": item.job_id,
                                 "sample_id": work_result.sample_id,
                                 "source_id": work_result.source_id,
                                 "outputs": work_result.outputs,

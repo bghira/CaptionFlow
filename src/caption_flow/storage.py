@@ -517,6 +517,19 @@ class StorageManager:
             f"Duplicates skipped: {self.duplicates_skipped}"
         )
 
+    async def get_processed_jobs_for_chunk(self, chunk_id: str) -> Set[str]:
+        """Get all processed job_ids for a given chunk."""
+        if not self.captions_path.exists():
+            return set()
+
+        # Read only job_id and chunk_id columns
+        table = pq.read_table(self.captions_path, columns=["job_id", "chunk_id"])
+        df = table.to_pandas()
+
+        # Filter by chunk_id and return job_ids
+        chunk_jobs = df[df["chunk_id"] == chunk_id]["job_id"].tolist()
+        return set(chunk_jobs)
+
     async def get_caption_stats(self) -> Dict[str, Any]:
         """Get statistics about stored captions including field-specific stats."""
         if not self.captions_path.exists():

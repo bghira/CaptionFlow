@@ -437,6 +437,8 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             logger.error("Dataset loader not initialized")
             return
 
+        shard_name = unit.metadata.get("shard_name", "unknown")
+        chunk_index = unit.metadata.get("chunk_index", 0)
         shard_url = unit.data["shard_url"]
         start_index = unit.data["start_index"]
         chunk_size = unit.data["chunk_size"]
@@ -471,6 +473,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             try:
                 # Load image
                 image = Image.open(io.BytesIO(image_data))
+                job_id = f"{shard_name}:chunk:{chunk_index}:idx:{idx}"
 
                 # Clean metadata - remove sensitive and redundant fields
                 clean_metadata = {
@@ -484,6 +487,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                     {
                         "_item_index": idx,
                         "_chunk_relative_index": idx - start_index,
+                        "_job_id": job_id,
                     }
                 )
 
@@ -494,6 +498,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                     "item_key": key,
                     "item_index": idx,
                     "metadata": clean_metadata,
+                    "job_id": job_id,
                 }
 
                 processed_indices.append(idx)
