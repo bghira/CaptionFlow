@@ -269,19 +269,6 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         assigned = []
 
         with self.lock:
-            # First check if worker has existing assignments with unprocessed items
-            if worker_id in self.assigned_units:
-                for unit_id in list(self.assigned_units[worker_id]):
-                    if len(assigned) >= count:
-                        break
-
-                    unit = self.work_units.get(unit_id)
-                    if unit and self._has_unprocessed_items(unit):
-                        assigned.append(unit)
-                        logger.debug(
-                            "Re-assigning existing unit %s to worker %s", unit_id, worker_id
-                        )
-
             # Get new units if needed
             while len(assigned) < count and self.pending_units:
                 unit_id = self.pending_units.popleft()

@@ -485,6 +485,9 @@ class ChunkTracker(CheckpointTracker):
             not chunk_state.assigned_to or chunk_state.completed_at is None
         ):
             # Return all unprocessed ranges
+            logger.debug(
+                f"Returning all unprocessed ranges. Status {self._startup_complete=} {chunk_state=}"
+            )
             return {
                 "chunk_id": chunk_id,
                 "unprocessed_ranges": chunk_state.get_unprocessed_ranges(),

@@ -214,6 +214,7 @@ class Orchestrator:
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Worker {worker_id} disconnected")
         finally:
+            logger.info(f"Cleaning up disconnected worker {worker_id}")
             if worker_id in self.workers:
                 del self.workers[worker_id]
 
@@ -312,7 +313,7 @@ class Orchestrator:
         if msg_type == "request_work":
             count = data.get("count", self.units_per_request)
             units = self.processor.get_work_units(count, worker_id)
-            logger.debug(f"Assigning units: {units}")
+            logger.debug(f"Assigning units: {[unit.chunk_id for unit in units]}")
 
             if units:
                 # Create assignment
@@ -360,7 +361,7 @@ class Orchestrator:
         chunk_name = job_id.chunk_id  # data-0000:chunk:>0<
         logger.debug(f"({job_id}) Worker result: {data}")
         result = WorkResult(
-            unit_id=data["sample_id"],
+            unit_id=data["unit_id"],
             source_id=shard_name,
             chunk_id=job_id.get_chunk_str(),  # we want the full string here
             sample_id=data["sample_id"],
@@ -826,8 +827,12 @@ class Orchestrator:
 
             # Clean up disconnected workers
             for worker_id in disconnected:
+                logger.warning(f"Worker {worker_id} did not respond to ping, disconnecting")
                 if worker_id in self.workers:
                     del self.workers[worker_id]
+                    logger.warning(
+                        f"Releasing assignments for worker {worker_id} because it did not respond to ping"
+                    )
                     self.processor.release_assignments(worker_id)
                     self.stats["connected_workers"] = len(self.workers)
 

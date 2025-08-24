@@ -245,7 +245,7 @@ class StorageManager:
         # Grouping key: (job_id, item_key)
         _job_id = caption_dict.get("job_id")
         job_id = JobId.from_dict(_job_id).get_sample_str()
-        group_key = (job_id, caption_dict.get("item_key"))
+        group_key = job_id
         logger.debug(
             f"save_caption: group_key={group_key}, outputs={list(outputs.keys())}, caption_count={caption_dict.get('caption_count')}, item_index={caption_dict.get('item_index')}"
         )
@@ -253,7 +253,7 @@ class StorageManager:
         # Try to find existing buffered row for this group
         found_row = False
         for idx, row in enumerate(self.caption_buffer):
-            check_key = (row.get("job_id"), row.get("item_key"))
+            check_key = row.get("job_id")
             logger.debug(f"Checking buffer row {idx}: check_key={check_key}, group_key={group_key}")
             if check_key == group_key:
                 found_row = True
@@ -412,7 +412,8 @@ class StorageManager:
                 )
                 actual_new = len(new_rows)
             else:
-                logger.info(f"All {num_rows} rows were duplicates, skipping write")
+                logger.info(f"All {num_rows} rows were duplicates, exiting")
+                raise SystemError("No duplicates can be submitted")
                 actual_new = 0
         else:
             # Write new file
