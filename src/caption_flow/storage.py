@@ -4,19 +4,20 @@ import asyncio
 import json
 import logging
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Set, Dict, Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pyarrow import fs
 import pandas as pd
-from collections import defaultdict
+from collections import defaultdict, deque
+import time
 
 from .models import Job, Caption, Contributor, JobStatus, JobId
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class StorageManager:
@@ -60,6 +61,11 @@ class StorageManager:
         self.total_caption_entries_written = 0  # Total individual captions
         self.total_flushes = 0
         self.duplicates_skipped = 0
+
+        # Rate tracking
+        self.row_additions = deque(maxlen=10000)  # Store (timestamp, row_count) tuples
+        self.start_time = time.time()
+        self.last_rate_log_time = time.time()
 
         # Base caption schema without dynamic output fields
         self.base_caption_fields = [
@@ -105,6 +111,80 @@ class StorageManager:
                 ("trust_level", pa.int32()),
             ]
         )
+
+    def _calculate_rates(self) -> Dict[str, float]:
+        """Calculate row addition rates over different time windows."""
+        current_time = time.time()
+        rates = {}
+
+        # Define time windows in minutes
+        windows = {"1min": 1, "5min": 5, "15min": 15, "60min": 60}
+
+        # Clean up old entries beyond the largest window
+        cutoff_time = current_time - (60 * 60)  # 60 minutes
+        while self.row_additions and self.row_additions[0][0] < cutoff_time:
+            self.row_additions.popleft()
+
+        # Calculate rates for each window
+        for window_name, window_minutes in windows.items():
+            window_seconds = window_minutes * 60
+            window_start = current_time - window_seconds
+
+            # Sum rows added within this window
+            rows_in_window = sum(
+                count for timestamp, count in self.row_additions if timestamp >= window_start
+            )
+
+            # Calculate rate (rows per second)
+            # For windows larger than elapsed time, use elapsed time
+            elapsed = current_time - self.start_time
+            actual_window = min(window_seconds, elapsed)
+
+            if actual_window > 0:
+                rate = rows_in_window / actual_window
+                rates[window_name] = rate
+            else:
+                rates[window_name] = 0.0
+
+        # Calculate instantaneous rate (last minute)
+        instant_window_start = current_time - 60  # Last 60 seconds
+        instant_rows = sum(
+            count for timestamp, count in self.row_additions if timestamp >= instant_window_start
+        )
+        instant_window = min(60, current_time - self.start_time)
+        rates["instant"] = instant_rows / instant_window if instant_window > 0 else 0.0
+
+        # Calculate overall rate since start
+        total_elapsed = current_time - self.start_time
+        if total_elapsed > 0:
+            rates["overall"] = self.total_captions_written / total_elapsed
+        else:
+            rates["overall"] = 0.0
+
+        return rates
+
+    def _log_rates(self, rows_added: int):
+        """Log rate information if enough time has passed."""
+        current_time = time.time()
+
+        # Log rates every 10 seconds or if it's been more than 30 seconds
+        time_since_last_log = current_time - self.last_rate_log_time
+        if time_since_last_log < 10 and rows_added < 50:
+            return
+
+        rates = self._calculate_rates()
+
+        # Format the rate information
+        rate_str = (
+            f"Rate stats - Instant: {rates['instant']:.1f} rows/s | "
+            f"Avg (5m): {rates['5min']:.1f} | "
+            f"Avg (15m): {rates['15min']:.1f} | "
+            f"Avg (60m): {rates['60min']:.1f} | "
+            f"Overall: {rates['overall']:.1f} rows/s"
+        )
+
+        logger.info(rate_str)
+        self.last_rate_log_time = current_time
 
     def _get_existing_output_columns(self) -> Set[str]:
         """Get output field columns that actually exist in the parquet file."""
@@ -330,7 +410,7 @@ class StorageManager:
                 if field_name in row and isinstance(row[field_name], list):
                     total_outputs += len(row[field_name])
 
-        logger.info(f"Flushing {num_rows} rows with {total_outputs} total outputs to disk")
+        logger.debug(f"Flushing {num_rows} rows with {total_outputs} total outputs to disk")
 
         # Check if we need to evolve the schema
         current_schema_fields = set(self.caption_schema.names) if self.caption_schema else set()
@@ -341,7 +421,7 @@ class StorageManager:
 
         if all_fields_needed != current_schema_fields:
             # Schema evolution needed
-            logger.info(
+            logger.debug(
                 f"Evolving schema to include new fields: {all_fields_needed - current_schema_fields}"
             )
             self.caption_schema = self._build_caption_schema(self.known_output_fields)
@@ -420,10 +500,19 @@ class StorageManager:
             pq.write_table(table, self.captions_path, compression="snappy")
             actual_new = num_rows
 
+        # Update statistics
         self.total_captions_written += actual_new
         self.total_caption_entries_written += total_outputs
         self.total_flushes += 1
         self.caption_buffer.clear()
+
+        # Track row additions for rate calculation
+        if actual_new > 0:
+            current_time = time.time()
+            self.row_additions.append((current_time, actual_new))
+
+            # Log rates
+            self._log_rates(actual_new)
 
         logger.info(
             f"Successfully wrote captions (rows: {self.total_captions_written}, "
@@ -526,11 +615,21 @@ class StorageManager:
         await self._flush_jobs()
         await self._flush_contributors()
 
-        logger.info(
-            f"Checkpoint complete. Total rows: {self.total_captions_written}, "
-            f"Total caption entries: {self.total_caption_entries_written}, "
-            f"Duplicates skipped: {self.duplicates_skipped}"
-        )
+        # Log final rate statistics
+        if self.total_captions_written > 0:
+            rates = self._calculate_rates()
+            logger.info(
+                f"Checkpoint complete. Total rows: {self.total_captions_written}, "
+                f"Total caption entries: {self.total_caption_entries_written}, "
+                f"Duplicates skipped: {self.duplicates_skipped} | "
+                f"Overall rate: {rates['overall']:.1f} rows/s"
+            )
+        else:
+            logger.info(
+                f"Checkpoint complete. Total rows: {self.total_captions_written}, "
+                f"Total caption entries: {self.total_caption_entries_written}, "
+                f"Duplicates skipped: {self.duplicates_skipped}"
+            )
 
     def get_all_processed_job_ids(self) -> Set[str]:
         """Get all processed job_ids - useful for resumption."""
@@ -547,7 +646,6 @@ class StorageManager:
             if "job_id" in row:
                 job_ids.add(row["job_id"])
 
-        logger.info(f"Total processed job_ids: {job_ids}")
         return job_ids
 
     async def get_processed_jobs_for_chunk(self, chunk_id: str) -> Set[str]:
@@ -761,11 +859,23 @@ class StorageManager:
     async def close(self):
         """Close storage and flush buffers."""
         await self.checkpoint()
-        logger.info(
-            f"Storage closed. Total rows: {self.total_captions_written}, "
-            f"Total caption entries: {self.total_caption_entries_written}, "
-            f"Duplicates skipped: {self.duplicates_skipped}"
-        )
+
+        # Log final rate statistics
+        if self.total_captions_written > 0:
+            rates = self._calculate_rates()
+            logger.info(
+                f"Storage closed. Total rows: {self.total_captions_written}, "
+                f"Total caption entries: {self.total_caption_entries_written}, "
+                f"Duplicates skipped: {self.duplicates_skipped} | "
+                f"Final rates - Overall: {rates['overall']:.1f} rows/s, "
+                f"Last hour: {rates['60min']:.1f} rows/s"
+            )
+        else:
+            logger.info(
+                f"Storage closed. Total rows: {self.total_captions_written}, "
+                f"Total caption entries: {self.total_caption_entries_written}, "
+                f"Duplicates skipped: {self.duplicates_skipped}"
+            )
 
     async def get_storage_stats(self) -> Dict[str, Any]:
         """Get all storage-related statistics."""
@@ -783,6 +893,9 @@ class StorageManager:
         field_stats = await self.get_caption_stats()
         total_rows_including_buffer = await self.count_caption_rows() + len(self.caption_buffer)
 
+        # Calculate rates
+        rates = self._calculate_rates()
+
         return {
             "total_captions": disk_outputs + buffer_outputs,
             "total_rows": total_rows_including_buffer,
@@ -795,4 +908,11 @@ class StorageManager:
             "field_breakdown": field_stats.get("field_stats", None),
             "job_buffer_size": len(self.job_buffer),
             "contributor_buffer_size": len(self.contributor_buffer),
+            "rates": {
+                "instant": f"{rates['instant']:.1f} rows/s",
+                "5min": f"{rates['5min']:.1f} rows/s",
+                "15min": f"{rates['15min']:.1f} rows/s",
+                "60min": f"{rates['60min']:.1f} rows/s",
+                "overall": f"{rates['overall']:.1f} rows/s",
+            },
         }

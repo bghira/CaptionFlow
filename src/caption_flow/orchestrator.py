@@ -21,7 +21,7 @@ from .processors.base import ProcessorConfig, WorkAssignment, WorkResult, WorkUn
 from .processors.webdataset import WebDatasetOrchestratorProcessor
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class Orchestrator:
@@ -328,14 +328,14 @@ class Orchestrator:
                     safe_json_dumps({"type": "work_assignment", "assignment": assignment.to_dict()})
                 )
 
-                logger.info(f"Assigned {len(units)} work units to worker {worker_id}")
+                logger.debug(f"Assigned {len(units)} work units to worker {worker_id}")
             else:
                 await self.workers[worker_id].send(safe_json_dumps({"type": "no_work"}))
 
         elif msg_type == "work_complete":
             unit_id = data["unit_id"]
             self.processor.mark_completed(unit_id, worker_id)
-            logger.info(f"Work unit {unit_id} completed by worker {worker_id}")
+            logger.debug(f"Work unit {unit_id} completed by worker {worker_id}")
 
         elif msg_type == "work_failed":
             unit_id = data["unit_id"]
