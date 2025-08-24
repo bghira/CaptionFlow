@@ -517,6 +517,24 @@ class StorageManager:
             f"Duplicates skipped: {self.duplicates_skipped}"
         )
 
+    def get_all_processed_job_ids(self) -> Set[str]:
+        """Get all processed job_ids - useful for resumption."""
+        if not self.captions_path.exists():
+            logger.info("No captions file found, returning empty processed job_ids set")
+            return set()
+
+        # Read only the job_id column
+        table = pq.read_table(self.captions_path, columns=["job_id"])
+        job_ids = set(table["job_id"].to_pylist())
+
+        # Add buffered job_ids
+        for row in self.caption_buffer:
+            if "job_id" in row:
+                job_ids.add(row["job_id"])
+
+        logger.info(f"Total processed job_ids: {job_ids}")
+        return job_ids
+
     async def get_processed_jobs_for_chunk(self, chunk_id: str) -> Set[str]:
         """Get all processed job_ids for a given chunk."""
         if not self.captions_path.exists():

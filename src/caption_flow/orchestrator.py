@@ -41,11 +41,6 @@ class Orchestrator:
         else:
             raise ValueError(f"Unknown processor type: {processor_type}")
 
-        self.processor.initialize(processor_config)
-
-        # Processing configuration
-        self.units_per_request = config.get("units_per_request", 2)
-
         # Initialize components
         storage_config = config.get("storage", {})
         self.storage = StorageManager(
@@ -53,6 +48,10 @@ class Orchestrator:
             caption_buffer_size=storage_config.get("caption_buffer_size", 1000),
         )
         self.auth = AuthManager(config.get("auth", {}))
+        self.processor.initialize(processor_config, self.storage)
+
+        # Processing configuration
+        self.units_per_request = config.get("units_per_request", 2)
 
         # Track connections
         self.workers: Dict[str, WebSocketServerProtocol] = {}
@@ -155,6 +154,9 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"Connection error: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
             await websocket.close()
 
     async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_ticket):
@@ -342,19 +344,9 @@ class Orchestrator:
 
         # Create work result
         job_id = data.get("job_id")
-        shard_name = None
-        if not job_id:
-            # Fallback for backwards compatibility
-            shard_name = data["source_id"]
-            item_index = data.get("metadata", {}).get("_item_index")
-            if item_index is not None:
-                job_id = f"{shard_name}:idx:{item_index}"
-            else:
-                job_id = f"{data.get('unit_id')}:{data.get('sample_id')}"
-        if not shard_name:
-            # split by : and grab first piece
-            shard_name = job_id.split(":")[0]
-        logger.info(f"({job_id=}) Worker result: {data}")
+        shard_name = job_id.split(":")[0]  # data-0000
+        chunk_name = job_id.split(":")[2]  # data-0000:chunk:0
+        # logger.debug(f"({job_id=}) Worker result: {data}")
         result = WorkResult(
             unit_id=data["sample_id"],
             source_id=shard_name,
@@ -371,11 +363,22 @@ class Orchestrator:
         # Create caption record for storage
         total_outputs = sum(len(v) for v in result.outputs.values())
 
+        image_height = result.metadata.pop("image_height", None)
+        image_width = result.metadata.pop("image_width", None)
+        file_size = result.metadata.pop("file_size", None)
+        image_format = result.metadata.pop("image_format", None)
+        item_index = result.metadata.pop("item_index", None)
+        item_key = result.metadata.pop("item_key", None)
+        to_delete_metadata_keys = ["_image_format", "_job_id"]
+        for key in to_delete_metadata_keys:
+            if key in result.metadata:
+                del result.metadata[key]
         caption = Caption(
             job_id=job_id,
-            dataset=processed["dataset"],
+            dataset=result.dataset,
             shard=processed["source_id"],
-            item_key=result.unit_id,
+            chunk_id=chunk_name,
+            item_key=item_key,
             captions=result.outputs.get("captions", []),
             outputs=result.outputs,
             contributor_id=worker_user,
@@ -383,6 +386,10 @@ class Orchestrator:
             caption_count=total_outputs,
             processing_time_ms=result.processing_time_ms,
             metadata=result.metadata,
+            image_height=image_height,
+            image_width=image_width,
+            file_size=file_size,
+            image_format=image_format,
         )
 
         # Save to storage

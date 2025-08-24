@@ -800,7 +800,7 @@ class CaptionWorker(BaseWorker):
                     outputs = result_data["outputs"]
 
                     # Create work result
-                    logger.info(f"Processed item: {item}")
+                    # logger.info(f"Processed item: {item}")
                     work_result = WorkResult(
                         unit_id=item.unit_id,
                         source_id=item.metadata.get("shard_name", "unknown"),

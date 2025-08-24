@@ -9,6 +9,7 @@ import json
 import io
 from datetime import datetime
 from PIL import Image
+from caption_flow.storage import StorageManager
 
 from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkUnit, WorkResult
 from ..utils import DatasetLoader, ChunkTracker
@@ -41,7 +42,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         self.unit_creation_thread: Optional[threading.Thread] = None
         self.stop_creation = threading.Event()
 
-    def initialize(self, config: ProcessorConfig) -> None:
+    def initialize(self, config: ProcessorConfig, storage: StorageManager) -> None:
         """Initialize WebDataset processor."""
         logger.debug("Initializing orchestrator with config: %s", config.config)
         cfg = config.config
@@ -88,7 +89,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
             logger.debug("All shards: %s", self.all_shards)
 
             # Restore existing state from chunk tracker
-            self._restore_state()
+            self._restore_state(storage=storage)
 
             # Start background unit creation
             self.unit_creation_thread = threading.Thread(
@@ -99,22 +100,36 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         else:
             logger.error("No dataset_path provided in config")
 
-    def _restore_state(self) -> None:
+    def _restore_state(self, storage: StorageManager) -> None:
         """Restore state from chunk tracker."""
         logger.debug("Restoring state from chunk tracker")
         if not self.chunk_tracker:
-            logger.warning("No chunk_tracker available for state restore")
             return
 
         shards_summary = self.chunk_tracker.get_shards_summary()
-        logger.debug("Shards summary from chunk tracker: %s", shards_summary)
+
+        # Get all processed job_ids from storage
+        all_processed_jobs = storage.get_all_processed_job_ids()
 
         with self.lock:
             for shard_name, shard_info in shards_summary.items():
                 for chunk_state in shard_info["chunks"]:
-                    logger.debug("Restoring chunk_state: %s", chunk_state)
-                    if chunk_state.status in ["pending", "failed", "assigned"]:
-                        # Create work unit
+                    # Calculate actual unprocessed ranges based on what's in storage
+                    chunk_range = (
+                        chunk_state.start_index,
+                        chunk_state.start_index + chunk_state.chunk_size - 1,
+                    )
+
+                    # Get processed indices for this chunk
+                    processed_ranges = self.chunk_tracker.get_processed_indices_for_chunk(
+                        chunk_state.chunk_id, all_processed_jobs
+                    )
+
+                    # Calculate unprocessed ranges
+                    unprocessed_ranges = self._subtract_ranges([chunk_range], processed_ranges)
+
+                    if unprocessed_ranges:
+                        # Create work unit for unprocessed items
                         unit = WorkUnit(
                             unit_id=chunk_state.chunk_id,
                             source_id=shard_name,
@@ -122,16 +137,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                                 "shard_url": chunk_state.shard_url,
                                 "start_index": chunk_state.start_index,
                                 "chunk_size": chunk_state.chunk_size,
-                                "unprocessed_ranges": getattr(
-                                    chunk_state,
-                                    "unprocessed_ranges",
-                                    [
-                                        (
-                                            chunk_state.start_index,
-                                            chunk_state.start_index + chunk_state.chunk_size - 1,
-                                        )
-                                    ],
-                                ),
+                                "unprocessed_ranges": unprocessed_ranges,
                             },
                             metadata={
                                 "shard_name": shard_name,
@@ -141,7 +147,6 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                         self.work_units[unit.unit_id] = unit
                         self.pending_units.append(unit.unit_id)
-                        logger.debug("Restored work unit: %s", unit.unit_id)
 
     def _create_units_background(self) -> None:
         """Background thread to create work units on demand."""
@@ -150,7 +155,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         shard_iter = iter(self.all_shards)
         current_shard_url = None
         current_shard_name = None
-        current_shard_items = None
+        current_shard_items = 0
         current_index = 0
 
         while not self.stop_creation.is_set():
@@ -344,6 +349,36 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 self.chunk_tracker.release_worker_chunks(worker_id)
                 logger.debug("Released worker %s chunks in chunk_tracker", worker_id)
 
+    def _subtract_ranges(
+        self, total_ranges: List[Tuple[int, int]], processed_ranges: List[Tuple[int, int]]
+    ) -> List[Tuple[int, int]]:
+        """Subtract processed ranges from total ranges."""
+        if not processed_ranges:
+            return total_ranges
+
+        # Create a set of all processed indices
+        processed_indices = set()
+        for start, end in processed_ranges:
+            processed_indices.update(range(start, end + 1))
+
+        # Find unprocessed ranges
+        unprocessed_ranges = []
+        for start, end in total_ranges:
+            current_start = None
+            for i in range(start, end + 1):
+                if i not in processed_indices:
+                    if current_start is None:
+                        current_start = i
+                else:
+                    if current_start is not None:
+                        unprocessed_ranges.append((current_start, i - 1))
+                        current_start = None
+
+            if current_start is not None:
+                unprocessed_ranges.append((current_start, end))
+
+        return unprocessed_ranges
+
     def get_stats(self) -> Dict[str, Any]:
         """Get processor statistics."""
         with self.lock:
@@ -359,7 +394,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
     def handle_result(self, result: WorkResult) -> Dict[str, Any]:
         """Handle WebDataset-specific result processing."""
-        logger.debug("Handling result for unit %s", result.unit_id)
+        # logger.debug("Handling result for unit %s", result.unit_id)
         base_result = super().handle_result(result)
 
         # Track processed items if we have chunk tracker
@@ -494,7 +529,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 )
 
                 # Prepare item for captioning
-                logger.debug("Yielding item idx=%d key=%s", idx, key)
+                # logger.debug("Yielding item idx=%d key=%s", idx, key)
                 yield {
                     "image": image,
                     "item_key": key,
