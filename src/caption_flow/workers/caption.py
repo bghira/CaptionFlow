@@ -796,8 +796,8 @@ class CaptionWorker(BaseWorker):
                 )
 
                 if self.websocket and self.connected.is_set():
-                    logger.debug(f"Handling results for item: {item}")
                     item = result_data["item"]
+                    logger.debug(f"Handling results for item: {item}")
                     outputs = result_data["outputs"]
 
                     # Create work result
