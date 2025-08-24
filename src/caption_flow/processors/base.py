@@ -12,6 +12,7 @@ class WorkUnit:
     """Generic unit of work that can be processed."""
 
     unit_id: str
+    chunk_id: str
     source_id: str  # e.g., shard name, batch ID
     data: Dict[str, Any]
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -80,6 +81,7 @@ class WorkResult:
 
     unit_id: str
     source_id: str
+    chunk_id: str
     sample_id: str
     outputs: Dict[str, List[Any]]  # field_name -> list of outputs
     dataset: Optional[str] = None
@@ -182,6 +184,7 @@ class WorkerProcessor(ABC):
         return WorkResult(
             unit_id=unit.unit_id,
             source_id=unit.source_id,
+            chunk_id=unit.chunk_id,
             sample_id=unit.sample_id,
             outputs=aggregated,
             metadata={"item_count": len(outputs), **unit.metadata},

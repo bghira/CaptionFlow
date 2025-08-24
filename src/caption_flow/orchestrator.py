@@ -356,10 +356,11 @@ class Orchestrator:
         job_id = data.get("job_id")
         shard_name = job_id.split(":")[0]  # data-0000
         chunk_name = job_id.split(":")[2]  # data-0000:chunk:0
-        # logger.debug(f"({job_id=}) Worker result: {data}")
+        logger.debug(f"({job_id=}) Worker result: {data}")
         result = WorkResult(
             unit_id=data["sample_id"],
             source_id=shard_name,
+            chunk_id=chunk_name,
             sample_id=data["sample_id"],
             dataset=data["dataset"],
             outputs=data["outputs"],

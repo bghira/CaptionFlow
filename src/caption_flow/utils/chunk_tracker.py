@@ -440,6 +440,7 @@ class ChunkTracker(CheckpointTracker):
         """Mark a range of items as processed within a chunk (expects ABSOLUTE indices)."""
         if chunk_id not in self.chunks:
             logger.error(f"Unknown chunk: {chunk_id}")
+            logger.debug(f"Known chunks: {list(self.chunks.keys())}")
             return
 
         chunk = self.chunks[chunk_id]

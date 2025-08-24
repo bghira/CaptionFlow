@@ -796,6 +796,7 @@ class CaptionWorker(BaseWorker):
                 )
 
                 if self.websocket and self.connected.is_set():
+                    logger.debug(f"Handling results for item: {item}")
                     item = result_data["item"]
                     outputs = result_data["outputs"]
 
@@ -804,6 +805,7 @@ class CaptionWorker(BaseWorker):
                     work_result = WorkResult(
                         unit_id=item.unit_id,
                         source_id=item.metadata.get("shard_name", "unknown"),
+                        chunk_id=item.chunk_id,
                         sample_id=f"{item.item_key}",
                         outputs=outputs,
                         metadata={

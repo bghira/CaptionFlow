@@ -130,8 +130,10 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     if unprocessed_ranges:
                         # Create work unit for unprocessed items
+                        logger.debug(f"Creating WorkUnit for chunk {chunk_state}")
                         unit = WorkUnit(
                             unit_id=chunk_state.chunk_id,
+                            chunk_id=chunk_state.chunk_id,
                             source_id=shard_name,
                             data={
                                 "shard_url": chunk_state.shard_url,
@@ -211,7 +213,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 # Create work unit
                 if current_shard_url and current_index < current_shard_items:
                     chunk_size = min(self.chunk_size, current_shard_items - current_index)
-                    unit_id = f"{current_shard_name}_chunk_{current_index}"
+                    unit_id = f"{current_shard_name}:chunk:{current_index // chunk_size}"
 
                     logger.debug(
                         "Creating work unit: unit_id=%s shard=%s start_index=%d chunk_size=%d",
@@ -223,6 +225,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     unit = WorkUnit(
                         unit_id=unit_id,
+                        chunk_id=unit_id,
                         source_id=current_shard_name,
                         data={
                             "shard_url": current_shard_url,
@@ -398,7 +401,9 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         base_result = super().handle_result(result)
 
         # Track processed items if we have chunk tracker
-        if self.chunk_tracker and "item_indices" in result.metadata:
+        if self.chunk_tracker:
+            if "item_indices" not in result.metadata:
+                result.metadata["item_indices"] = [result.metadata.get("_item_index")]
             indices = result.metadata["item_indices"]
             logger.debug("Result metadata item_indices: %s", indices)
 
@@ -421,13 +426,18 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                 # Mark ranges as processed
                 for start_idx, end_idx in ranges:
-                    self.chunk_tracker.mark_items_processed(result.unit_id, start_idx, end_idx)
+                    logger.debug(f"Marking chunk as processed: {result}")
+                    self.chunk_tracker.mark_items_processed(result.source_id, start_idx, end_idx)
                     logger.debug(
                         "Marked items processed for unit %s: %d-%d",
                         result.unit_id,
                         start_idx,
                         end_idx,
                     )
+        else:
+            logger.error(
+                f"No chunk tracker? {self.chunk_tracker} or no item_indices in {result.metadata}"
+            )
 
         return base_result
 
