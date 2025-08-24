@@ -331,6 +331,27 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
             for unit_id in unit_ids:
                 if unit_id in self.work_units:
+                    unit = self.work_units[unit_id]
+
+                    # Update unprocessed ranges based on what's been processed
+                    if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
+                        chunk_state = self.chunk_tracker.chunks[unit_id]
+                        unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+
+                        # Convert relative ranges back to absolute
+                        absolute_ranges = []
+                        for start, end in unprocessed_ranges:
+                            abs_start = chunk_state.start_index + start
+                            abs_end = chunk_state.start_index + end
+                            absolute_ranges.append((abs_start, abs_end))
+
+                        # Update the work unit's data
+                        unit.data["unprocessed_ranges"] = absolute_ranges
+
+                        logger.debug(
+                            f"Updated unit {unit_id} with unprocessed ranges: {absolute_ranges}"
+                        )
+
                     self.pending_units.append(unit_id)
                     logger.debug("Returned unit %s to pending_units", unit_id)
 
