@@ -177,7 +177,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 )
 
             if units_needed == 0:
-                logger.debug("No units needed, sleeping for 5 seconds")
+                # logger.debug("No units needed, sleeping for 5 seconds")
                 threading.Event().wait(5)
                 continue
 
