@@ -431,6 +431,64 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         return base_result
 
+    def update_from_storage(self, processed_job_ids: Set[str]) -> None:
+        """Update work units based on what's been processed."""
+        logger.info(f"Updating work units from {len(processed_job_ids)} processed jobs")
+
+        with self.lock:
+            for unit_id, unit in self.work_units.items():
+                # Extract chunk info from unit
+                start_index = unit.data["start_index"]
+                chunk_size = unit.data["chunk_size"]
+                shard_name = unit.metadata["shard_name"]
+                chunk_index = unit.metadata["chunk_index"]
+
+                # Find processed indices for this chunk
+                processed_indices = []
+                for job_id in processed_job_ids:
+                    # Parse job_id format: "data-0000:chunk:0:idx:42"
+                    parts = job_id.split(":")
+                    if (
+                        len(parts) == 5
+                        and parts[0] == shard_name
+                        and parts[1] == "chunk"
+                        and int(parts[2]) == chunk_index
+                        and parts[3] == "idx"
+                    ):
+
+                        idx = int(parts[4])
+                        if start_index <= idx < start_index + chunk_size:
+                            processed_indices.append(idx)
+
+                if processed_indices:
+                    # Convert to ranges
+                    processed_indices.sort()
+                    processed_ranges = []
+                    start = processed_indices[0]
+                    end = processed_indices[0]
+
+                    for idx in processed_indices[1:]:
+                        if idx == end + 1:
+                            end = idx
+                        else:
+                            processed_ranges.append((start, end))
+                            start = idx
+                            end = idx
+
+                    processed_ranges.append((start, end))
+
+                    # Calculate unprocessed ranges
+                    total_range = [(start_index, start_index + chunk_size - 1)]
+                    unprocessed_ranges = self._subtract_ranges(total_range, processed_ranges)
+
+                    # Update unit
+                    unit.data["unprocessed_ranges"] = unprocessed_ranges
+
+                    logger.debug(
+                        f"Updated unit {unit_id}: {len(processed_indices)} processed, "
+                        f"unprocessed ranges: {unprocessed_ranges}"
+                    )
+
 
 class WebDatasetWorkerProcessor(WorkerProcessor):
     """Worker processor for WebDataset shards."""

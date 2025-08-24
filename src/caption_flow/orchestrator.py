@@ -21,6 +21,7 @@ from .processors.base import ProcessorConfig, WorkAssignment, WorkResult, WorkUn
 from .processors.webdataset import WebDatasetOrchestratorProcessor
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class Orchestrator:
@@ -103,6 +104,7 @@ class Orchestrator:
 
         # Initialize storage
         await self.storage.initialize()
+        await self.update_unprocessed_ranges()
 
         # Start background tasks
         asyncio.create_task(self._heartbeat_loop())
@@ -122,6 +124,14 @@ class Orchestrator:
         for user, worker_ids in self.workers_by_user.items():
             stats[user] = {"worker_ids": list(worker_ids), "count": len(worker_ids)}
         return stats
+
+    async def update_unprocessed_ranges(self):
+        """Update unprocessed ranges based on what's actually in storage."""
+        if not self.processor or not self.storage:
+            return
+
+        processed_job_ids = self.storage.get_all_processed_job_ids()
+        self.processor.update_from_storage(processed_job_ids)
 
     async def _send_leaderboard_to_monitor(self, websocket: WebSocketServerProtocol):
         """Alias for _send_monitor_leaderboard for backward compatibility."""

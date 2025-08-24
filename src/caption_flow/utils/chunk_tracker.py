@@ -232,9 +232,9 @@ class ChunkTracker(CheckpointTracker):
 
         # Convert to ranges
         if not processed_indices:
-            logger.warning(
-                f"Chunk {chunk_id} had no pre-processed ranges discovered, will process all elements"
-            )
+            # logger.warning(
+            #     f"Chunk {chunk_id} had no pre-processed ranges discovered, will process all elements"
+            # )
             return []
         else:
             logger.info(f"Chunk {chunk_id} has {len(processed_indices)} pre-processed indices")
