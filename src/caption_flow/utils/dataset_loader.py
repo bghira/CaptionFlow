@@ -131,21 +131,42 @@ class DatasetLoader:
         shard_url: str,
         processed_keys: Optional[set] = None,
         unprocessed_ranges: Optional[List[Tuple[int, int]]] = None,
-    ) -> Generator[Tuple[str, str, bytes], None, None]:
+    ) -> Generator[Dict[str, Any], None, None]:
         """
-        Iterate over items in a shard.
+        Iterate over items in a shard, returning full sample dictionaries.
 
         Args:
             shard_url: URL or identifier of the shard
             processed_keys: Set of already processed keys to skip
-            unprocessed_ranges: Specific ranges to process (for HF datasets)
+            unprocessed_ranges: Specific ranges to process (for range-based processing)
 
         Yields:
-            Tuple of (key, url, image_bytes)
+            Dictionary containing the full WebDataset sample
         """
-        ds = self.load_shard(shard_url, processed_keys)
-        for key, url, image_data in ds:
-            yield key, url, image_data
+        if processed_keys is None:
+            processed_keys = set()
+
+        if self.dataset_type == "huggingface" and self.dataset_format == "webdataset":
+            # Use curl with auth token for HuggingFace
+            url_cmd = f"pipe:curl -s -L -H 'Authorization:Bearer {shlex.quote(self.token)}' {shlex.quote(shard_url)} || true"
+            ds = wds.DataPipeline(
+                wds.SimpleShardList(url_cmd),
+                wds.tarfile_to_samples(),
+                wds.select(lambda x: x.get("__key__", "") not in processed_keys),
+            )
+        else:
+            # Local file access
+            ds = wds.DataPipeline(
+                wds.SimpleShardList(shard_url),
+                wds.tarfile_to_samples(),
+                wds.select(lambda x: x.get("__key__", "") not in processed_keys),
+            )
+
+        # Return full samples as dictionaries
+        for sample in ds:
+            # Ensure it's a dict and has required fields
+            if isinstance(sample, dict) and "__key__" in sample:
+                yield sample
 
     def count_shard_items(self, shard_url: str, processed_keys: Optional[set] = None) -> int:
         """Count items in a shard (can be slow for large shards)."""

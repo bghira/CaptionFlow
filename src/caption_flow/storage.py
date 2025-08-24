@@ -226,8 +226,7 @@ class StorageManager:
         logger.info("Migration complete - outputs now stored in dynamic columns")
 
     async def save_caption(self, caption: Caption):
-        """Save a caption entry with dynamic output columns."""
-        # Convert to dict
+        """Save a caption entry, grouping outputs by job_id/item_key (not separating captions)."""
         caption_dict = asdict(caption)
 
         # Extract item_index from metadata if present
@@ -242,16 +241,59 @@ class StorageManager:
         # Remove old "captions" field if it exists (will be in outputs)
         caption_dict.pop("captions", None)
 
-        new_fields = set()
-        for field_name, field_values in outputs.items():
-            caption_dict[field_name] = field_values
-            if field_name not in self.known_output_fields:
-                new_fields.add(field_name)
-                self.known_output_fields.add(field_name)  # Add immediately
+        # Grouping key: (job_id, item_key)
+        group_key = (caption_dict.get("job_id"), caption_dict.get("item_key"))
+        logger.debug(
+            f"save_caption: group_key={group_key}, outputs={list(outputs.keys())}, caption_count={caption_dict.get('caption_count')}, item_index={caption_dict.get('item_index')}"
+        )
 
-        if new_fields:
-            logger.info(f"New output fields detected: {sorted(new_fields)}")
-            logger.info(f"Total known output fields: {sorted(self.known_output_fields)}")
+        # Try to find existing buffered row for this group
+        found_row = False
+        for idx, row in enumerate(self.caption_buffer):
+            check_key = (row.get("job_id"), row.get("item_key"))
+            logger.debug(f"Checking buffer row {idx}: check_key={check_key}, group_key={group_key}")
+            if check_key == group_key:
+                found_row = True
+                logger.debug(f"Found existing buffer row for group_key={group_key} at index {idx}")
+                # Merge outputs into existing row
+                for field_name, field_values in outputs.items():
+                    if field_name not in self.known_output_fields:
+                        self.known_output_fields.add(field_name)
+                        logger.info(f"New output field detected: {field_name}")
+                    if field_name in row and isinstance(row[field_name], list):
+                        logger.debug(
+                            f"Merging output field '{field_name}' into existing row: before={row[field_name]}, adding={field_values}"
+                        )
+                        row[field_name].extend(field_values)
+                        logger.debug(f"After merge: {row[field_name]}")
+                    else:
+                        logger.debug(
+                            f"Setting new output field '{field_name}' in existing row: {field_values}"
+                        )
+                        row[field_name] = list(field_values)
+                # Optionally update other fields (e.g., caption_count)
+                if "caption_count" in caption_dict:
+                    old_count = row.get("caption_count", 0)
+                    row["caption_count"] = old_count + caption_dict["caption_count"]
+                    logger.debug(
+                        f"Updated caption_count for group_key={group_key}: {old_count} + {caption_dict['caption_count']} = {row['caption_count']}"
+                    )
+                return  # Already merged, no need to add new row
+            else:
+                logger.debug(f"Caption row not found for group key: {group_key} vs {check_key}")
+
+        if not found_row:
+            logger.debug(
+                f"No existing buffer row found for group_key={group_key}, creating new row."
+            )
+
+        # If not found, create new row
+        for field_name, field_values in outputs.items():
+            if field_name not in self.known_output_fields:
+                self.known_output_fields.add(field_name)
+                logger.info(f"New output field detected: {field_name}")
+            caption_dict[field_name] = list(field_values)
+            logger.debug(f"Adding output field '{field_name}' to new row: {field_values}")
 
         # Serialize metadata to JSON if present
         if "metadata" in caption_dict:
@@ -259,14 +301,13 @@ class StorageManager:
         else:
             caption_dict["metadata"] = "{}"
 
-        # Add to buffer
         self.caption_buffer.append(caption_dict)
+        logger.debug(
+            f"Appended new caption row for group_key={group_key}. Caption buffer size: {len(self.caption_buffer)}/{self.caption_buffer_size}"
+        )
 
-        # Log buffer status
-        logger.debug(f"Caption buffer size: {len(self.caption_buffer)}/{self.caption_buffer_size}")
-
-        # Flush if buffer is large enough
         if len(self.caption_buffer) >= self.caption_buffer_size:
+            logger.debug("Caption buffer full, flushing captions.")
             await self._flush_captions()
 
     async def _flush_captions(self):
@@ -334,6 +375,7 @@ class StorageManager:
             new_rows = []
             duplicate_rows = []
             for row in prepared_buffer:
+                logger.debug(f"Inspecting prepared buffer row: {row}")
                 if row["job_id"] not in existing_job_ids:
                     new_rows.append(row)
                 elif row not in duplicate_rows:
@@ -474,6 +516,37 @@ class StorageManager:
             f"Total caption entries: {self.total_caption_entries_written}, "
             f"Duplicates skipped: {self.duplicates_skipped}"
         )
+
+    def get_all_processed_job_ids(self) -> Set[str]:
+        """Get all processed job_ids - useful for resumption."""
+        if not self.captions_path.exists():
+            logger.info("No captions file found, returning empty processed job_ids set")
+            return set()
+
+        # Read only the job_id column
+        table = pq.read_table(self.captions_path, columns=["job_id"])
+        job_ids = set(table["job_id"].to_pylist())
+
+        # Add buffered job_ids
+        for row in self.caption_buffer:
+            if "job_id" in row:
+                job_ids.add(row["job_id"])
+
+        logger.info(f"Total processed job_ids: {job_ids}")
+        return job_ids
+
+    async def get_processed_jobs_for_chunk(self, chunk_id: str) -> Set[str]:
+        """Get all processed job_ids for a given chunk."""
+        if not self.captions_path.exists():
+            return set()
+
+        # Read only job_id and chunk_id columns
+        table = pq.read_table(self.captions_path, columns=["job_id", "chunk_id"])
+        df = table.to_pandas()
+
+        # Filter by chunk_id and return job_ids
+        chunk_jobs = df[df["chunk_id"] == chunk_id]["job_id"].tolist()
+        return set(chunk_jobs)
 
     async def get_caption_stats(self) -> Dict[str, Any]:
         """Get statistics about stored captions including field-specific stats."""

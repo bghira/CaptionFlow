@@ -10,6 +10,7 @@ from dataclasses import dataclass, asdict, field
 from .checkpoint_tracker import CheckpointTracker
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 @dataclass
@@ -210,6 +211,49 @@ class ChunkTracker(CheckpointTracker):
                 if shard_name is None or chunk.shard_name == shard_name:
                     pending.append(chunk_id)
         return pending
+
+    def get_processed_indices_for_chunk(
+        self, chunk_id: str, processed_job_ids: Set[str]
+    ) -> List[Tuple[int, int]]:
+        """Convert processed job_ids back to ranges for a chunk."""
+        # Extract indices from job_ids like "data-0000:chunk:0:idx:42"
+        processed_indices = []
+        # this will be slow as shit, but it's simple for now, Proof of Concept.
+        for job_id in processed_job_ids:
+            test_chunk_id = chunk_id.replace("_", ":")
+            if test_chunk_id in job_id:
+                parts = job_id.split(":")
+                logger.debug(
+                    f"Found matching job_id {job_id} for chunk {chunk_id} with {len(parts)=} and {parts[3]=}"
+                )
+                if len(parts) >= 5 and parts[3] == "idx":
+                    idx = int(parts[4])
+                    processed_indices.append(idx)
+
+        # Convert to ranges
+        if not processed_indices:
+            logger.warning(
+                f"Chunk {chunk_id} had no pre-processed ranges discovered, will process all elements"
+            )
+            return []
+        else:
+            logger.info(f"Chunk {chunk_id} has {len(processed_indices)} pre-processed indices")
+
+        processed_indices.sort()
+        ranges = []
+        start = processed_indices[0]
+        end = processed_indices[0]
+
+        for idx in processed_indices[1:]:
+            if idx == end + 1:
+                end = idx
+            else:
+                ranges.append((start, end))
+                start = idx
+                end = idx
+
+        ranges.append((start, end))
+        return ranges
 
     def is_shard_complete(self, shard_name: str) -> bool:
         """Check if all chunks for a shard are complete."""
