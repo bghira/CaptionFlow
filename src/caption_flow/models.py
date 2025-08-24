@@ -41,6 +41,38 @@ class Job:
 
 
 @dataclass
+class JobId:
+    shard_id: str
+    chunk_id: str
+    sample_id: str
+
+    def get_shard_str(self):
+        return f"{self.shard_id}"
+
+    def get_chunk_str(self):
+        return f"{self.shard_id}:chunk:{self.chunk_id}"
+
+    def get_sample_str(self):
+        return f"{self.shard_id}:chunk:{self.chunk_id}:idx:{self.sample_id}"
+
+    @staticmethod
+    def from_dict(job: dict) -> "JobId":
+        return JobId(shard_id=job["shard_id"], chunk_id=job["chunk_id"], sample_id=job["sample_id"])
+
+    @staticmethod
+    def from_values(shard_id: str, chunk_id: str, sample_id: str) -> "JobId":
+        return JobId(shard_id=shard_id, chunk_id=chunk_id, sample_id=sample_id)
+
+    @staticmethod
+    def from_str(job_id: str):
+        # from data-0000:chunk:0:idx:0
+        parts = job_id.split(":")
+        if len(parts) != 5:
+            raise ValueError(f"Invalid job_id format: {job_id}")
+        return JobId(shard_id=parts[0], chunk_id=parts[2], sample_id=parts[4])
+
+
+@dataclass
 class Caption:
     """Generated caption with attribution and image metadata."""
 

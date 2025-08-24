@@ -130,8 +130,10 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     if unprocessed_ranges:
                         # Create work unit for unprocessed items
+                        logger.debug(f"Creating WorkUnit for chunk {chunk_state}")
                         unit = WorkUnit(
                             unit_id=chunk_state.chunk_id,
+                            chunk_id=chunk_state.chunk_id,
                             source_id=shard_name,
                             data={
                                 "shard_url": chunk_state.shard_url,
@@ -211,7 +213,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 # Create work unit
                 if current_shard_url and current_index < current_shard_items:
                     chunk_size = min(self.chunk_size, current_shard_items - current_index)
-                    unit_id = f"{current_shard_name}_chunk_{current_index}"
+                    unit_id = f"{current_shard_name}:chunk:{current_index // chunk_size}"
 
                     logger.debug(
                         "Creating work unit: unit_id=%s shard=%s start_index=%d chunk_size=%d",
@@ -223,6 +225,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     unit = WorkUnit(
                         unit_id=unit_id,
+                        chunk_id=unit_id,
                         source_id=current_shard_name,
                         data={
                             "shard_url": current_shard_url,
@@ -242,14 +245,17 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         logger.debug("Added work unit %s to pending_units", unit_id)
 
                     if self.chunk_tracker:
-                        self.chunk_tracker.add_chunk(
+                        added_chunk = self.chunk_tracker.add_chunk(
                             unit_id,
                             current_shard_name,
                             current_shard_url,
                             current_index,
                             chunk_size,
                         )
-                        logger.debug("Added chunk to chunk_tracker: %s", unit_id)
+                        if added_chunk:
+                            logger.debug("Added chunk to chunk_tracker: %s", unit_id)
+                        else:
+                            logger.debug("Chunk already exists in chunk_tracker: %s", unit_id)
 
                     units_created += 1
                     current_index += self.chunk_size
@@ -263,19 +269,6 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         assigned = []
 
         with self.lock:
-            # First check if worker has existing assignments with unprocessed items
-            if worker_id in self.assigned_units:
-                for unit_id in list(self.assigned_units[worker_id]):
-                    if len(assigned) >= count:
-                        break
-
-                    unit = self.work_units.get(unit_id)
-                    if unit and self._has_unprocessed_items(unit):
-                        assigned.append(unit)
-                        logger.debug(
-                            "Re-assigning existing unit %s to worker %s", unit_id, worker_id
-                        )
-
             # Get new units if needed
             while len(assigned) < count and self.pending_units:
                 unit_id = self.pending_units.popleft()
@@ -398,7 +391,9 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         base_result = super().handle_result(result)
 
         # Track processed items if we have chunk tracker
-        if self.chunk_tracker and "item_indices" in result.metadata:
+        if self.chunk_tracker:
+            if "item_indices" not in result.metadata:
+                result.metadata["item_indices"] = [result.metadata.get("_item_index")]
             indices = result.metadata["item_indices"]
             logger.debug("Result metadata item_indices: %s", indices)
 
@@ -421,15 +416,78 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                 # Mark ranges as processed
                 for start_idx, end_idx in ranges:
-                    self.chunk_tracker.mark_items_processed(result.unit_id, start_idx, end_idx)
+                    logger.debug(f"Marking chunk as processed: {result}")
+                    self.chunk_tracker.mark_items_processed(result.chunk_id, start_idx, end_idx)
                     logger.debug(
                         "Marked items processed for unit %s: %d-%d",
                         result.unit_id,
                         start_idx,
                         end_idx,
                     )
+        else:
+            logger.error(
+                f"No chunk tracker? {self.chunk_tracker} or no item_indices in {result.metadata}"
+            )
 
         return base_result
+
+    def update_from_storage(self, processed_job_ids: Set[str]) -> None:
+        """Update work units based on what's been processed."""
+        logger.info(f"Updating work units from {len(processed_job_ids)} processed jobs")
+
+        with self.lock:
+            for unit_id, unit in self.work_units.items():
+                # Extract chunk info from unit
+                start_index = unit.data["start_index"]
+                chunk_size = unit.data["chunk_size"]
+                shard_name = unit.metadata["shard_name"]
+                chunk_index = unit.metadata["chunk_index"]
+
+                # Find processed indices for this chunk
+                processed_indices = []
+                for job_id in processed_job_ids:
+                    # Parse job_id format: "data-0000:chunk:0:idx:42"
+                    parts = job_id.split(":")
+                    if (
+                        len(parts) == 5
+                        and parts[0] == shard_name
+                        and parts[1] == "chunk"
+                        and int(parts[2]) == chunk_index
+                        and parts[3] == "idx"
+                    ):
+
+                        idx = int(parts[4])
+                        if start_index <= idx < start_index + chunk_size:
+                            processed_indices.append(idx)
+
+                if processed_indices:
+                    # Convert to ranges
+                    processed_indices.sort()
+                    processed_ranges = []
+                    start = processed_indices[0]
+                    end = processed_indices[0]
+
+                    for idx in processed_indices[1:]:
+                        if idx == end + 1:
+                            end = idx
+                        else:
+                            processed_ranges.append((start, end))
+                            start = idx
+                            end = idx
+
+                    processed_ranges.append((start, end))
+
+                    # Calculate unprocessed ranges
+                    total_range = [(start_index, start_index + chunk_size - 1)]
+                    unprocessed_ranges = self._subtract_ranges(total_range, processed_ranges)
+
+                    # Update unit
+                    unit.data["unprocessed_ranges"] = unprocessed_ranges
+
+                    logger.debug(
+                        f"Updated unit {unit_id}: {len(processed_indices)} processed, "
+                        f"unprocessed ranges: {unprocessed_ranges}"
+                    )
 
 
 class WebDatasetWorkerProcessor(WorkerProcessor):

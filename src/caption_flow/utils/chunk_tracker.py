@@ -232,9 +232,9 @@ class ChunkTracker(CheckpointTracker):
 
         # Convert to ranges
         if not processed_indices:
-            logger.warning(
-                f"Chunk {chunk_id} had no pre-processed ranges discovered, will process all elements"
-            )
+            # logger.warning(
+            #     f"Chunk {chunk_id} had no pre-processed ranges discovered, will process all elements"
+            # )
             return []
         else:
             logger.info(f"Chunk {chunk_id} has {len(processed_indices)} pre-processed indices")
@@ -440,6 +440,7 @@ class ChunkTracker(CheckpointTracker):
         """Mark a range of items as processed within a chunk (expects ABSOLUTE indices)."""
         if chunk_id not in self.chunks:
             logger.error(f"Unknown chunk: {chunk_id}")
+            logger.debug(f"Known chunks: {list(self.chunks.keys())}")
             return
 
         chunk = self.chunks[chunk_id]
@@ -480,8 +481,13 @@ class ChunkTracker(CheckpointTracker):
         if not hasattr(self, "_startup_complete"):
             self._startup_complete = False
 
-        if not self._startup_complete or not chunk_state.assigned_to:
+        if not self._startup_complete or (
+            not chunk_state.assigned_to or chunk_state.completed_at is None
+        ):
             # Return all unprocessed ranges
+            logger.debug(
+                f"Returning all unprocessed ranges. Status {self._startup_complete=} {chunk_state=}"
+            )
             return {
                 "chunk_id": chunk_id,
                 "unprocessed_ranges": chunk_state.get_unprocessed_ranges(),

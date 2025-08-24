@@ -11,8 +11,9 @@ from pathlib import Path
 class WorkUnit:
     """Generic unit of work that can be processed."""
 
-    unit_id: str
-    source_id: str  # e.g., shard name, batch ID
+    unit_id: str  # usually, but not always, the chunk id
+    chunk_id: str  # always the chunk id
+    source_id: str  # the shard name
     data: Dict[str, Any]
     metadata: Dict[str, Any] = field(default_factory=dict)
     priority: int = 0
@@ -42,6 +43,7 @@ class WorkAssignment:
                 {
                     "unit_id": u.unit_id,
                     "source_id": u.source_id,
+                    "chunk_id": u.chunk_id,
                     "data": u.data,
                     "metadata": u.metadata,
                     "priority": u.priority,
@@ -58,6 +60,7 @@ class WorkAssignment:
         units = [
             WorkUnit(
                 unit_id=u["unit_id"],
+                chunk_id=u["chunk_id"],
                 source_id=u["source_id"],
                 data=u["data"],
                 metadata=u.get("metadata", {}),
@@ -80,6 +83,7 @@ class WorkResult:
 
     unit_id: str
     source_id: str
+    chunk_id: str
     sample_id: str
     outputs: Dict[str, List[Any]]  # field_name -> list of outputs
     dataset: Optional[str] = None
@@ -182,6 +186,7 @@ class WorkerProcessor(ABC):
         return WorkResult(
             unit_id=unit.unit_id,
             source_id=unit.source_id,
+            chunk_id=unit.chunk_id,
             sample_id=unit.sample_id,
             outputs=aggregated,
             metadata={"item_count": len(outputs), **unit.metadata},

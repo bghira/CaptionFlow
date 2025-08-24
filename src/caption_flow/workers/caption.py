@@ -27,6 +27,7 @@ from ..utils.prompt_template import PromptTemplateManager
 from ..models import ProcessingStage, StageResult
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 @dataclass
@@ -35,6 +36,7 @@ class ProcessingItem:
 
     unit_id: str
     job_id: str
+    chunk_id: str
     item_key: str
     item_index: int
     image: Image.Image
@@ -509,6 +511,7 @@ class CaptionWorker(BaseWorker):
                 # Create processing item
                 item = ProcessingItem(
                     unit_id=unit.unit_id,
+                    chunk_id=unit.chunk_id,
                     job_id=item_data["job_id"],
                     item_key=item_data["item_key"],
                     item_index=item_data["item_index"],
@@ -551,6 +554,14 @@ class CaptionWorker(BaseWorker):
         # Process any remaining items
         if not self.should_stop_processing.is_set():
             self._batch_for_inference()
+            if self.connected.is_set():
+                # Notify orchestrator that unit is complete
+                asyncio.run_coroutine_threadsafe(
+                    self.websocket.send(
+                        json.dumps({"type": "work_complete", "unit_id": unit.unit_id})
+                    ),
+                    self.main_loop,
+                ).result(timeout=5)
 
         logger.info(f"Unit {unit.unit_id} processed {items_processed} items")
 
@@ -797,6 +808,7 @@ class CaptionWorker(BaseWorker):
 
                 if self.websocket and self.connected.is_set():
                     item = result_data["item"]
+                    logger.debug(f"Handling results for item: {item}")
                     outputs = result_data["outputs"]
 
                     # Create work result
@@ -804,6 +816,7 @@ class CaptionWorker(BaseWorker):
                     work_result = WorkResult(
                         unit_id=item.unit_id,
                         source_id=item.metadata.get("shard_name", "unknown"),
+                        chunk_id=item.chunk_id,
                         sample_id=f"{item.item_key}",
                         outputs=outputs,
                         metadata={
@@ -844,7 +857,10 @@ class CaptionWorker(BaseWorker):
             except Empty:
                 continue
             except Exception as e:
+                import traceback
+
                 logger.error(f"Error sending result: {e}")
+                logger.error(traceback.format_exc())
                 await asyncio.sleep(1)
 
     async def _on_disconnect(self):

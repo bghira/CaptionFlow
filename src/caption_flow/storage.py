@@ -13,9 +13,10 @@ from pyarrow import fs
 import pandas as pd
 from collections import defaultdict
 
-from .models import Job, Caption, Contributor, JobStatus
+from .models import Job, Caption, Contributor, JobStatus, JobId
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class StorageManager:
@@ -242,7 +243,9 @@ class StorageManager:
         caption_dict.pop("captions", None)
 
         # Grouping key: (job_id, item_key)
-        group_key = (caption_dict.get("job_id"), caption_dict.get("item_key"))
+        _job_id = caption_dict.get("job_id")
+        job_id = JobId.from_dict(_job_id).get_sample_str()
+        group_key = job_id
         logger.debug(
             f"save_caption: group_key={group_key}, outputs={list(outputs.keys())}, caption_count={caption_dict.get('caption_count')}, item_index={caption_dict.get('item_index')}"
         )
@@ -250,7 +253,7 @@ class StorageManager:
         # Try to find existing buffered row for this group
         found_row = False
         for idx, row in enumerate(self.caption_buffer):
-            check_key = (row.get("job_id"), row.get("item_key"))
+            check_key = row.get("job_id")
             logger.debug(f"Checking buffer row {idx}: check_key={check_key}, group_key={group_key}")
             if check_key == group_key:
                 found_row = True
@@ -300,6 +303,9 @@ class StorageManager:
             caption_dict["metadata"] = json.dumps(caption_dict.get("metadata", {}))
         else:
             caption_dict["metadata"] = "{}"
+
+        if isinstance(caption_dict.get("job_id"), dict):
+            caption_dict["job_id"] = job_id
 
         self.caption_buffer.append(caption_dict)
         logger.debug(
@@ -362,6 +368,7 @@ class StorageManager:
             prepared_buffer.append(prepared_row)
 
         # Create table from buffer
+        # logger.debug(f"Creating table from {prepared_buffer} prepared buffer with {self.caption_schema} schema")
         table = pa.Table.from_pylist(prepared_buffer, schema=self.caption_schema)
 
         if self.captions_path.exists():
@@ -375,11 +382,18 @@ class StorageManager:
             new_rows = []
             duplicate_rows = []
             for row in prepared_buffer:
-                logger.debug(f"Inspecting prepared buffer row: {row}")
+                # logger.debug(f"Inspecting prepared buffer row: {row}")
                 if row["job_id"] not in existing_job_ids:
                     new_rows.append(row)
                 elif row not in duplicate_rows:
-                    duplicate_rows.append(row)
+                    duplicate_rows.append(
+                        {
+                            "input": row,
+                            "existing_job": existing.to_pandas()[
+                                existing.to_pandas()["job_id"] == row["job_id"]
+                            ].to_dict(orient="records"),
+                        }
+                    )
 
             if duplicate_rows:
                 logger.info(f"Example duplicate row: {duplicate_rows[0]}")
@@ -398,7 +412,8 @@ class StorageManager:
                 )
                 actual_new = len(new_rows)
             else:
-                logger.info(f"All {num_rows} rows were duplicates, skipping write")
+                logger.info(f"All {num_rows} rows were duplicates, exiting")
+                raise SystemError("No duplicates can be submitted")
                 actual_new = 0
         else:
             # Write new file

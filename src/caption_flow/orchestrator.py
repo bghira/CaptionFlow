@@ -14,13 +14,14 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 from .storage import StorageManager
-from .models import Caption, Contributor
+from .models import Caption, Contributor, JobId
 from .utils.auth import AuthManager
 from .utils.json_utils import safe_json_dumps
 from .processors.base import ProcessorConfig, WorkAssignment, WorkResult, WorkUnit
 from .processors.webdataset import WebDatasetOrchestratorProcessor
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class Orchestrator:
@@ -103,6 +104,7 @@ class Orchestrator:
 
         # Initialize storage
         await self.storage.initialize()
+        await self.update_unprocessed_ranges()
 
         # Start background tasks
         asyncio.create_task(self._heartbeat_loop())
@@ -122,6 +124,14 @@ class Orchestrator:
         for user, worker_ids in self.workers_by_user.items():
             stats[user] = {"worker_ids": list(worker_ids), "count": len(worker_ids)}
         return stats
+
+    async def update_unprocessed_ranges(self):
+        """Update unprocessed ranges based on what's actually in storage."""
+        if not self.processor or not self.storage:
+            return
+
+        processed_job_ids = self.storage.get_all_processed_job_ids()
+        self.processor.update_from_storage(processed_job_ids)
 
     async def _send_leaderboard_to_monitor(self, websocket: WebSocketServerProtocol):
         """Alias for _send_monitor_leaderboard for backward compatibility."""
@@ -204,6 +214,7 @@ class Orchestrator:
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Worker {worker_id} disconnected")
         finally:
+            logger.info(f"Cleaning up disconnected worker {worker_id}")
             if worker_id in self.workers:
                 del self.workers[worker_id]
 
@@ -302,6 +313,7 @@ class Orchestrator:
         if msg_type == "request_work":
             count = data.get("count", self.units_per_request)
             units = self.processor.get_work_units(count, worker_id)
+            logger.debug(f"Assigning units: {[unit.chunk_id for unit in units]}")
 
             if units:
                 # Create assignment
@@ -343,13 +355,15 @@ class Orchestrator:
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
 
         # Create work result
-        job_id = data.get("job_id")
-        shard_name = job_id.split(":")[0]  # data-0000
-        chunk_name = job_id.split(":")[2]  # data-0000:chunk:0
-        # logger.debug(f"({job_id=}) Worker result: {data}")
+        _job_id = data.get("job_id")
+        job_id = JobId.from_str(_job_id)
+        shard_name = job_id.shard_id  # >data-0000<
+        chunk_name = job_id.chunk_id  # data-0000:chunk:>0<
+        logger.debug(f"({job_id}) Worker result: {data}")
         result = WorkResult(
-            unit_id=data["sample_id"],
+            unit_id=data["unit_id"],
             source_id=shard_name,
+            chunk_id=job_id.get_chunk_str(),  # we want the full string here
             sample_id=data["sample_id"],
             dataset=data["dataset"],
             outputs=data["outputs"],
@@ -813,8 +827,12 @@ class Orchestrator:
 
             # Clean up disconnected workers
             for worker_id in disconnected:
+                logger.warning(f"Worker {worker_id} did not respond to ping, disconnecting")
                 if worker_id in self.workers:
                     del self.workers[worker_id]
+                    logger.warning(
+                        f"Releasing assignments for worker {worker_id} because it did not respond to ping"
+                    )
                     self.processor.release_assignments(worker_id)
                     self.stats["connected_workers"] = len(self.workers)
 
