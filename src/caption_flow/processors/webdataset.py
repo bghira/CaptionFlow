@@ -15,7 +15,7 @@ from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkU
 from ..utils import DatasetLoader, ChunkTracker
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
@@ -261,7 +261,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                     current_index += self.chunk_size
 
             if units_created > 0:
-                logger.info(f"Created {units_created} work units")
+                logger.debug(f"Created {units_created} work units")
 
     def get_work_units(self, count: int, worker_id: str) -> List[WorkUnit]:
         """Get available work units for a worker."""

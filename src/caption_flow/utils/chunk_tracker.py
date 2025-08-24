@@ -10,7 +10,7 @@ from dataclasses import dataclass, asdict, field
 from .checkpoint_tracker import CheckpointTracker
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+# logger.setLevel(logging.DEBUG)
 
 
 @dataclass
@@ -137,6 +137,11 @@ class ChunkTracker(CheckpointTracker):
         self, chunk_id: str, shard_name: str, shard_url: str, start_index: int, chunk_size: int
     ) -> bool:
         """Add a new chunk. Returns False if chunk already exists and is completed."""
+        if chunk_id in self.chunks:
+            logger.debug(
+                f"Chunk {chunk_id} already exists with status: {self.chunks[chunk_id].status}, not creating"
+            )
+            return False
         if chunk_id in self.completed_chunks:
             logger.debug(f"Chunk {chunk_id} already completed, skipping")
             return False
@@ -171,7 +176,7 @@ class ChunkTracker(CheckpointTracker):
             chunk.completed_at = datetime.utcnow()
             self.completed_chunks.add(chunk_id)
             self.save()
-            logger.info(f"Chunk {chunk_id} marked as completed")
+            logger.debug(f"Chunk {chunk_id} marked as completed")
 
     def mark_failed(self, chunk_id: str):
         """Mark chunk as failed."""
