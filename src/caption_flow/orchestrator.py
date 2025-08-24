@@ -341,11 +341,11 @@ class Orchestrator:
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
 
         # Create work result
-        # logger.info(f"Worker result: {data}")
+        logger.info(f"Worker result: {data}")
         result = WorkResult(
             unit_id=data["sample_id"],
-            source_id=data.get("source_id", "unknown"),
-            sample_id=data.get("sample_id", "unknown"),
+            source_id=data["source_id"],
+            sample_id=data["sample_id"],
             outputs=data["outputs"],
             metadata=data.get("metadata", {}),
             processing_time_ms=data.get("processing_time_ms", 0),
@@ -359,7 +359,7 @@ class Orchestrator:
         job_id = data.get("job_id")
         if not job_id:
             # Fallback for backwards compatibility
-            shard_name = data.get("source_id", "unknown")
+            shard_name = data["source_id"]
             item_index = data.get("metadata", {}).get("_item_index")
             if item_index is not None:
                 job_id = f"{shard_name}:idx:{item_index}"
@@ -368,8 +368,8 @@ class Orchestrator:
 
         caption = Caption(
             job_id=job_id,
-            dataset=processed.get("source_id", "unknown"),
-            shard=processed.get("source_id", "unknown"),
+            dataset=processed["dataset"],
+            shard=processed["source_id"],
             item_key=result.unit_id,
             captions=result.outputs.get("captions", []),
             outputs=result.outputs,

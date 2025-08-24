@@ -437,8 +437,8 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             logger.error("Dataset loader not initialized")
             return
 
-        shard_name = unit.metadata.get("shard_name", "unknown")
-        chunk_index = unit.metadata.get("chunk_index", 0)
+        shard_name = unit.metadata["shard_name"]
+        chunk_index = unit.metadata["chunk_index"]
         shard_url = unit.data["shard_url"]
         start_index = unit.data["start_index"]
         chunk_size = unit.data["chunk_size"]
@@ -582,8 +582,8 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             logger.debug("Dataset info: %s", info)
             return info
         info = {
-            "dataset_path": self.dataset_config.get("dataset_path", "unknown"),
-            "dataset_type": self.dataset_config.get("dataset_type", "unknown"),
+            "dataset_path": self.dataset_config.get("dataset_path"),
+            "dataset_type": self.dataset_config.get("type", "huggingface"),
         }
         logger.debug("Dataset info (no loader): %s", info)
         return info
