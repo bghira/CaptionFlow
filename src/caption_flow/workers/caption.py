@@ -509,6 +509,7 @@ class CaptionWorker(BaseWorker):
                 # Create processing item
                 item = ProcessingItem(
                     unit_id=unit.unit_id,
+                    chunk_id=unit.chunk_id,
                     job_id=item_data["job_id"],
                     item_key=item_data["item_key"],
                     item_index=item_data["item_index"],
