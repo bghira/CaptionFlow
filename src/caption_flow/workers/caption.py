@@ -35,6 +35,7 @@ class ProcessingItem:
 
     unit_id: str
     job_id: str
+    chunk_id: str
     item_key: str
     item_index: int
     image: Image.Image
