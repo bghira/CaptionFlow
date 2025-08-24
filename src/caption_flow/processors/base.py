@@ -81,8 +81,8 @@ class WorkResult:
     unit_id: str
     source_id: str
     sample_id: str
-    dataset: Optional[str] = None
     outputs: Dict[str, List[Any]]  # field_name -> list of outputs
+    dataset: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     processing_time_ms: float = 0
     error: Optional[str] = None
