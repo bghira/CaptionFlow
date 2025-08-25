@@ -59,7 +59,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         # HTTP server for serving images
         self.http_app: Optional[FastAPI] = None
         self.http_server_task: Optional[asyncio.Task] = None
-        self.http_host: str = "0.0.0.0"
+        self.http_bind_address: str = "0.0.0.0"
         self.http_port: int = 8766
 
     def initialize(self, config: ProcessorConfig, storage: StorageManager) -> None:
@@ -83,7 +83,8 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         self.buffer_multiplier = cfg.get("chunk_buffer_multiplier", 3)
 
         # HTTP server settings
-        self.http_host = dataset_cfg.get("http_host", "0.0.0.0")
+        self.http_bind_address = dataset_cfg.get("http_bind_address", "0.0.0.0")
+        self.http_public_address = dataset_cfg.get("public_address", "127.0.0.1")
         self.http_port = dataset_cfg.get("http_port", 8766)
 
         logger.info(f"Root path: {self.dataset_path}, recursive: {self.recursive}")
@@ -183,13 +184,16 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
             return {
                 "total_images": self.total_images,
                 "root_path": str(self.dataset_path),
-                "http_url": f"http://{self.http_host}:{self.http_port}",
+                "http_url": f"http://{self.http_public_address}:{self.http_port}",
             }
 
         # Start server in background
         async def run_server():
             config = uvicorn.Config(
-                app=self.http_app, host=self.http_host, port=self.http_port, log_level="warning"
+                app=self.http_app,
+                host=self.http_bind_address,
+                port=self.http_port,
+                log_level="warning",
             )
             server = uvicorn.Server(config)
             await server.serve()
@@ -203,7 +207,9 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
             loop.run_forever()
 
         threading.Thread(target=run_loop, daemon=True).start()
-        logger.info(f"HTTP server started on {self.http_host}:{self.http_port}")
+        logger.info(
+            f"HTTP server started on {self.http_bind_address}:{self.http_port}, advertising hostname {self.http_public_address} to clients"
+        )
 
     def _restore_state(self, storage: StorageManager) -> None:
         """Restore state from chunk tracker."""
@@ -240,7 +246,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                             "start_index": chunk_state.start_index,
                             "chunk_size": chunk_state.chunk_size,
                             "unprocessed_ranges": unprocessed_ranges,
-                            "http_url": f"http://{self.http_host}:{self.http_port}",
+                            "http_url": f"http://{self.http_public_address}:{self.http_port}",
                         },
                         metadata={
                             "dataset": str(self.dataset_path),
@@ -303,7 +309,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                             "unprocessed_ranges": [
                                 (self.current_index, self.current_index + chunk_size - 1)
                             ],
-                            "http_url": f"http://{self.http_host}:{self.http_port}",
+                            "http_url": f"http://{self.http_public_address}:{self.http_port}",
                         },
                         metadata={
                             "dataset": str(self.dataset_path),
