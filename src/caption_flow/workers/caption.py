@@ -26,6 +26,7 @@ from ..processors import (
     WorkResult,
     WebDatasetWorkerProcessor,
     HuggingFaceDatasetWorkerProcessor,
+    LocalFilesystemWorkerProcessor,
 )
 from ..utils.vllm_config import VLLMConfigManager
 from ..utils.image_processor import ImageProcessor
@@ -165,7 +166,11 @@ class CaptionWorker(BaseWorker):
         # Processor configuration - will be set from orchestrator
         self.processor_type = None
         self.processor: Optional[
-            Union[WebDatasetWorkerProcessor, HuggingFaceDatasetWorkerProcessor]
+            Union[
+                WebDatasetWorkerProcessor,
+                HuggingFaceDatasetWorkerProcessor,
+                LocalFilesystemWorkerProcessor,
+            ],
         ] = None
         self.dataset_path: Optional[str] = None
 
@@ -285,6 +290,8 @@ class CaptionWorker(BaseWorker):
             self.processor = WebDatasetWorkerProcessor()
         elif self.processor_type == "huggingface_datasets":
             self.processor = HuggingFaceDatasetWorkerProcessor()
+        elif self.processor_type == "local_filesystem":
+            self.processor = LocalFilesystemWorkerProcessor()
         else:
             raise ValueError(f"Unknown processor type: {self.processor_type}")
 

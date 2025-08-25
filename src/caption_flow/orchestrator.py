@@ -17,9 +17,15 @@ from .storage import StorageManager
 from .models import Caption, Contributor, JobId
 from .utils.auth import AuthManager
 from .utils.json_utils import safe_json_dumps
-from .processors.base import ProcessorConfig, WorkAssignment, WorkResult, WorkUnit
-from .processors.webdataset import WebDatasetOrchestratorProcessor
-from .processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
+from .processors import (
+    ProcessorConfig,
+    WorkAssignment,
+    WorkResult,
+    WorkUnit,
+    WebDatasetOrchestratorProcessor,
+    HuggingFaceDatasetOrchestratorProcessor,
+    LocalFilesystemOrchestratorProcessor,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -45,6 +51,8 @@ class Orchestrator:
             self.processor = WebDatasetOrchestratorProcessor()
         elif processor_type == "huggingface_datasets":
             self.processor = HuggingFaceDatasetOrchestratorProcessor()
+        elif processor_type == "local_filesystem":
+            self.processor = LocalFilesystemOrchestratorProcessor()
         else:
             raise ValueError(f"Unknown processor type: {processor_type}")
 
