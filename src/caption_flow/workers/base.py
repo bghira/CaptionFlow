@@ -74,7 +74,7 @@ class BaseWorker(ABC):
                 await self._connect_and_run()
                 reconnect_delay = 5  # Reset delay on successful connection
             except Exception as e:
-                logger.error(f"Connection error: {e}")
+                logger.error(f"Connection error: {e}", exc_info=True)
                 self.connected.clear()
                 self.websocket = None
 

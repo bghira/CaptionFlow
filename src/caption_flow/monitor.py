@@ -83,7 +83,7 @@ class Monitor:
                         await self._handle_update(data)
 
             except Exception as e:
-                logger.error(f"Connection error: {e}")
+                logger.error(f"Connection error: {e}", exc_info=True)
                 await asyncio.sleep(5)
 
     async def _handle_update(self, data: Dict):
