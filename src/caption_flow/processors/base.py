@@ -94,6 +94,26 @@ class WorkResult:
     def is_success(self) -> bool:
         return self.error is None and bool(self.outputs)
 
+    def to_repr(self, filter_outputs: bool = True):
+        """
+        Print the WorkResult, optionally without captions to save on screen wall-of-text dumpage.
+        """
+        if filter_outputs:
+            outputs = "...filtered from logs..."
+        else:
+            outputs = self.outputs
+
+        return {
+            "unit_id": self.unit_id,
+            "source_id": self.source_id,
+            "chunk_id": self.chunk_id,
+            "sample_id": self.sample_id,
+            "outputs": outputs,
+            "metadata": self.metadata,
+            "processing_time_ms": self.processing_time_ms,
+            "error": self.error,
+        }
+
 
 @dataclass
 class ProcessorConfig:

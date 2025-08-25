@@ -361,7 +361,7 @@ class Orchestrator:
         job_id = JobId.from_str(_job_id)
         shard_name = job_id.shard_id  # >data-0000<
         chunk_name = job_id.chunk_id  # data-0000:chunk:>0<
-        logger.debug(f"({job_id}) Worker result: {data}")
+        # logger.debug(f"({job_id}) Worker result: {data}")
         result = WorkResult(
             unit_id=data["unit_id"],
             source_id=shard_name,
