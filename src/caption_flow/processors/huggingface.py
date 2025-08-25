@@ -22,6 +22,7 @@ from caption_flow.storage import StorageManager
 
 from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkUnit, WorkResult
 from ..utils import ChunkTracker
+from ..models import JobId
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -289,6 +290,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                             and sinfo["end_offset"] >= chunk_state.start_index
                         ):
                             shard_ids.append(sid)
+                            logger.info(f"Found shard {sid} for chunk {chunk_id}: {sinfo}")
 
                     chunk_index = chunk_state.start_index // self.chunk_size
                     unit = WorkUnit(
@@ -306,7 +308,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                         },
                         metadata={
                             "dataset": self.dataset_name,
-                            "shard_name": f"data-{chunk_index}",
+                            "shard_name": Path(self.shard_info[shard_ids[0]]["filename"]).stem,
                             "chunk_index": chunk_index,
                         },
                     )
@@ -515,16 +517,9 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 processed_indices = []
                 for job_id in processed_job_ids:
                     # Parse job_id format: "data-0000:chunk:0:idx:42"
-                    parts = job_id.split(":")
-                    if (
-                        len(parts) == 5
-                        and parts[0] == shard_name
-                        and parts[1] == "chunk"
-                        and int(parts[2]) == chunk_index
-                        and parts[3] == "idx"
-                    ):
-
-                        idx = int(parts[4])
+                    job_id = JobId.from_str(job_id=job_id)
+                    if job_id.shard_id == shard_name and int(job_id.chunk_id) == chunk_index:
+                        idx = int(job_id.sample_id)
                         if start_index <= idx < start_index + chunk_size:
                             processed_indices.append(idx)
 
@@ -764,7 +759,11 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
 
                 # Build job ID
                 chunk_index = unit.metadata["chunk_index"]
-                job_id = f"{dataset_name}:chunk:{chunk_index}:idx:{global_idx}"
+                shard_name = unit.metadata["shard_name"]
+                job_id_obj = JobId(
+                    shard_id=shard_name, chunk_id=str(chunk_index), sample_id=str(global_idx)
+                )
+                job_id = job_id_obj.get_sample_str()
 
                 # Clean metadata
                 clean_metadata = {
