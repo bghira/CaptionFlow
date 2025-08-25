@@ -143,6 +143,10 @@ class StageResult:
     stage_name: str
     output_field: str
     outputs: List[str]  # Multiple outputs from multiple prompts
+    error: Optional[str] = None
+
+    def is_success(self) -> bool:
+        return self.error is None and bool(self.outputs)
 
 
 @dataclass

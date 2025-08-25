@@ -194,8 +194,7 @@ class Orchestrator:
             )
             await self.storage.save_contributor(contributor)
 
-        logger.info(f"Worker {worker_id} (user: {worker_user}) connected")
-
+        logger.info(f"Worker {worker_id} (user: {worker_user}) is retrieving configuration")
         try:
             # Send welcome message with processor config
             filtered_config = self.config.copy()
@@ -215,9 +214,8 @@ class Orchestrator:
                 await self._process_worker_message(worker_id, data)
 
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Worker {worker_id} disconnected")
+            logger.info(f"Worker {worker_id} has disconnected due to websocket connection closure")
         finally:
-            logger.info(f"Cleaning up disconnected worker {worker_id}")
             if worker_id in self.workers:
                 del self.workers[worker_id]
 
@@ -229,6 +227,7 @@ class Orchestrator:
 
             # Release assignments
             self.processor.release_assignments(worker_id)
+            logger.info(f"Worker {worker_id} has safely disconnected")
 
     async def _handle_config_reload(
         self, websocket: WebSocketServerProtocol, new_config: Dict[str, Any]
