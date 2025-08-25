@@ -1,23 +1,24 @@
+# Caption Flow Configuration
+
 orchestrator:
   host: 0.0.0.0
   port: 8765
+  #ssl:
   #  # Use the paths output by 'caption-flow generate-cert' command
   #  cert: /etc/letsencrypt/live/caption.example.com/fullchain.pem  # From generate-cert output
   #  key: /etc/letsencrypt/live/caption.example.com/privkey.pem      # From generate-cert output
 
   # Dataset configuration - centrally managed by orchestrator
-  chunk_size: 1000 # Items per chunk
+  chunk_size: 10 # Items per chunk
   chunks_per_request: 2 # Chunks sent to worker at once
   chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
   min_chunk_buffer: 10 # Minimum chunks to keep ready
   dataset:
     type: "huggingface" # or "local"
-    processor_type: "huggingface_webdataset"
+    processor_type: "huggingface" # or "webdataset" for wds format
     dataset_path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
     name: "pixelvision"
     version: "1.0"
-    split: "images"
-    image_column: "full_image_url"
 
   # vLLM configuration - distributed to all workers
   vllm:
@@ -49,23 +50,25 @@ orchestrator:
 
     # Inference prompts - each image gets captions from all prompts
     inference_prompts:
-      - "You're a caption bot, ONLY designed to output image descriptions. Describe what you see. DON'T explain anything else. ONLY output the description, or the application WILL CRASH."
-      # this one references the title and description column to get more accurate results.
-      - "provide a comprehensive description of the visual content. The original user provided a title ({column:title}) and a description: {column:description}"
+      - "describe this image in detail"
+      - "provide a comprehensive description of the visual content"
       - "what are the key elements in this image?"
+      # Add more prompts for diverse captions
+      # - "describe the scene, including any notable objects, people, or activities"
+      # - "what story does this image tell?"
 
   storage:
     data_dir: ./caption_data
     checkpoint_interval: 1000
     caption_buffer_size: 100
-    job_buffer_size: 100
-    contributor_buffer_size: 10
+    job_buffer_size: 1
+    contributor_buffer_size: 1
     checkpoint_dir: ./checkpoints
 
   auth:
     worker_tokens:
       - token: "worker-alpha-2024"
-        name: "NVIDIA 4090 1"
+        name: "NVIDIA A6000"
       - token: "worker-beta-2024"
         name: "NVIDIA 4090 2"
       - token: "worker-kappa-2024"

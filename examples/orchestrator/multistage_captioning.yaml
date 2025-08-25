@@ -15,7 +15,8 @@ orchestrator:
   min_chunk_buffer: 10 # Minimum chunks to keep ready
   dataset:
     type: "huggingface" # or "local"
-    path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
+    processor_type: "huggingface_webdataset"
+    dataset_path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
     name: "pixelvision"
     version: "1.0"
     split: "images"

@@ -15,7 +15,8 @@ orchestrator:
   min_chunk_buffer: 10 # Minimum chunks to keep ready
   dataset:
     type: "huggingface" # or "local"
-    path: "NebulaeWis/e621-2024-webp-4Mpixel" # HF dataset path or local directory
+    processor_type: "webdataset"
+    dataset_path: "NebulaeWis/e621-2024-webp-4Mpixel" # HF dataset path or local directory
     name: "e621"
     version: "1.0"
 
