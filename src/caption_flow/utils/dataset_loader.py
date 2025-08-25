@@ -57,8 +57,12 @@ class DatasetLoader:
         if tar_files:
             return "webdataset"
 
-        logger.warning(f"Could not detect dataset format for {self.dataset_path}")
-        return "unknown"
+        # Check for .parquet files (Huggingface Arrow DB)
+        parquet_files = list(fs.glob(f"hf://datasets/{self.dataset_path}/**/*.parquet"))
+        if parquet_files:
+            return "huggingface"
+
+        raise AssertionError(f"Could not detect dataset format for {self.dataset_path}")
 
     def get_shard_list(self) -> List[str]:
         """Get list of all shards in the dataset."""

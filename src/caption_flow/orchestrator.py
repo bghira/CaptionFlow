@@ -34,8 +34,10 @@ class Orchestrator:
         self.port = config.get("port", 8765)
 
         # Processor configuration
-        processor_type = config.get('dataset', {}).get("processor_type", None)
-        assert processor_type is not None, "You must supply processor_type in your orchestrator dataset configuration."
+        processor_type = config.get("dataset", {}).get("processor_type", None)
+        assert (
+            processor_type is not None
+        ), "You must supply processor_type in your orchestrator dataset configuration."
         processor_config = ProcessorConfig(processor_type=processor_type, config=config)
 
         # Initialize processor
@@ -104,10 +106,12 @@ class Orchestrator:
     async def start(self):
         """Start the orchestrator server."""
         logger.info(f"Starting orchestrator on {self.host}:{self.port}")
-        processor_type = self.config.get('dataset', {}).get('processor_type', None)
+        processor_type = self.config.get("dataset", {}).get("processor_type", None)
         if not processor_type:
             logger.info(f"Config: {self.config}")
-            raise ValueError("You must supply processor_type in your orchestrator dataset configuration.")
+            raise ValueError(
+                "You must supply processor_type in your orchestrator dataset configuration."
+            )
         logger.info(f"Processor type: {processor_type}")
 
         # Initialize storage
