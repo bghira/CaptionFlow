@@ -519,7 +519,6 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
         self.dataset_path: Optional[Path] = None
         self.image_paths: Optional[List[Tuple[Path, int]]] = None
         self.dataset_config: Dict[str, Any] = {}
-        self.dataset_path = Optional[str] = None
 
     def initialize(self, config: ProcessorConfig) -> None:
         """Initialize processor."""
