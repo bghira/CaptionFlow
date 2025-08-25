@@ -624,6 +624,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
         # Determine if this is an image URL dataset or binary image dataset
         self.image_column = self.dataset_config.get("dataset_image_column", "image")
         self.url_column = self.dataset_config.get("dataset_url_column", "image_url")
+        self.dataset_path = self.dataset_config.get("dataset_path", None)
 
     def _load_shard(self, dataset_name: str, shard_filename: str, shard_id: int) -> Dataset:
         """Load a shard if not already cached."""
