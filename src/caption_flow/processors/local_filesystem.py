@@ -516,9 +516,10 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
 
     def __init__(self):
         logger.debug("Initializing LocalFilesystemWorkerProcessor")
-        self.local_storage_path: Optional[Path] = None
+        self.dataset_path: Optional[Path] = None
         self.image_paths: Optional[List[Tuple[Path, int]]] = None
         self.dataset_config: Dict[str, Any] = {}
+        self.dataset_path = Optional[str] = None
 
     def initialize(self, config: ProcessorConfig) -> None:
         """Initialize processor."""
@@ -529,14 +530,15 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
         worker_cfg = config.config.get("worker", {})
         local_path = worker_cfg.get("local_storage_path")
 
+        self.dataset_path = None
         if local_path:
-            self.local_storage_path = Path(local_path)
-            if self.local_storage_path.exists():
-                logger.info(f"Worker has local storage access at: {self.local_storage_path}")
+            self.dataset_path = Path(local_path)
+            if self.dataset_path.exists():
+                logger.info(f"Worker has local storage access at: {self.dataset_path}")
                 # Could potentially cache image list here if needed
             else:
-                logger.warning(f"Local storage path does not exist: {self.local_storage_path}")
-                self.local_storage_path = None
+                logger.warning(f"Local storage path does not exist: {self.dataset_path}")
+                self.dataset_path = None
         else:
             logger.info("Worker does not have local storage access, will use HTTP")
 
@@ -567,7 +569,7 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
             try:
                 image = None
 
-                if self.local_storage_path and self.image_paths:
+                if self.dataset_path and self.image_paths:
                     # Direct file access
                     if 0 <= idx < len(self.image_paths):
                         file_path, _ = self.image_paths[idx]
@@ -640,16 +642,16 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
         return {
             "dataset_path": self.dataset_config.get("dataset_path", "local"),
             "dataset_type": "local_filesystem",
-            "has_local_access": self.local_storage_path is not None,
+            "has_local_access": self.dataset_path is not None,
         }
 
     def set_image_paths_from_orchestrator(self, image_paths: List[Tuple[str, int]]) -> None:
         """Set the image paths list from orchestrator (for local access mode)."""
-        if self.local_storage_path:
+        if self.dataset_path:
             # Convert paths relative to our local storage path
             self.image_paths = []
             for path_str, size in image_paths:
                 # Orchestrator sends paths relative to its root
                 # We need to resolve them relative to our local_storage_path
-                self.image_paths.append((self.local_storage_path / path_str, size))
+                self.image_paths.append((self.dataset_path / path_str, size))
             logger.info(f"Set {len(self.image_paths)} image paths for local access")
