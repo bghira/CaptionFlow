@@ -293,10 +293,11 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                             logger.info(f"Found shard {sid} for chunk {chunk_id}: {sinfo}")
 
                     chunk_index = chunk_state.start_index // self.chunk_size
+                    shard_name = Path(self.shard_info[shard_ids[0]]["filename"]).stem
                     unit = WorkUnit(
                         unit_id=chunk_id,
                         chunk_id=chunk_id,
-                        source_id=self.dataset_name,
+                        source_id=shard_name,
                         data={
                             "dataset_name": self.dataset_name,
                             "config": self.config,
@@ -308,7 +309,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                         },
                         metadata={
                             "dataset": self.dataset_name,
-                            "shard_name": Path(self.shard_info[shard_ids[0]]["filename"]).stem,
+                            "shard_name": shard_name,
                             "chunk_index": chunk_index,
                         },
                     )
