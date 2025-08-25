@@ -348,9 +348,24 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
             while units_created < units_needed and current_index < self.total_items:
                 chunk_size = min(self.chunk_size, self.total_items - current_index)
-                unit_id = f"{self.dataset_name}:chunk:{current_index // self.chunk_size}"
+                chunk_id = current_index // self.chunk_size
 
                 with self.lock:
+                    shard_ids = []
+                    for sid, sinfo in self.shard_info.items():
+                        if (
+                            sinfo["start_offset"] <= current_index + chunk_size - 1
+                            and sinfo["end_offset"] >= current_index
+                        ):
+                            shard_ids.append(sid)
+                    shard_name = Path(self.shard_info[shard_ids[0]]["filename"]).stem
+
+                    job_id_obj = JobId(
+                        shard_id=shard_name, chunk_id=chunk_id, sample_id=current_index
+                    )
+                    unit_id = (
+                        job_id_obj.get_chunk_str()
+                    )  # just the chunk part, eg pixel-images:chunk:0
                     if unit_id in self.work_units:
                         current_index += self.chunk_size
                         continue
@@ -363,19 +378,11 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                             continue
 
                     # Find which shard(s) this chunk belongs to
-                    shard_ids = []
-                    for sid, sinfo in self.shard_info.items():
-                        if (
-                            sinfo["start_offset"] <= current_index + chunk_size - 1
-                            and sinfo["end_offset"] >= current_index
-                        ):
-                            shard_ids.append(sid)
 
-                    chunk_index = current_index // chunk_size
                     unit = WorkUnit(
                         unit_id=unit_id,
                         chunk_id=unit_id,
-                        source_id=self.dataset_name,
+                        source_id=shard_name,
                         data={
                             "dataset_name": self.dataset_name,
                             "config": self.config,
@@ -387,10 +394,11 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                         },
                         metadata={
                             "dataset": self.dataset_name,
-                            "shard_name": f"data-{chunk_index}",
-                            "chunk_index": chunk_index,
+                            "shard_name": shard_name,
+                            "chunk_index": chunk_id,
                         },
                     )
+                    logger.debug(f"Created WorkUnit: {unit}")
 
                     self.work_units[unit_id] = unit
                     self.pending_units.append(unit_id)
