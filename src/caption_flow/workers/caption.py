@@ -10,7 +10,7 @@ import logging
 import websockets
 import time
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, List, Tuple, Iterator
+from typing import Dict, Any, Optional, List, Tuple, Union
 from queue import Queue, Empty
 from threading import Thread, Event, Lock
 from collections import defaultdict, deque
@@ -19,8 +19,14 @@ from PIL import Image
 from huggingface_hub import get_token
 
 from .base import BaseWorker
-from ..processors.base import ProcessorConfig, WorkAssignment, WorkUnit, WorkResult
-from ..processors.webdataset import WebDatasetWorkerProcessor
+from ..processors import (
+    ProcessorConfig,
+    WorkAssignment,
+    WorkUnit,
+    WorkResult,
+    WebDatasetWorkerProcessor,
+    HuggingFaceDatasetWorkerProcessor,
+)
 from ..utils.vllm_config import VLLMConfigManager
 from ..utils.image_processor import ImageProcessor
 from ..utils.prompt_template import PromptTemplateManager
@@ -158,7 +164,9 @@ class CaptionWorker(BaseWorker):
 
         # Processor configuration - will be set from orchestrator
         self.processor_type = None
-        self.processor: Optional[WebDatasetWorkerProcessor] = None
+        self.processor: Optional[
+            Union[WebDatasetWorkerProcessor, HuggingFaceDatasetWorkerProcessor]
+        ] = None
         self.dataset_path: Optional[str] = None
 
         # vLLM configuration
@@ -266,13 +274,17 @@ class CaptionWorker(BaseWorker):
         self.units_completed = 0
 
         # Setup processor
-        self.processor_type = welcome_data.get("processor_type", "webdataset")
+        self.processor_type = welcome_data.get("processor_type", None)
+        assert self.processor_type is not None, "Processor type not found in welcome data"
+        logger.info(f"Creating {self.processor_type} processor")
         processor_config = ProcessorConfig(
             processor_type=self.processor_type, config=welcome_data.get("processor_config", {})
         )
 
         if self.processor_type == "webdataset":
             self.processor = WebDatasetWorkerProcessor()
+        elif self.processor_type == "huggingface_datasets":
+            self.processor = HuggingFaceDatasetWorkerProcessor()
         else:
             raise ValueError(f"Unknown processor type: {self.processor_type}")
 
@@ -509,7 +521,7 @@ class CaptionWorker(BaseWorker):
                     self.current_unit = None
 
             except Exception as e:
-                logger.error(f"Error processing unit: {e}")
+                logger.error(f"Error processing unit: {e}", exc_info=True)
                 with self.work_lock:
                     self.current_unit = None
 

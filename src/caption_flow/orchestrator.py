@@ -19,6 +19,7 @@ from .utils.auth import AuthManager
 from .utils.json_utils import safe_json_dumps
 from .processors.base import ProcessorConfig, WorkAssignment, WorkResult, WorkUnit
 from .processors.webdataset import WebDatasetOrchestratorProcessor
+from .processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -33,12 +34,17 @@ class Orchestrator:
         self.port = config.get("port", 8765)
 
         # Processor configuration
-        processor_type = config.get("processor_type", "webdataset")
+        processor_type = config.get("dataset", {}).get("processor_type", None)
+        assert (
+            processor_type is not None
+        ), "You must supply processor_type in your orchestrator dataset configuration."
         processor_config = ProcessorConfig(processor_type=processor_type, config=config)
 
         # Initialize processor
         if processor_type == "webdataset":
             self.processor = WebDatasetOrchestratorProcessor()
+        elif processor_type == "huggingface_datasets":
+            self.processor = HuggingFaceDatasetOrchestratorProcessor()
         else:
             raise ValueError(f"Unknown processor type: {processor_type}")
 
@@ -100,7 +106,13 @@ class Orchestrator:
     async def start(self):
         """Start the orchestrator server."""
         logger.info(f"Starting orchestrator on {self.host}:{self.port}")
-        logger.info(f"Processor type: {self.config.get('processor_type', 'webdataset')}")
+        processor_type = self.config.get("dataset", {}).get("processor_type", None)
+        if not processor_type:
+            logger.info(f"Config: {self.config}")
+            raise ValueError(
+                "You must supply processor_type in your orchestrator dataset configuration."
+            )
+        logger.info(f"Processor type: {processor_type}")
 
         # Initialize storage
         await self.storage.initialize()
@@ -204,7 +216,7 @@ class Orchestrator:
                 "type": "welcome",
                 "worker_id": worker_id,
                 "user_id": worker_user,
-                "processor_type": self.config.get("processor_type", "webdataset"),
+                "processor_type": self.config.get("dataset", {}).get("processor_type", None),
                 "processor_config": filtered_config,
             }
             await websocket.send(safe_json_dumps(welcome_message))
