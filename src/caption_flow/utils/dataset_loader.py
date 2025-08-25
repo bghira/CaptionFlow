@@ -60,7 +60,7 @@ class DatasetLoader:
         # Check for .parquet files (Huggingface Arrow DB)
         parquet_files = list(fs.glob(f"hf://datasets/{self.dataset_path}/**/*.parquet"))
         if parquet_files:
-            return "huggingface"
+            return "huggingface_datasets"
 
         raise AssertionError(f"Could not detect dataset format for {self.dataset_path}")
 
