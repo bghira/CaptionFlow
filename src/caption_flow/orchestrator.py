@@ -216,7 +216,7 @@ class Orchestrator:
                 "type": "welcome",
                 "worker_id": worker_id,
                 "user_id": worker_user,
-                "processor_type": self.config.get("processor_type", "webdataset"),
+                "processor_type": self.config.get("dataset", {}).get("processor_type", None),
                 "processor_config": filtered_config,
             }
             await websocket.send(safe_json_dumps(welcome_message))
