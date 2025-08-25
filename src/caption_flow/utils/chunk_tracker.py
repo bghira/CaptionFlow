@@ -242,7 +242,7 @@ class ChunkTracker(CheckpointTracker):
             # )
             return []
         else:
-            logger.info(f"Chunk {chunk_id} has {len(processed_indices)} pre-processed indices")
+            logger.debug(f"Chunk {chunk_id} has {len(processed_indices)} pre-processed indices")
 
         processed_indices.sort()
         ranges = []

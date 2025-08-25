@@ -112,8 +112,14 @@ class Orchestrator:
         asyncio.create_task(self._stats_update_loop())
 
         # Start WebSocket server
+        websocket_logger = logging.getLogger("websockets")
+        websocket_logger.setLevel(logging.WARNING)
         async with websockets.serve(
-            self.handle_connection, self.host, self.port, ssl=self.ssl_context
+            self.handle_connection,
+            self.host,
+            self.port,
+            ssl=self.ssl_context,
+            logger=websocket_logger,
         ):
             logger.info("Orchestrator ready for connections")
             await asyncio.Future()  # Run forever
@@ -163,10 +169,7 @@ class Orchestrator:
                 )
 
         except Exception as e:
-            logger.error(f"Connection error: {e}")
-            import traceback
-
-            logger.error(traceback.format_exc())
+            logger.error(f"Connection error: {e}", exc_info=True)
             await websocket.close()
 
     async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_ticket):
@@ -191,8 +194,7 @@ class Orchestrator:
             )
             await self.storage.save_contributor(contributor)
 
-        logger.info(f"Worker {worker_id} (user: {worker_user}) connected")
-
+        logger.info(f"Worker {worker_id} (user: {worker_user}) is retrieving configuration")
         try:
             # Send welcome message with processor config
             filtered_config = self.config.copy()
@@ -212,9 +214,8 @@ class Orchestrator:
                 await self._process_worker_message(worker_id, data)
 
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Worker {worker_id} disconnected")
+            logger.info(f"Worker {worker_id} has disconnected due to websocket connection closure")
         finally:
-            logger.info(f"Cleaning up disconnected worker {worker_id}")
             if worker_id in self.workers:
                 del self.workers[worker_id]
 
@@ -226,6 +227,7 @@ class Orchestrator:
 
             # Release assignments
             self.processor.release_assignments(worker_id)
+            logger.info(f"Worker {worker_id} has safely disconnected")
 
     async def _handle_config_reload(
         self, websocket: WebSocketServerProtocol, new_config: Dict[str, Any]
@@ -359,7 +361,7 @@ class Orchestrator:
         job_id = JobId.from_str(_job_id)
         shard_name = job_id.shard_id  # >data-0000<
         chunk_name = job_id.chunk_id  # data-0000:chunk:>0<
-        logger.debug(f"({job_id}) Worker result: {data}")
+        # logger.debug(f"({job_id}) Worker result: {data}")
         result = WorkResult(
             unit_id=data["unit_id"],
             source_id=shard_name,

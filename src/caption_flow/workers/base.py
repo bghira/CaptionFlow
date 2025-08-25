@@ -159,16 +159,13 @@ class BaseWorker(ABC):
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid message format: {e}")
                 except Exception as e:
-                    import traceback
-
-                    logger.error(f"Error handling message: {e}")
-                    logger.error(traceback.format_exc())
+                    logger.error(f"Error handling message: {e}", exc_info=True)
 
         except websockets.exceptions.ConnectionClosed as e:
             logger.info(f"Connection closed by orchestrator: {e}")
             raise
         except Exception as e:
-            logger.error(f"Message handler error: {e}")
+            logger.error(f"Message handler error: {e}", exc_info=True)
             raise
 
     async def shutdown(self):

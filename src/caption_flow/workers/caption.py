@@ -199,6 +199,10 @@ class CaptionWorker(BaseWorker):
         """Get authentication data."""
         return {"token": self.token, "name": self.name}
 
+    def _get_current_unit_id(self) -> Optional[str]:
+        """Get the current unit ID."""
+        return self.current_unit.unit_id if self.current_unit else None
+
     async def _pre_start(self):
         """Initialize before starting connection loop."""
         # Wait for initial connection to get config
@@ -248,6 +252,19 @@ class CaptionWorker(BaseWorker):
 
     async def _handle_welcome(self, welcome_data: Dict[str, Any]):
         """Handle welcome message from orchestrator."""
+        with self.work_lock:
+            self.assigned_units.clear()
+            self.current_unit = None
+
+        self._clear_queue(self.readahead_queue)
+        self._clear_queue(self.inference_queue)
+        self._clear_queue(self.result_queue)
+
+        # Reset counters
+        self.items_processed = 0
+        self.items_failed = 0
+        self.units_completed = 0
+
         # Setup processor
         self.processor_type = welcome_data.get("processor_type", "webdataset")
         processor_config = ProcessorConfig(
@@ -460,7 +477,7 @@ class CaptionWorker(BaseWorker):
             with self.work_lock:
                 if not self.current_unit and self.assigned_units:
                     self.current_unit = self.assigned_units.popleft()
-                    logger.info(f"Starting unit {self.current_unit.unit_id}")
+                    logger.info(f"Starting unit {self._get_current_unit_id()}")
 
             if not self.current_unit:
                 time.sleep(1)
@@ -470,7 +487,7 @@ class CaptionWorker(BaseWorker):
                 self._process_work_unit(self.current_unit)
 
                 if self.connected.is_set() and not self.should_stop_processing.is_set():
-                    logger.info(f"Completed unit {self.current_unit.unit_id}")
+                    logger.info(f"Completed unit {self._get_current_unit_id()}")
                     self.units_completed += 1
 
                     # Request more work if needed
@@ -713,6 +730,21 @@ class CaptionWorker(BaseWorker):
                         else:
                             logger.error(f"Stage {stage_name} failed for item {item.item_key}")
                             self.items_failed += 1
+                            stage_result = StageResult(
+                                stage_name=stage_name,
+                                output_field=stage.output_field,
+                                outputs=[],
+                                error=f"Failed after {max_attempts} attempts",
+                            )
+                            item.stage_results[stage_name] = stage_result
+                            self.result_queue.put(
+                                {
+                                    "item": item,
+                                    "outputs": {},
+                                    "processing_time_ms": 0.0,
+                                    "error": f"Failed stage {stage_name} after {max_attempts} attempts",
+                                }
+                            )
 
                 # Update for next iteration
                 items_to_process = failed_items
@@ -779,7 +811,7 @@ class CaptionWorker(BaseWorker):
             "processed": self.items_processed,
             "failed": self.items_failed,
             "units_completed": self.units_completed,
-            "current_unit": self.current_unit.unit_id if self.current_unit else None,
+            "current_unit": self._get_current_unit_id() if self.current_unit else None,
             "queue_sizes": {
                 "readahead": self.readahead_queue.qsize(),
                 "inference": self.inference_queue.qsize(),
@@ -829,6 +861,7 @@ class CaptionWorker(BaseWorker):
                             **item.metadata,
                         },
                         processing_time_ms=result_data["processing_time_ms"],
+                        error=result_data.get("error", None),
                     )
 
                     # Send result in format that orchestrator expects
@@ -857,10 +890,7 @@ class CaptionWorker(BaseWorker):
             except Empty:
                 continue
             except Exception as e:
-                import traceback
-
-                logger.error(f"Error sending result: {e}")
-                logger.error(traceback.format_exc())
+                logger.error(f"Error sending result: {e}", exc_info=True)
                 await asyncio.sleep(1)
 
     async def _on_disconnect(self):

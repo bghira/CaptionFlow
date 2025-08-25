@@ -179,7 +179,6 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 )
 
             if units_needed == 0:
-                # logger.debug("No units needed, sleeping for 5 seconds")
                 threading.Event().wait(5)
                 continue
 
@@ -213,51 +212,129 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 # Create work unit
                 if current_shard_url and current_index < current_shard_items:
                     chunk_size = min(self.chunk_size, current_shard_items - current_index)
-                    unit_id = f"{current_shard_name}:chunk:{current_index // chunk_size}"
-
-                    logger.debug(
-                        "Creating work unit: unit_id=%s shard=%s start_index=%d chunk_size=%d",
-                        unit_id,
-                        current_shard_name,
-                        current_index,
-                        chunk_size,
-                    )
-
-                    unit = WorkUnit(
-                        unit_id=unit_id,
-                        chunk_id=unit_id,
-                        source_id=current_shard_name,
-                        data={
-                            "shard_url": current_shard_url,
-                            "start_index": current_index,
-                            "chunk_size": chunk_size,
-                            "unprocessed_ranges": [(current_index, current_index + chunk_size - 1)],
-                        },
-                        metadata={
-                            "shard_name": current_shard_name,
-                            "chunk_index": current_index // self.chunk_size,
-                        },
-                    )
+                    unit_id = f"{current_shard_name}:chunk:{current_index // self.chunk_size}"
 
                     with self.lock:
+                        # Check if this unit already exists in work_units
+                        if unit_id in self.work_units:
+                            logger.debug(
+                                f"Unit {unit_id} already exists in work_units, skipping creation"
+                            )
+                            current_index += self.chunk_size
+                            continue
+
+                        # Check if chunk is already completed or has no unprocessed items
+                        if self.chunk_tracker:
+                            chunk_state = self.chunk_tracker.chunks.get(unit_id)
+
+                            if chunk_state:
+                                # Check if completed
+                                if chunk_state.status == "completed":
+                                    logger.debug(f"Unit {unit_id} already completed, skipping")
+                                    current_index += self.chunk_size
+                                    continue
+
+                                # Check if has unprocessed items
+                                unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+                                if not unprocessed_ranges:
+                                    logger.debug(
+                                        f"Unit {unit_id} has no unprocessed items, skipping"
+                                    )
+                                    current_index += self.chunk_size
+                                    continue
+
+                                # If chunk exists but has unprocessed items, use those ranges
+                                logger.debug(
+                                    f"Existing chunk {unit_id} has unprocessed ranges: {unprocessed_ranges}"
+                                )
+
+                                unit = WorkUnit(
+                                    unit_id=unit_id,
+                                    chunk_id=unit_id,
+                                    source_id=current_shard_name,
+                                    data={
+                                        "shard_url": current_shard_url,
+                                        "start_index": current_index,
+                                        "chunk_size": chunk_size,
+                                        "unprocessed_ranges": [
+                                            (
+                                                r[0] + chunk_state.start_index,
+                                                r[1] + chunk_state.start_index,
+                                            )
+                                            for r in unprocessed_ranges
+                                        ],  # Convert relative to absolute
+                                    },
+                                    metadata={
+                                        "shard_name": current_shard_name,
+                                        "chunk_index": current_index // self.chunk_size,
+                                    },
+                                )
+                            else:
+                                # New chunk
+                                logger.debug(
+                                    "Creating new work unit: unit_id=%s shard=%s start_index=%d chunk_size=%d",
+                                    unit_id,
+                                    current_shard_name,
+                                    current_index,
+                                    chunk_size,
+                                )
+
+                                unit = WorkUnit(
+                                    unit_id=unit_id,
+                                    chunk_id=unit_id,
+                                    source_id=current_shard_name,
+                                    data={
+                                        "shard_url": current_shard_url,
+                                        "start_index": current_index,
+                                        "chunk_size": chunk_size,
+                                        "unprocessed_ranges": [
+                                            (current_index, current_index + chunk_size - 1)
+                                        ],
+                                    },
+                                    metadata={
+                                        "shard_name": current_shard_name,
+                                        "chunk_index": current_index // self.chunk_size,
+                                    },
+                                )
+                        else:
+                            # No chunk tracker, create normally
+                            unit = WorkUnit(
+                                unit_id=unit_id,
+                                chunk_id=unit_id,
+                                source_id=current_shard_name,
+                                data={
+                                    "shard_url": current_shard_url,
+                                    "start_index": current_index,
+                                    "chunk_size": chunk_size,
+                                    "unprocessed_ranges": [
+                                        (current_index, current_index + chunk_size - 1)
+                                    ],
+                                },
+                                metadata={
+                                    "shard_name": current_shard_name,
+                                    "chunk_index": current_index // self.chunk_size,
+                                },
+                            )
+
                         self.work_units[unit_id] = unit
                         self.pending_units.append(unit_id)
                         logger.debug("Added work unit %s to pending_units", unit_id)
 
-                    if self.chunk_tracker:
-                        added_chunk = self.chunk_tracker.add_chunk(
-                            unit_id,
-                            current_shard_name,
-                            current_shard_url,
-                            current_index,
-                            chunk_size,
-                        )
-                        if added_chunk:
-                            logger.debug("Added chunk to chunk_tracker: %s", unit_id)
-                        else:
-                            logger.debug("Chunk already exists in chunk_tracker: %s", unit_id)
+                        if self.chunk_tracker:
+                            added_chunk = self.chunk_tracker.add_chunk(
+                                unit_id,
+                                current_shard_name,
+                                current_shard_url,
+                                current_index,
+                                chunk_size,
+                            )
+                            if added_chunk:
+                                logger.debug("Added chunk to chunk_tracker: %s", unit_id)
+                            else:
+                                logger.debug("Chunk already exists in chunk_tracker: %s", unit_id)
 
-                    units_created += 1
+                        units_created += 1
+
                     current_index += self.chunk_size
 
             if units_created > 0:
@@ -437,7 +514,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                 # Mark ranges as processed
                 for start_idx, end_idx in ranges:
-                    logger.debug(f"Marking chunk as processed: {result}")
+                    logger.debug(f"Marking chunk as processed: {result.to_repr()}")
                     self.chunk_tracker.mark_items_processed(result.chunk_id, start_idx, end_idx)
                     logger.debug(
                         "Marked items processed for unit %s: %d-%d",
