@@ -43,7 +43,7 @@ class Orchestrator:
         # Initialize processor
         if processor_type == "webdataset":
             self.processor = WebDatasetOrchestratorProcessor()
-        elif processor_type == "huggingface":
+        elif processor_type == "huggingface_datasets":
             self.processor = HuggingFaceDatasetOrchestratorProcessor()
         else:
             raise ValueError(f"Unknown processor type: {processor_type}")
