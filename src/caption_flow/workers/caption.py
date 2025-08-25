@@ -276,13 +276,14 @@ class CaptionWorker(BaseWorker):
         # Setup processor
         self.processor_type = welcome_data.get("processor_type", None)
         assert self.processor_type is not None, "Processor type not found in welcome data"
+        logger.info(f"Creating {self.processor_type} processor")
         processor_config = ProcessorConfig(
             processor_type=self.processor_type, config=welcome_data.get("processor_config", {})
         )
 
         if self.processor_type == "webdataset":
             self.processor = WebDatasetWorkerProcessor()
-        elif self.processor_type == "huggingface":
+        elif self.processor_type == "huggingface_datasets":
             self.processor = HuggingFaceDatasetWorkerProcessor()
         else:
             raise ValueError(f"Unknown processor type: {self.processor_type}")
