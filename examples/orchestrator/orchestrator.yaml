@@ -14,7 +14,7 @@ orchestrator:
   chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
   min_chunk_buffer: 10 # Minimum chunks to keep ready
   dataset:
-    type: "huggingface" # or "local"
+    type: "huggingface"
     processor_type: "huggingface" # or "webdataset" for wds format
     dataset_path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
     name: "pixelvision"
