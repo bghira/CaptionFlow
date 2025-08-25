@@ -35,7 +35,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
 
     def __init__(self):
         logger.debug("Initializing LocalFilesystemOrchestratorProcessor")
-        self.root_path: Optional[Path] = None
+        self.dataset_path: Optional[Path] = None
         self.chunk_tracker: Optional[ChunkTracker] = None
         self.chunk_size: int = 1000
         self.recursive: bool = True
@@ -69,10 +69,10 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
 
         # Dataset configuration
         dataset_cfg = cfg.get("dataset", {})
-        self.root_path = Path(dataset_cfg.get("dataset_path", "."))
+        self.dataset_path = Path(dataset_cfg.get("dataset_path", "."))
 
-        if not self.root_path.exists():
-            raise ValueError(f"Dataset path does not exist: {self.root_path}")
+        if not self.dataset_path.exists():
+            raise ValueError(f"Dataset path does not exist: {self.dataset_path}")
 
         self.recursive = dataset_cfg.get("recursive", True)
         self.follow_symlinks = dataset_cfg.get("follow_symlinks", False)
@@ -86,7 +86,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         self.http_host = dataset_cfg.get("http_host", "0.0.0.0")
         self.http_port = dataset_cfg.get("http_port", 8766)
 
-        logger.info(f"Root path: {self.root_path}, recursive: {self.recursive}")
+        logger.info(f"Root path: {self.dataset_path}, recursive: {self.recursive}")
 
         # Initialize chunk tracking
         checkpoint_dir = Path(cfg.get("checkpoint_dir", "./checkpoints"))
@@ -115,7 +115,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
 
         if self.recursive:
             # Walk directory tree
-            for root, dirs, files in os.walk(self.root_path, followlinks=self.follow_symlinks):
+            for root, dirs, files in os.walk(self.dataset_path, followlinks=self.follow_symlinks):
                 root_path = Path(root)
 
                 # Skip hidden directories
@@ -131,7 +131,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                             logger.warning(f"Cannot stat {file_path}: {e}")
         else:
             # Just scan root directory
-            for file_path in self.root_path.iterdir():
+            for file_path in self.dataset_path.iterdir():
                 if file_path.is_file() and any(
                     file_path.suffix.lower() == ext for ext in IMAGE_EXTENSIONS
                 ):
@@ -182,7 +182,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
             """Get dataset info."""
             return {
                 "total_images": self.total_images,
-                "root_path": str(self.root_path),
+                "root_path": str(self.dataset_path),
                 "http_url": f"http://{self.http_host}:{self.http_port}",
             }
 
@@ -243,7 +243,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                             "http_url": f"http://{self.http_host}:{self.http_port}",
                         },
                         metadata={
-                            "dataset": str(self.root_path),
+                            "dataset": str(self.dataset_path),
                             "chunk_index": chunk_index,
                         },
                     )
@@ -306,7 +306,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                             "http_url": f"http://{self.http_host}:{self.http_port}",
                         },
                         metadata={
-                            "dataset": str(self.root_path),
+                            "dataset": str(self.dataset_path),
                             "chunk_index": chunk_id,
                         },
                     )
@@ -316,7 +316,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
 
                     if self.chunk_tracker:
                         self.chunk_tracker.add_chunk(
-                            unit_id, "local", str(self.root_path), self.current_index, chunk_size
+                            unit_id, "local", str(self.dataset_path), self.current_index, chunk_size
                         )
 
                     units_created += 1
@@ -466,7 +466,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         """Get processor statistics."""
         with self.lock:
             stats = {
-                "dataset": str(self.root_path),
+                "dataset": str(self.dataset_path),
                 "total_units": len(self.work_units),
                 "pending_units": len(self.pending_units),
                 "assigned_units": sum(len(units) for units in self.assigned_units.values()),
