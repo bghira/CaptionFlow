@@ -486,15 +486,11 @@ class StorageManager:
 
                 # Write with proper preservation
                 pq.write_table(combined, self.captions_path, compression="snappy")
-
-                logger.info(
-                    f"Added {len(new_rows)} new rows (skipped {num_rows - len(new_rows)} duplicates)"
-                )
+                self.duplicates_skipped = num_rows - len(new_rows)
                 actual_new = len(new_rows)
             else:
                 logger.info(f"All {num_rows} rows were duplicates, exiting")
                 raise SystemError("No duplicates can be submitted")
-                actual_new = 0
         else:
             # Write new file
             pq.write_table(table, self.captions_path, compression="snappy")
@@ -515,8 +511,9 @@ class StorageManager:
             self._log_rates(actual_new)
 
         logger.info(
-            f"Successfully wrote captions (rows: {self.total_captions_written}, "
-            f"total outputs: {self.total_caption_entries_written}, "
+            f"Successfully wrote captions (new rows: {actual_new}, "
+            f"total rows written: {self.total_captions_written}, "
+            f"total captions written: {self.total_caption_entries_written}, "
             f"duplicates skipped: {self.duplicates_skipped})"
         )
 

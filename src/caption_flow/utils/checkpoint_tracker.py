@@ -73,12 +73,12 @@ class CheckpointTracker(ABC):
             logger.debug(f"Saved checkpoint to {self.checkpoint_path}")
 
         except Exception as e:
-            logger.error(f"Error saving checkpoint: {e}", exc_info=True)
+            # logger.error(f"Error saving checkpoint: {e}", exc_info=True)
             # Try direct write as fallback
             try:
                 with open(self.checkpoint_path, "w") as f:
                     json.dump(data, f, indent=2)
-                logger.info("Saved checkpoint using fallback direct write")
+                # logger.info("Saved checkpoint using fallback direct write")
             except Exception as fallback_error:
                 logger.error(f"Fallback save also failed: {fallback_error}")
 

@@ -112,8 +112,14 @@ class Orchestrator:
         asyncio.create_task(self._stats_update_loop())
 
         # Start WebSocket server
+        websocket_logger = logging.getLogger("websockets")
+        websocket_logger.setLevel(logging.WARNING)
         async with websockets.serve(
-            self.handle_connection, self.host, self.port, ssl=self.ssl_context
+            self.handle_connection,
+            self.host,
+            self.port,
+            ssl=self.ssl_context,
+            logger=websocket_logger,
         ):
             logger.info("Orchestrator ready for connections")
             await asyncio.Future()  # Run forever
@@ -163,10 +169,7 @@ class Orchestrator:
                 )
 
         except Exception as e:
-            logger.error(f"Connection error: {e}")
-            import traceback
-
-            logger.error(traceback.format_exc())
+            logger.error(f"Connection error: {e}", exc_info=True)
             await websocket.close()
 
     async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_ticket):

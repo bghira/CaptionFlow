@@ -248,6 +248,19 @@ class CaptionWorker(BaseWorker):
 
     async def _handle_welcome(self, welcome_data: Dict[str, Any]):
         """Handle welcome message from orchestrator."""
+        with self.work_lock:
+            self.assigned_units.clear()
+            self.current_unit = None
+
+        self._clear_queue(self.readahead_queue)
+        self._clear_queue(self.inference_queue)
+        self._clear_queue(self.result_queue)
+
+        # Reset counters
+        self.items_processed = 0
+        self.items_failed = 0
+        self.units_completed = 0
+
         # Setup processor
         self.processor_type = welcome_data.get("processor_type", "webdataset")
         processor_config = ProcessorConfig(
@@ -857,10 +870,7 @@ class CaptionWorker(BaseWorker):
             except Empty:
                 continue
             except Exception as e:
-                import traceback
-
-                logger.error(f"Error sending result: {e}")
-                logger.error(traceback.format_exc())
+                logger.error(f"Error sending result: {e}", exc_info=True)
                 await asyncio.sleep(1)
 
     async def _on_disconnect(self):
