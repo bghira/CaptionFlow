@@ -520,7 +520,7 @@ class CaptionWorker(BaseWorker):
                     self.current_unit = None
 
             except Exception as e:
-                logger.error(f"Error processing unit: {e}")
+                logger.error(f"Error processing unit: {e}", exc_info=True)
                 with self.work_lock:
                     self.current_unit = None
 

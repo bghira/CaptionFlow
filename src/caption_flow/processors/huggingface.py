@@ -24,7 +24,7 @@ from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkU
 from ..utils import ChunkTracker
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
@@ -258,7 +258,6 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             return
 
         all_processed_jobs = storage.get_all_processed_job_ids()
-        chunks_summary = self.chunk_tracker.get_chunks_summary()
 
         with self.lock:
             for chunk_id, chunk_state in self.chunk_tracker.chunks.items():
@@ -291,6 +290,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                         ):
                             shard_ids.append(sid)
 
+                    chunk_index = chunk_state.start_index // self.chunk_size
                     unit = WorkUnit(
                         unit_id=chunk_id,
                         chunk_id=chunk_id,
@@ -306,7 +306,8 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                         },
                         metadata={
                             "dataset": self.dataset_name,
-                            "chunk_index": chunk_state.start_index // self.chunk_size,
+                            "shard_name": f"data-{chunk_index}",
+                            "chunk_index": chunk_index,
                         },
                     )
 
@@ -367,6 +368,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                         ):
                             shard_ids.append(sid)
 
+                    chunk_index = current_index // chunk_size
                     unit = WorkUnit(
                         unit_id=unit_id,
                         chunk_id=unit_id,
@@ -382,7 +384,8 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                         },
                         metadata={
                             "dataset": self.dataset_name,
-                            "chunk_index": current_index // self.chunk_size,
+                            "shard_name": f"data-{chunk_index}",
+                            "chunk_index": chunk_index,
                         },
                     )
 
@@ -492,6 +495,67 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
             if self.chunk_tracker:
                 self.chunk_tracker.release_worker_chunks(worker_id)
+
+    def update_from_storage(self, processed_job_ids: Set[str]) -> None:
+        """Update work units based on what's been processed."""
+        logger.info(f"Updating work units from {len(processed_job_ids)} processed jobs")
+
+        with self.lock:
+            for unit_id, unit in self.work_units.items():
+                # Extract chunk info from unit
+                logger.debug(f"Checking unit {unit_id} for updates")
+                logger.debug(f"Unit data: {unit.data}")
+                logger.debug(f"Unit metadata: {unit.metadata}")
+                start_index = unit.data["start_index"]
+                chunk_size = unit.data["chunk_size"]
+                shard_name = unit.metadata["shard_name"]
+                chunk_index = unit.metadata["chunk_index"]
+
+                # Find processed indices for this chunk
+                processed_indices = []
+                for job_id in processed_job_ids:
+                    # Parse job_id format: "data-0000:chunk:0:idx:42"
+                    parts = job_id.split(":")
+                    if (
+                        len(parts) == 5
+                        and parts[0] == shard_name
+                        and parts[1] == "chunk"
+                        and int(parts[2]) == chunk_index
+                        and parts[3] == "idx"
+                    ):
+
+                        idx = int(parts[4])
+                        if start_index <= idx < start_index + chunk_size:
+                            processed_indices.append(idx)
+
+                if processed_indices:
+                    # Convert to ranges
+                    processed_indices.sort()
+                    processed_ranges = []
+                    start = processed_indices[0]
+                    end = processed_indices[0]
+
+                    for idx in processed_indices[1:]:
+                        if idx == end + 1:
+                            end = idx
+                        else:
+                            processed_ranges.append((start, end))
+                            start = idx
+                            end = idx
+
+                    processed_ranges.append((start, end))
+
+                    # Calculate unprocessed ranges
+                    total_range = [(start_index, start_index + chunk_size - 1)]
+                    unprocessed_ranges = self._subtract_ranges(total_range, processed_ranges)
+
+                    # Update unit
+                    unit.data["unprocessed_ranges"] = unprocessed_ranges
+
+                    logger.debug(
+                        f"Updated unit {unit_id}: {len(processed_indices)} processed, "
+                        f"unprocessed ranges: {unprocessed_ranges}"
+                    )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get processor statistics."""
