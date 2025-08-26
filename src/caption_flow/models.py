@@ -95,6 +95,8 @@ class Caption:
     image_height: Optional[int] = None
     image_format: Optional[str] = None
     file_size: Optional[int] = None
+    filename: Optional[str] = None
+    url: Optional[str] = None
 
     # Processing metadata
     caption_index: Optional[int] = None  # Which caption this is (0, 1, 2...)

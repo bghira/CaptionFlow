@@ -75,6 +75,8 @@ class StorageManager:
             ("chunk_id", pa.string()),
             ("item_key", pa.string()),
             ("item_index", pa.int32()),
+            ("filename", pa.string()),
+            ("url", pa.string()),
             ("caption_count", pa.int32()),
             ("contributor_id", pa.string()),
             ("timestamp", pa.timestamp("us")),

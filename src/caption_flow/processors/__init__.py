@@ -8,3 +8,4 @@ from .base import (
 )
 from .huggingface import HuggingFaceDatasetOrchestratorProcessor, HuggingFaceDatasetWorkerProcessor
 from .webdataset import WebDatasetOrchestratorProcessor, WebDatasetWorkerProcessor
+from .local_filesystem import LocalFilesystemOrchestratorProcessor, LocalFilesystemWorkerProcessor

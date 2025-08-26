@@ -17,9 +17,15 @@ from .storage import StorageManager
 from .models import Caption, Contributor, JobId
 from .utils.auth import AuthManager
 from .utils.json_utils import safe_json_dumps
-from .processors.base import ProcessorConfig, WorkAssignment, WorkResult, WorkUnit
-from .processors.webdataset import WebDatasetOrchestratorProcessor
-from .processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
+from .processors import (
+    ProcessorConfig,
+    WorkAssignment,
+    WorkResult,
+    WorkUnit,
+    WebDatasetOrchestratorProcessor,
+    HuggingFaceDatasetOrchestratorProcessor,
+    LocalFilesystemOrchestratorProcessor,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -45,6 +51,8 @@ class Orchestrator:
             self.processor = WebDatasetOrchestratorProcessor()
         elif processor_type == "huggingface_datasets":
             self.processor = HuggingFaceDatasetOrchestratorProcessor()
+        elif processor_type == "local_filesystem":
+            self.processor = LocalFilesystemOrchestratorProcessor()
         else:
             raise ValueError(f"Unknown processor type: {processor_type}")
 
@@ -391,6 +399,8 @@ class Orchestrator:
         # Create caption record for storage
         total_outputs = sum(len(v) for v in result.outputs.values())
 
+        filename = result.metadata.pop("_filename", None)
+        url = result.metadata.pop("_url", None)
         image_height = result.metadata.pop("image_height", None)
         image_width = result.metadata.pop("image_width", None)
         file_size = result.metadata.pop("file_size", None)
@@ -416,6 +426,8 @@ class Orchestrator:
             metadata=result.metadata,
             image_height=image_height,
             image_width=image_width,
+            filename=filename,
+            url=url,
             file_size=file_size,
             image_format=image_format,
         )

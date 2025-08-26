@@ -14,13 +14,13 @@ orchestrator:
   chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
   min_chunk_buffer: 10 # Minimum chunks to keep ready
   dataset:
-    type: "huggingface" # or "local"
+    type: "huggingface"
     processor_type: "huggingface_webdataset"
     dataset_path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
     name: "pixelvision"
     version: "1.0"
     split: "images"
-    image_column: "full_image_url"
+    dataset_url_column: "full_image_url"
 
   # vLLM configuration - distributed to all workers
   vllm:

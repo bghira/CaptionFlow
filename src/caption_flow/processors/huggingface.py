@@ -788,11 +788,9 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                         "_job_id": job_id,
                         "_shard_id": shard_id,
                         "_local_index": local_idx,
+                        "_url": image_url,
                     }
                 )
-
-                if image_url:
-                    clean_metadata["_source_url"] = image_url
 
                 yield {
                     "image": image,
