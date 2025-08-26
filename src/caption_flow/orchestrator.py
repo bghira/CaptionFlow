@@ -399,6 +399,8 @@ class Orchestrator:
         # Create caption record for storage
         total_outputs = sum(len(v) for v in result.outputs.values())
 
+        filename = result.metadata.pop("_filename", None)
+        url = result.metadata.pop("_url", None)
         image_height = result.metadata.pop("image_height", None)
         image_width = result.metadata.pop("image_width", None)
         file_size = result.metadata.pop("file_size", None)
@@ -424,6 +426,7 @@ class Orchestrator:
             metadata=result.metadata,
             image_height=image_height,
             image_width=image_width,
+            filename=filename,
             file_size=file_size,
             image_format=image_format,
         )

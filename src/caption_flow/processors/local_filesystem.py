@@ -630,8 +630,7 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
                     "_item_index": idx,
                     "_chunk_relative_index": idx - start_index,
                     "_job_id": job_id,
-                    "_path": filename,
-                    "_filename": Path(filename).stem,
+                    "_filename": filename,
                 }
 
                 yield {
