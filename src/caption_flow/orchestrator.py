@@ -427,6 +427,7 @@ class Orchestrator:
             image_height=image_height,
             image_width=image_width,
             filename=filename,
+            url=url,
             file_size=file_size,
             image_format=image_format,
         )
