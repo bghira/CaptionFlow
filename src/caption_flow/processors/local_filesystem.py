@@ -238,6 +238,15 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                 if unprocessed_ranges:
                     # Create work unit for unprocessed items
                     chunk_index = chunk_state.start_index // self.chunk_size
+
+                    # Get filenames for this chunk
+                    filenames = {}
+                    for idx in range(
+                        chunk_state.start_index, chunk_state.start_index + chunk_state.chunk_size
+                    ):
+                        if idx < len(self.all_images):
+                            filenames[idx] = self.all_images[idx][0].name
+
                     unit = WorkUnit(
                         unit_id=chunk_id,
                         chunk_id=chunk_id,
@@ -247,6 +256,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                             "chunk_size": chunk_state.chunk_size,
                             "unprocessed_ranges": unprocessed_ranges,
                             "http_url": f"http://{self.http_public_address}:{self.http_port}",
+                            "filenames": filenames,
                         },
                         metadata={
                             "dataset": str(self.dataset_path),
@@ -299,6 +309,12 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                             self.current_index += self.chunk_size
                             continue
 
+                    # Get filenames for this chunk
+                    filenames = {}
+                    for idx in range(self.current_index, self.current_index + chunk_size):
+                        if idx < len(self.all_images):
+                            filenames[idx] = self.all_images[idx][0].name
+
                     unit = WorkUnit(
                         unit_id=unit_id,
                         chunk_id=unit_id,
@@ -310,6 +326,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                                 (self.current_index, self.current_index + chunk_size - 1)
                             ],
                             "http_url": f"http://{self.http_public_address}:{self.http_port}",
+                            "filenames": filenames,
                         },
                         metadata={
                             "dataset": str(self.dataset_path),
@@ -557,6 +574,7 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
             "unprocessed_ranges", [(start_index, start_index + chunk_size - 1)]
         )
         http_url = unit.data.get("http_url")
+        filenames = unit.data.get("filenames", {})
 
         logger.info(f"Processing unit {unit.unit_id} with ranges: {unprocessed_ranges}")
 
@@ -573,6 +591,7 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
         for idx in sorted(indices_to_process):
             try:
                 image = None
+                filename = filenames.get(str(idx), f"image_{idx}")
 
                 if self.dataset_path and self.image_paths:
                     # Direct file access
@@ -580,6 +599,7 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
                         file_path, _ = self.image_paths[idx]
                         if file_path.exists():
                             image = Image.open(file_path)
+                            filename = file_path.name
                             logger.debug(f"Loaded image from local path: {file_path}")
                         else:
                             logger.warning(f"Local file not found: {file_path}")
@@ -610,6 +630,8 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
                     "_item_index": idx,
                     "_chunk_relative_index": idx - start_index,
                     "_job_id": job_id,
+                    "_path": filename,
+                    "_filename": Path(filename).stem,
                 }
 
                 yield {
