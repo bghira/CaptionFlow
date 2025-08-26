@@ -13,6 +13,7 @@ from pyarrow import fs
 import pandas as pd
 from collections import defaultdict, deque
 import time
+import numpy as np
 
 from .models import Job, Caption, Contributor, JobStatus, JobId
 
@@ -113,6 +114,63 @@ class StorageManager:
                 ("trust_level", pa.int32()),
             ]
         )
+
+    def _is_column_empty(self, df: pd.DataFrame, column_name: str) -> bool:
+        """Check if a column is entirely empty, null, or contains only zeros/empty lists."""
+        if column_name not in df.columns:
+            return True
+
+        col = df[column_name]
+
+        # Check if all values are null/NaN
+        if col.isna().all():
+            return True
+
+        # For numeric columns, check if all non-null values are 0
+        if pd.api.types.is_numeric_dtype(col):
+            non_null_values = col.dropna()
+            if len(non_null_values) > 0 and (non_null_values == 0).all():
+                return True
+
+        # For list columns, check if all are None or empty lists
+        if col.dtype == "object":
+            non_null_values = col.dropna()
+            if len(non_null_values) == 0:
+                return True
+            # Check if all non-null values are empty lists
+            all_empty_lists = True
+            for val in non_null_values:
+                if isinstance(val, list) and len(val) > 0:
+                    all_empty_lists = False
+                    break
+                elif not isinstance(val, list):
+                    all_empty_lists = False
+                    break
+            if all_empty_lists:
+                return True
+
+        return False
+
+    def _get_non_empty_columns(
+        self, df: pd.DataFrame, preserve_base_fields: bool = True
+    ) -> List[str]:
+        """Get list of columns that contain actual data.
+
+        Args:
+            df: DataFrame to check
+            preserve_base_fields: If True, always include base fields even if empty
+        """
+        base_field_names = {field[0] for field in self.base_caption_fields}
+        non_empty_columns = []
+
+        for col in df.columns:
+            # Always keep base fields if preserve_base_fields is True
+            if preserve_base_fields and col in base_field_names:
+                non_empty_columns.append(col)
+            elif not self._is_column_empty(df, col):
+                non_empty_columns.append(col)
+
+        return non_empty_columns
 
     def _calculate_rates(self) -> Dict[str, float]:
         """Calculate row addition rates over different time windows."""
@@ -299,9 +357,14 @@ class StorageManager:
         if "outputs" in df.columns:
             df = df.drop(columns=["outputs"])
 
-        # Update known fields and schema
-        self.known_output_fields = output_fields
-        self.caption_schema = self._build_caption_schema(output_fields)
+        # Remove empty columns before saving (but preserve base fields)
+        non_empty_columns = self._get_non_empty_columns(df, preserve_base_fields=True)
+        df = df[non_empty_columns]
+
+        # Update known fields and schema based on non-empty columns
+        base_field_names = {field[0] for field in self.base_caption_fields}
+        self.known_output_fields = set(non_empty_columns) - base_field_names
+        self.caption_schema = self._build_caption_schema(self.known_output_fields)
 
         # Write migrated table
         migrated_table = pa.Table.from_pandas(df, schema=self.caption_schema)
@@ -414,24 +477,6 @@ class StorageManager:
 
         logger.debug(f"Flushing {num_rows} rows with {total_outputs} total outputs to disk")
 
-        # Check if we need to evolve the schema
-        current_schema_fields = set(self.caption_schema.names) if self.caption_schema else set()
-        all_fields_needed = set(
-            self.base_caption_fields[i][0] for i in range(len(self.base_caption_fields))
-        )
-        all_fields_needed.update(self.known_output_fields)
-
-        if all_fields_needed != current_schema_fields:
-            # Schema evolution needed
-            logger.debug(
-                f"Evolving schema to include new fields: {all_fields_needed - current_schema_fields}"
-            )
-            self.caption_schema = self._build_caption_schema(self.known_output_fields)
-
-            # If file exists, we need to migrate it
-            if self.captions_path.exists():
-                await self._evolve_schema_on_disk()
-
         # Prepare data with all required columns
         prepared_buffer = []
         for row in self.caption_buffer:
@@ -449,9 +494,9 @@ class StorageManager:
 
             prepared_buffer.append(prepared_row)
 
-        # Create table from buffer
-        # logger.debug(f"Creating table from {prepared_buffer} prepared buffer with {self.caption_schema} schema")
-        table = pa.Table.from_pylist(prepared_buffer, schema=self.caption_schema)
+        # Build schema with all known fields (base + output)
+        schema = self._build_caption_schema(self.known_output_fields)
+        table = pa.Table.from_pylist(prepared_buffer, schema=schema)
 
         if self.captions_path.exists():
             # Read existing table
@@ -464,7 +509,6 @@ class StorageManager:
             new_rows = []
             duplicate_rows = []
             for row in prepared_buffer:
-                # logger.debug(f"Inspecting prepared buffer row: {row}")
                 if row["job_id"] not in existing_job_ids:
                     new_rows.append(row)
                 elif row not in duplicate_rows:
@@ -479,22 +523,24 @@ class StorageManager:
 
             if duplicate_rows:
                 logger.info(f"Example duplicate row: {duplicate_rows[0]}")
+
             if new_rows:
                 # Create table from new rows only
-                new_table = pa.Table.from_pylist(new_rows, schema=self.caption_schema)
+                new_table = pa.Table.from_pylist(new_rows, schema=schema)
 
-                # Combine tables
-                combined = pa.concat_tables([existing, new_table])
+                # Concatenate with promote_options="default" to handle schema differences automatically
+                combined = pa.concat_tables([existing, new_table], promote_options="default")
 
-                # Write with proper preservation
+                # Write combined table
                 pq.write_table(combined, self.captions_path, compression="snappy")
+
                 self.duplicates_skipped = num_rows - len(new_rows)
                 actual_new = len(new_rows)
             else:
                 logger.info(f"All {num_rows} rows were duplicates, exiting")
                 raise SystemError("No duplicates can be submitted")
         else:
-            # Write new file
+            # Write new file with all fields
             pq.write_table(table, self.captions_path, compression="snappy")
             actual_new = num_rows
 
@@ -516,11 +562,95 @@ class StorageManager:
             f"Successfully wrote captions (new rows: {actual_new}, "
             f"total rows written: {self.total_captions_written}, "
             f"total captions written: {self.total_caption_entries_written}, "
-            f"duplicates skipped: {self.duplicates_skipped})"
+            f"duplicates skipped: {self.duplicates_skipped}, "
+            f"output fields: {sorted(list(self.known_output_fields))})"
         )
 
+    async def optimize_storage(self):
+        """Optimize storage by dropping empty columns. Run this periodically or on-demand."""
+        if not self.captions_path.exists():
+            logger.info("No captions file to optimize")
+            return
+
+        logger.info("Starting storage optimization...")
+
+        # Read the full table
+        table = pq.read_table(self.captions_path)
+        df = table.to_pandas()
+        original_columns = len(df.columns)
+
+        # Find non-empty columns (don't preserve empty base fields)
+        non_empty_columns = self._get_non_empty_columns(df, preserve_base_fields=False)
+
+        # Always keep at least job_id
+        if "job_id" not in non_empty_columns:
+            non_empty_columns.append("job_id")
+
+        if len(non_empty_columns) < original_columns:
+            # We have columns to drop
+            df_optimized = df[non_empty_columns]
+
+            # Rebuild schema for non-empty columns only
+            base_field_names = {f[0] for f in self.base_caption_fields}
+            fields = []
+            output_fields = set()
+
+            # Process columns in a consistent order: base fields first, then output fields
+            for col in non_empty_columns:
+                if col in base_field_names:
+                    # Find the base field definition
+                    for fname, ftype in self.base_caption_fields:
+                        if fname == col:
+                            fields.append((fname, ftype))
+                            break
+                else:
+                    # Output field
+                    output_fields.add(col)
+
+            # Add output fields in sorted order
+            for field_name in sorted(output_fields):
+                fields.append((field_name, pa.list_(pa.string())))
+
+            # Create optimized schema and table
+            optimized_schema = pa.schema(fields)
+            optimized_table = pa.Table.from_pandas(df_optimized, schema=optimized_schema)
+
+            # Backup the original file (optional)
+            backup_path = self.captions_path.with_suffix(".parquet.bak")
+            import shutil
+
+            shutil.copy2(self.captions_path, backup_path)
+
+            # Write optimized table
+            pq.write_table(optimized_table, self.captions_path, compression="snappy")
+
+            # Update known output fields
+            self.known_output_fields = output_fields
+
+            # Clean up backup (optional - keep it for safety)
+            # backup_path.unlink()
+
+            logger.info(
+                f"Storage optimization complete: {original_columns} -> {len(non_empty_columns)} columns. "
+                f"Removed columns: {sorted(set(df.columns) - set(non_empty_columns))}"
+            )
+        else:
+            logger.info(f"No optimization needed - all {original_columns} columns contain data")
+
+        # Report file size reduction
+        import os
+
+        if backup_path and backup_path.exists():
+            original_size = os.path.getsize(backup_path)
+            new_size = os.path.getsize(self.captions_path)
+            reduction_pct = (1 - new_size / original_size) * 100
+            logger.info(
+                f"File size: {original_size/1024/1024:.1f}MB -> {new_size/1024/1024:.1f}MB "
+                f"({reduction_pct:.1f}% reduction)"
+            )
+
     async def _evolve_schema_on_disk(self):
-        """Evolve the schema of the existing parquet file to include new columns."""
+        """Evolve the schema of the existing parquet file to include new columns, removing empty ones."""
         logger.info("Evolving schema on disk to add new columns...")
 
         # Read existing data
@@ -533,10 +663,23 @@ class StorageManager:
                 df[field_name] = None
                 logger.info(f"Added new column: {field_name}")
 
+        # Remove empty columns (but preserve base fields)
+        non_empty_columns = self._get_non_empty_columns(df, preserve_base_fields=True)
+        df = df[non_empty_columns]
+
+        # Update known output fields
+        base_field_names = {field[0] for field in self.base_caption_fields}
+        self.known_output_fields = set(non_empty_columns) - base_field_names
+
+        # Recreate schema with only non-empty fields
+        self.caption_schema = self._build_caption_schema(self.known_output_fields)
+
         # Recreate table with new schema
         evolved_table = pa.Table.from_pandas(df, schema=self.caption_schema)
         pq.write_table(evolved_table, self.captions_path, compression="snappy")
-        logger.info("Schema evolution complete")
+        logger.info(
+            f"Schema evolution complete. Active output fields: {sorted(list(self.known_output_fields))}"
+        )
 
     async def save_contributor(self, contributor: Contributor):
         """Save or update contributor stats - buffers until batch size reached."""
