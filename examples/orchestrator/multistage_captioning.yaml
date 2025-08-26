@@ -20,7 +20,7 @@ orchestrator:
     name: "pixelvision"
     version: "1.0"
     split: "images"
-    image_column: "full_image_url"
+    dataset_url_column: "full_image_url"
 
   # vLLM configuration - distributed to all workers
   vllm:

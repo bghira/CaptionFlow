@@ -15,9 +15,8 @@ orchestrator:
     processor_type: "local_filesystem"
     dataset_path: "/Volumes/ml/datasets/geo" # HF dataset path or local directory
     name: "National Geographic"
-    # for remote workers, these may be necessary.
-    http_bind_address: "0.0.0.0" # if you need to use a specific local binding
-    public_address: "your-system.dyndns.org" # your public IP or hostname
+    http_bind_address: "0.0.0.0"
+    public_address: "your.hostname.address" # your public IP
 
   # vLLM configuration - distributed to all workers
   vllm:
