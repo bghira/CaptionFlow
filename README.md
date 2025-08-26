@@ -25,12 +25,14 @@ pip install -e .  # installs the `caption-flow` command
 1. copy + edit the sample configs
 
 ```bash
-cp orchestrator.yaml my-orchestrator.yaml
-cp worker.yaml my-worker.yaml
-cp monitor.yaml my-monitor.yaml   # optional; requires a monitor module
+cp examples/orchestrator/local_image_files.yaml my-orchestrator.yaml
+cp examples/worker.yaml my-worker.yaml
+cp examples/monitor.yaml my-monitor.yaml   # optional terminal interface
 ```
 
-set a unique shared token in both `my-orchestrator.yaml` and `my-worker.yaml` (see `auth.worker_tokens` in the orchestrator config and `worker.token` in the worker config). if you use private hugging face datasets/models, export `HUGGINGFACE_HUB_TOKEN` before starting workers.
+set a unique shared token in both `my-orchestrator.yaml` and `my-worker.yaml` (see `auth.worker_tokens` in the orchestrator config and `worker.token` in the worker config).
+
+if you use private hugging face datasets/models, export `HUGGINGFACE_HUB_TOKEN` before starting anything.
 
 2. start the orchestrator
 
@@ -46,18 +48,15 @@ caption-flow worker --config my-worker.yaml --gpu-id 0
 
 # your second GPU
 caption-flow worker --config my-worker.yaml --gpu-id 1
+
+# on a remote host
+caption-flow worker --config my-worker.yaml --server ws://your.hostname.address:8765
 ```
 
 4. (optional) start the monitor
 
 ```bash
 caption-flow monitor --config my-monitor.yaml
-```
-
-5. (optional) scan/fix chunks on disk if you had crashes
-
-```bash
-caption-flow scan_chunks --data-dir ./caption_data --checkpoint-dir ./checkpoints --fix
 ```
 
 ---
@@ -134,7 +133,7 @@ orchestrator:
   #   key:  /path/privkey.pem
 
   dataset:
-    type: huggingface   # or "local"
+    type: huggingface
     path: <hf-dataset-or-local-path>
     name: <logical-name>
     version: "1.0"
@@ -271,28 +270,31 @@ PRs welcome. keep it simple and fast.
 ## Storage Schema
 
 ### captions.parquet
+
 - `job_id`: Unique job identifier
-- `dataset`: Dataset name
-- `shard`: Shard identifier
-- `item_key`: Item within shard
-- `caption`: Generated caption text
-- `contributor_id`: Worker who generated it
-- `timestamp`: Generation time
-- `quality_score`: Optional quality metric
+* `dataset`: Dataset name
+* `shard`: Shard identifier
+* `item_key`: Item within shard
+* `caption`: Generated caption text
+* `contributor_id`: Worker who generated it
+* `timestamp`: Generation time
+* `quality_score`: Optional quality metric
 
 ### jobs.parquet
+
 - `job_id`: Unique identifier
-- `dataset`: Dataset name
-- `shard`: Shard identifier
-- `status`: pending/processing/completed/failed
-- `assigned_to`: Worker ID
-- `timestamp`: Status change time
+* `dataset`: Dataset name
+* `shard`: Shard identifier
+* `status`: pending/processing/completed/failed
+* `assigned_to`: Worker ID
+* `timestamp`: Status change time
 
 ### contributors.parquet
+
 - `contributor_id`: Unique identifier
-- `name`: Display name
-- `total_captions`: Lifetime count
-- `trust_level`: Quality tier (0-5)
+* `name`: Display name
+* `total_captions`: Lifetime count
+* `trust_level`: Quality tier (0-5)
 
 ## Development
 
