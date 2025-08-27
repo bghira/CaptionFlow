@@ -640,7 +640,9 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
 @click.option("--data-dir", default="./caption_data", help="Storage directory")
 @click.option(
     "--format",
-    type=click.Choice(["jsonl", "json", "csv", "txt", "all"], case_sensitive=False),
+    type=click.Choice(
+        ["jsonl", "json", "csv", "txt", "huggingface_hub", "all"], case_sensitive=False
+    ),
     default="jsonl",
     help="Export format (default: jsonl)",
 )
@@ -655,6 +657,11 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
     "--optimize", is_flag=True, help="Optimize storage before export (remove empty columns)"
 )
 @click.option("--verbose", is_flag=True, help="Show detailed export progress")
+@click.option("--hf-dataset", help="Dataset name on HF Hub (e.g., username/dataset-name)")
+@click.option("--license", help="License for the dataset (required for new HF datasets)")
+@click.option("--private", is_flag=True, help="Make HF dataset private")
+@click.option("--nsfw", is_flag=True, help="Add not-for-all-audiences tag")
+@click.option("--tags", help="Comma-separated tags for HF dataset")
 def export(
     data_dir: str,
     format: str,
@@ -667,11 +674,15 @@ def export(
     stats_only: bool,
     optimize: bool,
     verbose: bool,
+    hf_dataset: Optional[str],
+    license: Optional[str],
+    private: bool,
+    nsfw: bool,
+    tags: Optional[str],
 ):
     """Export caption data to various formats."""
     from .storage import StorageManager
-    from .storage.exporter import StorageExporter
-    from .models import ExportError
+    from .storage.exporter import StorageExporter, ExportError
 
     # Initialize storage manager
     storage_path = Path(data_dir)
@@ -733,7 +744,7 @@ def export(
             contents.rows = [
                 row
                 for row in contents.rows
-                if row.get(export_column).all()
+                if row.get(export_column)
                 and (not isinstance(row[export_column], list) or len(row[export_column]) > 0)
             ]
             filtered_count = original_count - len(contents.rows)
@@ -816,6 +827,39 @@ def export(
                     files = exporter.to_txt(output_dir, filename_column, export_column)
                     console.print(f"[green]✓ Created {files:,} text files[/green]")
 
+                elif format == "huggingface_hub":
+                    # Validate required parameters
+                    if not hf_dataset:
+                        console.print(
+                            "[red]Error: --hf-dataset required for huggingface_hub format[/red]"
+                        )
+                        console.print(
+                            "[dim]Example: --hf-dataset username/my-caption-dataset[/dim]"
+                        )
+                        sys.exit(1)
+
+                    # Parse tags
+                    tag_list = None
+                    if tags:
+                        tag_list = [tag.strip() for tag in tags.split(",")]
+
+                    console.print(f"\n[cyan]Uploading to Hugging Face Hub:[/cyan] {hf_dataset}")
+                    if private:
+                        console.print("[dim]Privacy: Private dataset[/dim]")
+                    if nsfw:
+                        console.print("[dim]Content: Not for all audiences[/dim]")
+                    if tag_list:
+                        console.print(f"[dim]Tags: {', '.join(tag_list)}[/dim]")
+
+                    url = exporter.to_huggingface_hub(
+                        dataset_name=hf_dataset,
+                        license=license,
+                        private=private,
+                        nsfw=nsfw,
+                        tags=tag_list,
+                    )
+                    console.print(f"[green]✓ Dataset uploaded to: {url}[/green]")
+
             except ExportError as e:
                 console.print(f"[red]Export error: {e}[/red]")
                 sys.exit(1)
@@ -835,9 +879,10 @@ def export(
         sys.exit(1)
     except Exception as e:
         console.print(f"[red]Unexpected error: {e}[/red]")
-        import traceback
+        if verbose:
+            import traceback
 
-        traceback.print_exc()
+            traceback.print_exc()
         sys.exit(1)
 
 

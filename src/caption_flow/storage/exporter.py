@@ -292,3 +292,259 @@ class StorageExporter:
 
         logger.info(f"Created {files_created} text files in: {output_dir}")
         return files_created
+
+    def to_huggingface_hub(
+        self,
+        dataset_name: str,
+        token: Optional[str] = None,
+        license: Optional[str] = None,
+        private: bool = False,
+        nsfw: bool = False,
+        tags: Optional[List[str]] = None,
+        language: str = "en",
+        task_categories: Optional[List[str]] = None,
+    ) -> str:
+        """Export to Hugging Face Hub as a dataset.
+
+        Args:
+            dataset_name: Name for the dataset (e.g., "username/dataset-name")
+            token: Hugging Face API token
+            license: License for the dataset (required for new repos)
+            private: Whether to make the dataset private
+            nsfw: Whether to add not-for-all-audiences tag
+            tags: Additional tags for the dataset
+            language: Language code (default: "en")
+            task_categories: Task categories (default: ["text-to-image", "image-to-image"])
+
+        Returns:
+            URL of the uploaded dataset
+        """
+        try:
+            from huggingface_hub import HfApi, DatasetCard, create_repo
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            raise ExportError(
+                "huggingface_hub and pyarrow are required for HF export. "
+                "Install with: pip install huggingface_hub pyarrow"
+            )
+
+        # Initialize HF API
+        api = HfApi(token=token)
+
+        # Check if repo exists
+        repo_exists = False
+        try:
+            api.dataset_info(dataset_name)
+            repo_exists = True
+            logger.info(f"Dataset {dataset_name} already exists, will update it")
+        except:
+            logger.info(f"Creating new dataset: {dataset_name}")
+            if not license:
+                raise ExportError("License is required when creating a new dataset")
+
+        # Create repo if it doesn't exist
+        if not repo_exists:
+            create_repo(repo_id=dataset_name, repo_type="dataset", private=private, token=token)
+
+        # Prepare data for parquet
+        df = pd.DataFrame(self.contents.rows)
+
+        # Convert any remaining non-serializable types
+        for col in df.columns:
+            if df[col].dtype == "object":
+                df[col] = df[col].apply(
+                    lambda x: self._serialize_value(x) if x is not None else None
+                )
+
+        # Determine size category
+        num_rows = len(df)
+        if num_rows < 1000:
+            size_category = "n<1K"
+        elif num_rows < 10000:
+            size_category = "1K<n<10K"
+        elif num_rows < 100000:
+            size_category = "10K<n<100K"
+        elif num_rows < 1000000:
+            size_category = "100K<n<1M"
+        elif num_rows < 10000000:
+            size_category = "1M<n<10M"
+        else:
+            size_category = "n>10M"
+
+        # Prepare tags
+        all_tags = tags or []
+        if nsfw:
+            all_tags.append("not-for-all-audiences")
+
+        # Default task categories
+        if task_categories is None:
+            task_categories = ["text-to-image", "image-to-image"]
+
+        # Create dataset card
+        card_content = f"""---
+license: {license or 'unknown'}
+language:
+- {language}
+size_categories:
+- {size_category}
+task_categories:
+{self._yaml_list(task_categories)}"""
+
+        if all_tags:
+            card_content += f"\ntags:\n{self._yaml_list(all_tags)}"
+
+        card_content += f"""
+---
+
+# Caption Dataset
+
+This dataset contains {num_rows:,} captioned items exported from CaptionFlow.
+
+## Dataset Structure
+
+### Data Fields
+
+"""
+
+        # Add field descriptions
+        for col in df.columns:
+            dtype = str(df[col].dtype)
+            if col in self.contents.output_fields:
+                card_content += f"- `{col}`: List of captions/outputs\n"
+            else:
+                card_content += f"- `{col}`: {dtype}\n"
+
+        if self.contents.metadata:
+            card_content += "\n## Export Information\n\n"
+            if "export_timestamp" in self.contents.metadata:
+                card_content += (
+                    f"- Export timestamp: {self.contents.metadata['export_timestamp']}\n"
+                )
+            if "field_stats" in self.contents.metadata:
+                card_content += "\n### Field Statistics\n\n"
+                for field, stats in self.contents.metadata["field_stats"].items():
+                    card_content += f"- `{field}`: {stats['total_items']:,} items across {stats['rows_with_data']:,} rows\n"
+
+        # Create temporary parquet file
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp_file:
+            temp_path = Path(tmp_file.name)
+
+        try:
+            # Write parquet file
+            table = pa.Table.from_pandas(df)
+            pq.write_table(table, temp_path, compression="snappy")
+
+            # Upload parquet file
+            api.upload_file(
+                path_or_fileobj=str(temp_path),
+                path_in_repo="data.parquet",
+                repo_id=dataset_name,
+                repo_type="dataset",
+                token=token,
+            )
+
+            # Create and upload dataset card
+            card = DatasetCard(card_content)
+            card.push_to_hub(dataset_name, token=token)
+
+            dataset_url = f"https://huggingface.co/datasets/{dataset_name}"
+            logger.info(f"Successfully uploaded dataset to: {dataset_url}")
+
+            return dataset_url
+
+        finally:
+            # Clean up temp file
+            if temp_path.exists():
+                temp_path.unlink()
+
+    def _yaml_list(self, items: List[str]) -> str:
+        """Format a list for YAML."""
+        return "\n".join(f"- {item}" for item in items)
+
+
+# Addition to StorageManager class
+async def get_storage_contents(
+    self,
+    limit: Optional[int] = None,
+    columns: Optional[List[str]] = None,
+    include_metadata: bool = True,
+) -> StorageContents:
+    """Retrieve storage contents for export.
+
+    Args:
+        limit: Maximum number of rows to retrieve
+        columns: Specific columns to include (None for all)
+        include_metadata: Whether to include metadata in the result
+
+    Returns:
+        StorageContents instance with the requested data
+    """
+    if not self.captions_path.exists():
+        return StorageContents(
+            rows=[],
+            columns=[],
+            output_fields=list(self.known_output_fields),
+            total_rows=0,
+            metadata={"message": "No captions file found"},
+        )
+
+    # Flush buffers first to ensure all data is on disk
+    await self.checkpoint()
+
+    # Determine columns to read
+    if columns:
+        # Validate requested columns exist
+        table_metadata = pq.read_metadata(self.captions_path)
+        available_columns = set(table_metadata.schema.names)
+        invalid_columns = set(columns) - available_columns
+        if invalid_columns:
+            raise ValueError(f"Columns not found: {invalid_columns}")
+        columns_to_read = columns
+    else:
+        # Read all columns
+        columns_to_read = None
+
+    # Read the table
+    table = pq.read_table(self.captions_path, columns=columns_to_read)
+    df = table.to_pandas()
+
+    # Apply limit if specified
+    if limit:
+        df = df.head(limit)
+
+    # Convert to list of dicts
+    rows = df.to_dict("records")
+
+    # Parse metadata JSON strings back to dicts if present
+    if "metadata" in df.columns:
+        for row in rows:
+            if row.get("metadata"):
+                try:
+                    row["metadata"] = json.loads(row["metadata"])
+                except:
+                    pass  # Keep as string if parsing fails
+
+    # Prepare metadata
+    metadata = {}
+    if include_metadata:
+        stats = await self.get_caption_stats()
+        metadata.update(
+            {
+                "export_timestamp": pd.Timestamp.now().isoformat(),
+                "total_available_rows": stats.get("total_rows", 0),
+                "rows_exported": len(rows),
+                "storage_path": str(self.captions_path),
+                "field_stats": stats.get("field_stats", {}),
+            }
+        )
+
+    return StorageContents(
+        rows=rows,
+        columns=list(df.columns),
+        output_fields=list(self.known_output_fields),
+        total_rows=len(df),
+        metadata=metadata,
+    )
