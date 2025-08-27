@@ -367,6 +367,63 @@ def monitor(
         sys.exit(1)
 
 
+# Add this command after the export command in cli.py
+
+
+@main.command()
+@click.option("--data-dir", default="./caption_data", help="Storage directory")
+@click.option("--refresh-rate", default=10, type=int, help="Display refresh rate (Hz)")
+@click.option("--no-images", is_flag=True, help="Disable image preview")
+@click.pass_context
+def view(ctx, data_dir: str, refresh_rate: int, no_images: bool):
+    """Browse captioned dataset with interactive TUI viewer."""
+    from .viewer import DatasetViewer
+
+    data_path = Path(data_dir)
+
+    if not data_path.exists():
+        console.print(f"[red]Storage directory not found: {data_dir}[/red]")
+        sys.exit(1)
+
+    if not (data_path / "captions.parquet").exists():
+        console.print(f"[red]No captions file found in {data_dir}[/red]")
+        console.print("[yellow]Have you exported any captions yet?[/yellow]")
+        sys.exit(1)
+
+    # Check for term-image if images are enabled
+    if not no_images:
+        try:
+            import term_image
+        except ImportError:
+            console.print("[yellow]Warning: term-image not installed[/yellow]")
+            console.print("Install with: pip install term-image")
+            console.print("Running without image preview...")
+            no_images = True
+
+    try:
+        viewer = DatasetViewer(data_path)
+        if no_images:
+            viewer.disable_images = True
+        viewer.refresh_rate = refresh_rate
+
+        console.print(f"[cyan]Starting dataset viewer...[/cyan]")
+        console.print(f"[dim]Data directory: {data_path}[/dim]")
+
+        asyncio.run(viewer.run())
+
+    except FileNotFoundError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Viewer closed[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)
+
+
 @main.command()
 @click.option("--config", type=click.Path(exists=True), help="Configuration file")
 @click.option("--server", help="Orchestrator WebSocket URL")
