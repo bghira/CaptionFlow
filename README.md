@@ -7,7 +7,6 @@ a fast websocket-based orchestrator paired with lightweight gpu workers achieves
 * **orchestrator**: hands out work in chunked shards, collects captions, checkpoints progress, and keeps simple stats.
 * **workers (vLLM)**: connect to the orchestrator, stream in image samples, batch them, and generate 1..N captions per image using prompts supplied by the orchestrator.
 * **config-driven**: all components read YAML config; flags can override.
-* **tui monitor (optional)**: a monitor client is wired into the CLI; ship a `monitor` module to enable it.
 
 > no conda. just `venv` + `pip`.
 
