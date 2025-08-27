@@ -189,3 +189,29 @@ class ProcessedResult:
     file_size: int
     processing_time_ms: float
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StorageContents:
+    """Container for storage data to be exported."""
+
+    rows: List[Dict[str, Any]]
+    columns: List[str]
+    output_fields: List[str]
+    total_rows: int
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Validate data consistency."""
+        if self.rows and self.columns:
+            # Ensure all rows have the expected columns
+            for row in self.rows:
+                missing_cols = set(self.columns) - set(row.keys())
+                if missing_cols:
+                    logger.warning(f"Row missing columns: {missing_cols}")
+
+
+class ExportError(Exception):
+    """Base exception for export-related errors."""
+
+    pass

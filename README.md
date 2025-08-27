@@ -1,6 +1,8 @@
 # CaptionFlow
 
-scalable, fault-tolerant **vLLM-powered image captioning**. this "first round" focuses on a fast websocket orchestrator plus lightweight gpu workers that batch requests through vLLM.
+scalable, fault-tolerant **vLLM-powered image captioning**.
+
+a fast websocket-based orchestrator paired with lightweight gpu workers achieves exceptional performance for batched requests through vLLM.
 
 * **orchestrator**: hands out work in chunked shards, collects captions, checkpoints progress, and keeps simple stats.
 * **workers (vLLM)**: connect to the orchestrator, stream in image samples, batch them, and generate 1..N captions per image using prompts supplied by the orchestrator.
@@ -59,6 +61,25 @@ caption-flow worker --config my-worker.yaml --server ws://your.hostname.address:
 caption-flow monitor --config my-monitor.yaml
 ```
 
+5. export the data
+
+```bash
+% caption-flow export --help                                                                                                                                      
+Usage: caption-flow export [OPTIONS]
+
+  Export caption data to various formats.
+
+Options:
+  --format [jsonl|json|csv|txt|huggingface_hub|all] Export format (default: jsonl)
+```
+
+* **jsonl**: create JSON line file in the specified `--output` path
+* **csv**: exports CSV-compatible data columns to the `--output` path containing incomplete metadata
+* **json**: creates a `.json` file for each sample inside the `--output` subdirectory containing **complete** metadata; useful for webdatasets
+* **txt**: creates `.txt` file for each sample inside the `--output` subdirectory containing ONLY captions
+* **huggingface_hub**: creates a dataset on Hugging Face Hub, possibly `--private` and `--nsfw` where necessary
+* **all**: creates all export formats in a specified `--output` directory
+
 ---
 
 ## how it’s wired
@@ -67,19 +88,10 @@ caption-flow monitor --config my-monitor.yaml
 
 * **websocket server** (default `0.0.0.0:8765`) with three client roles: workers, data-feeders, and admin.
 * **dataset control**: the orchestrator centrally defines the dataset (`huggingface` or `local`) and version/name. it chunk-slices shards and assigns work.
+* **data serving to remote workers**: local files can be captioned by remote workers that don't have access to the same files, automatically.
 * **vLLM config broadcast**: model, tp size, dtype, max seq len, memory targets, batching, sampling params, and **inference prompts** are all pushed to workers; workers can apply many changes without a model reload.
 * **storage + checkpoints**: captions buffer to disk with periodic checkpoints. chunk state is tracked so restarts don’t double-work.
 * **auth**: token lists for `worker`, `monitor`, and `admin` roles.
-
-start flags you’ll likely use:
-
-```text
---config PATH                # yaml config for the orchestrator
---port INT, --host STR       # bind controls
---data-dir PATH              # overrides storage.data_dir
---cert PATH, --key PATH      # enable TLS (or use --no-ssl for ws:// in dev)
---vllm                       # use the vLLM-style orchestrator (webdataset/hf)
-```
 
 ### vLLM worker
 
@@ -88,27 +100,15 @@ start flags you’ll likely use:
 * **resilient**: detects disconnects, abandons the current chunk cleanly, clears queues, reconnects, and resumes.
 * **batched generate()**: images are resized down for consistent batching; each image can get multiple captions (one per prompt).
 
-start flags you’ll likely use:
-
-```text
---config PATH                 # yaml for the worker
---server URL                  # ws(s)://host:port
---token STR                   # must match an allowed worker token on the orchestrator
---name STR                    # display name
---batch-size INT              # override vLLM batch size
---vllm                        # use the vLLM worker implementation
---gpu-id INT                  # which gpu to use
---precision STR, --model STR  # optional overrides for dtype/model
---no-verify-ssl               # accept self-signed certs in dev
-```
-
-### (optional) monitor
-
-* a CLI entry exists for a TUI monitor; wire in a `monitor` module to enable it. config lives in `monitor.yaml` or inside `orchestrator.yaml` under `monitor:`.
-
 ---
 
-## configuration
+## dataset formats
+
+* huggingface hub or local based URL list datasets that are compatible with the datasets library
+* webdatasets shards containing full image data; also can be hosted on the hub
+* local folder filled with images; orchestrator will serve the data to workers
+
+## configuration path
 
 ### config discovery order
 
@@ -121,98 +121,6 @@ for any component, the CLI looks for config in this order (first match wins):
 5. `/etc/caption-flow/<component>.yaml`
 6. any `$XDG_CONFIG_DIRS` entries under `caption-flow/`
 7. `./examples/<component>.yaml` (fallback)
-
-### orchestrator.yaml (highlights)
-
-```yaml
-orchestrator:
-  host: 0.0.0.0
-  port: 8765
-  # ssl:
-  #   cert: /path/fullchain.pem
-  #   key:  /path/privkey.pem
-
-  dataset:
-    type: huggingface
-    path: <hf-dataset-or-local-path>
-    name: <logical-name>
-    version: "1.0"
-
-  vllm:
-    model: Qwen/Qwen2.5-VL-3B-Instruct
-    tensor_parallel_size: 1
-    max_model_len: 16384
-    dtype: float16
-    gpu_memory_utilization: 0.92
-    enforce_eager: true
-    disable_mm_preprocessor_cache: true
-    limit_mm_per_prompt: { image: 1 }
-
-    batch_size: 8
-
-    sampling:
-      temperature: 0.7
-      top_p: 0.95
-      max_tokens: 256
-      repetition_penalty: 1.05
-      skip_special_tokens: true
-      stop: ["<|end|>", "<|endoftext|>", "<|im_end|>"]
-
-    inference_prompts:
-      - "describe this image in detail"
-      - "provide a comprehensive description of the visual content"
-      - "what are the key elements in this image?"
-
-  storage:
-    data_dir: ./caption_data
-    checkpoint_dir: ./checkpoints
-    caption_buffer_size: 100
-    checkpoint_interval: 1000
-
-  # chunking/queueing
-  chunk_size: 1000
-  chunks_per_request: 2
-  chunk_buffer_multiplier: 3
-  min_chunk_buffer: 10
-
-  auth:
-    worker_tokens:
-      - { token: "example-worker-token", name: "Example Worker" }
-    monitor_tokens:
-      - { token: "letmein", name: "Default monitor" }
-    admin_tokens:
-      - { token: "admin-secret-2024", name: "Admin" }
-```
-
-### worker.yaml (highlights)
-
-```yaml
-worker:
-  server: ws://localhost:8765   # use wss:// in prod
-  token: example-worker-token
-  name: local-gpu
-  gpu_id: 0
-  vllm: true
-
-  # local queues
-  readahead_size: 256
-  inference_queue_size: 128
-```
-
-### monitor.yaml (optional)
-
-```yaml
-monitor:
-  server: ws://localhost:8765
-  token: letmein
-  refresh_rate: 1.0
-  show_contributors: true
-  show_quality_metrics: true
-  max_activity_items: 20
-  show_chunk_progress: true
-  show_worker_queues: true
-  show_throughput_graph: true
-```
 
 ---
 
@@ -256,66 +164,24 @@ PRs welcome. keep it simple and fast.
 ```
 ┌─────────────┐     WebSocket      ┌─────────────┐
 │   Worker    │◄──────────────────►│             │
-└─────────────┘                    │             │     ┌──────────────┐
-                                   │ Orchestrator│────►│Arrow/Parquet │
-┌─────────────┐                    │             │     │   Storage    │
-│   Worker    │◄──────────────────►│             │     └──────────────┘
-└─────────────┘                    └─────────────┘
+│             │                    │             │     ┌──────────────┐
+│             │◄───────────────────│             │────►│Arrow/Parquet │
+└─────────────┘   HTTP (img data)  │ Orchestrator│     │   Storage    │
+                                   │             │     └──────────────┘
+┌─────────────┐                    │             │
+│   Worker    │◄──────────────────►│             │
+│             │                    │             │
+│             │◄───────────────────│             │
+└─────────────┘   HTTP (img data)  └─────────────┘
                                            ▲
 ┌─────────────┐                           │
 │   Monitor   │◄──────────────────────────┘
 └─────────────┘
 ```
 
-## Storage Schema
+## Community Clusters
 
-### captions.parquet
-
-- `job_id`: Unique job identifier
-* `dataset`: Dataset name
-* `shard`: Shard identifier
-* `item_key`: Item within shard
-* `caption`: Generated caption text
-* `contributor_id`: Worker who generated it
-* `timestamp`: Generation time
-* `quality_score`: Optional quality metric
-
-### jobs.parquet
-
-- `job_id`: Unique identifier
-* `dataset`: Dataset name
-* `shard`: Shard identifier
-* `status`: pending/processing/completed/failed
-* `assigned_to`: Worker ID
-* `timestamp`: Status change time
-
-### contributors.parquet
-
-- `contributor_id`: Unique identifier
-* `name`: Display name
-* `total_captions`: Lifetime count
-* `trust_level`: Quality tier (0-5)
-
-## Development
-
-```bash
-# Install with dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Format code
-black src/
-ruff --fix src/
-
-# Type checking
-mypy src/
-```
-
-## Community Contribution
-
-To contribute compute:
+To contribute compute to a cluster:
 
 1. Install caption-flow: `pip install caption-flow`
 2. Get a worker token from the project maintainer
@@ -325,4 +191,4 @@ Your contributions will be tracked and attributed in the final dataset!
 
 ## License
 
-MIT
+AGPLv3

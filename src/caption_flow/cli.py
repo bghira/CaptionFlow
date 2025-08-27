@@ -637,6 +637,256 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
 
 
 @main.command()
+@click.option("--data-dir", default="./caption_data", help="Storage directory")
+@click.option(
+    "--format",
+    type=click.Choice(
+        ["jsonl", "json", "csv", "txt", "huggingface_hub", "all"], case_sensitive=False
+    ),
+    default="jsonl",
+    help="Export format (default: jsonl)",
+)
+@click.option("--output", "-o", help="Output path (file for jsonl/csv, directory for json/txt)")
+@click.option("--limit", type=int, help="Limit number of rows to export")
+@click.option("--columns", help="Comma-separated list of columns to export (default: all)")
+@click.option("--export-column", default="captions", help="Column to export for txt format")
+@click.option("--filename-column", default="filename", help="Column containing filenames")
+@click.option("--include-empty", is_flag=True, help="Include rows with empty export column")
+@click.option("--stats-only", is_flag=True, help="Show statistics without exporting")
+@click.option(
+    "--optimize", is_flag=True, help="Optimize storage before export (remove empty columns)"
+)
+@click.option("--verbose", is_flag=True, help="Show detailed export progress")
+@click.option("--hf-dataset", help="Dataset name on HF Hub (e.g., username/dataset-name)")
+@click.option("--license", help="License for the dataset (required for new HF datasets)")
+@click.option("--private", is_flag=True, help="Make HF dataset private")
+@click.option("--nsfw", is_flag=True, help="Add not-for-all-audiences tag")
+@click.option("--tags", help="Comma-separated tags for HF dataset")
+def export(
+    data_dir: str,
+    format: str,
+    output: Optional[str],
+    limit: Optional[int],
+    columns: Optional[str],
+    export_column: str,
+    filename_column: str,
+    include_empty: bool,
+    stats_only: bool,
+    optimize: bool,
+    verbose: bool,
+    hf_dataset: Optional[str],
+    license: Optional[str],
+    private: bool,
+    nsfw: bool,
+    tags: Optional[str],
+):
+    """Export caption data to various formats."""
+    from .storage import StorageManager
+    from .storage.exporter import StorageExporter, ExportError
+
+    # Initialize storage manager
+    storage_path = Path(data_dir)
+    if not storage_path.exists():
+        console.print(f"[red]Storage directory not found: {data_dir}[/red]")
+        sys.exit(1)
+
+    storage = StorageManager(storage_path)
+
+    async def run_export():
+        await storage.initialize()
+
+        # Show statistics first
+        stats = await storage.get_caption_stats()
+        console.print("\n[bold cyan]Storage Statistics:[/bold cyan]")
+        console.print(f"[green]Total rows:[/green] {stats['total_rows']:,}")
+        console.print(f"[green]Total outputs:[/green] {stats['total_outputs']:,}")
+        console.print(f"[green]Output fields:[/green] {', '.join(stats['output_fields'])}")
+
+        if stats.get("field_stats"):
+            console.print("\n[cyan]Field breakdown:[/cyan]")
+            for field, field_stat in stats["field_stats"].items():
+                console.print(
+                    f"  • {field}: {field_stat['total_items']:,} items "
+                    f"in {field_stat['rows_with_data']:,} rows"
+                )
+
+        if stats_only:
+            return
+
+        # Optimize storage if requested
+        if optimize:
+            console.print("\n[yellow]Optimizing storage (removing empty columns)...[/yellow]")
+            await storage.optimize_storage()
+
+        # Prepare columns list
+        column_list = None
+        if columns:
+            column_list = [col.strip() for col in columns.split(",")]
+            console.print(f"\n[cyan]Exporting columns:[/cyan] {', '.join(column_list)}")
+
+        # Get storage contents
+        console.print("\n[yellow]Loading data...[/yellow]")
+        try:
+            contents = await storage.get_storage_contents(
+                limit=limit, columns=column_list, include_metadata=True
+            )
+        except ValueError as e:
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+        if not contents.rows:
+            console.print("[yellow]No data to export![/yellow]")
+            return
+
+        # Filter out empty rows if not including empty
+        if not include_empty and format in ["txt", "json"]:
+            original_count = len(contents.rows)
+            contents.rows = [
+                row
+                for row in contents.rows
+                if row.get(export_column)
+                and (not isinstance(row[export_column], list) or len(row[export_column]) > 0)
+            ]
+            filtered_count = original_count - len(contents.rows)
+            if filtered_count > 0:
+                console.print(f"[dim]Filtered {filtered_count} empty rows[/dim]")
+
+        # Create exporter
+        exporter = StorageExporter(contents)
+
+        # Determine output paths
+        if format == "all":
+            # Export to all formats
+            base_name = output or "caption_export"
+            base_path = Path(base_name)
+
+            formats_exported = []
+
+            # JSONL
+            jsonl_path = base_path.with_suffix(".jsonl")
+            console.print(f"\n[cyan]Exporting to JSONL:[/cyan] {jsonl_path}")
+            rows = exporter.to_jsonl(jsonl_path)
+            formats_exported.append(f"JSONL: {rows:,} rows")
+
+            # CSV
+            csv_path = base_path.with_suffix(".csv")
+            console.print(f"[cyan]Exporting to CSV:[/cyan] {csv_path}")
+            try:
+                rows = exporter.to_csv(csv_path)
+                formats_exported.append(f"CSV: {rows:,} rows")
+            except ExportError as e:
+                console.print(f"[yellow]Skipping CSV: {e}[/yellow]")
+
+            # JSON files
+            json_dir = base_path.parent / f"{base_path.stem}_json"
+            console.print(f"[cyan]Exporting to JSON files:[/cyan] {json_dir}/")
+            try:
+                files = exporter.to_json(json_dir, filename_column)
+                formats_exported.append(f"JSON: {files:,} files")
+            except ExportError as e:
+                console.print(f"[yellow]Skipping JSON files: {e}[/yellow]")
+
+            # Text files
+            txt_dir = base_path.parent / f"{base_path.stem}_txt"
+            console.print(f"[cyan]Exporting to text files:[/cyan] {txt_dir}/")
+            try:
+                files = exporter.to_txt(txt_dir, filename_column, export_column)
+                formats_exported.append(f"Text: {files:,} files")
+            except ExportError as e:
+                console.print(f"[yellow]Skipping text files: {e}[/yellow]")
+
+            console.print(f"\n[green]✓ Export complete![/green]")
+            for fmt in formats_exported:
+                console.print(f"  • {fmt}")
+
+        else:
+            # Single format export
+            try:
+                if format == "jsonl":
+                    output_path = output or "captions.jsonl"
+                    console.print(f"\n[cyan]Exporting to JSONL:[/cyan] {output_path}")
+                    rows = exporter.to_jsonl(output_path)
+                    console.print(f"[green]✓ Exported {rows:,} rows[/green]")
+
+                elif format == "csv":
+                    output_path = output or "captions.csv"
+                    console.print(f"\n[cyan]Exporting to CSV:[/cyan] {output_path}")
+                    rows = exporter.to_csv(output_path)
+                    console.print(f"[green]✓ Exported {rows:,} rows[/green]")
+
+                elif format == "json":
+                    output_dir = output or "./json_output"
+                    console.print(f"\n[cyan]Exporting to JSON files:[/cyan] {output_dir}/")
+                    files = exporter.to_json(output_dir, filename_column)
+                    console.print(f"[green]✓ Created {files:,} JSON files[/green]")
+
+                elif format == "txt":
+                    output_dir = output or "./txt_output"
+                    console.print(f"\n[cyan]Exporting to text files:[/cyan] {output_dir}/")
+                    console.print(f"[dim]Export column: {export_column}[/dim]")
+                    files = exporter.to_txt(output_dir, filename_column, export_column)
+                    console.print(f"[green]✓ Created {files:,} text files[/green]")
+
+                elif format == "huggingface_hub":
+                    # Validate required parameters
+                    if not hf_dataset:
+                        console.print(
+                            "[red]Error: --hf-dataset required for huggingface_hub format[/red]"
+                        )
+                        console.print(
+                            "[dim]Example: --hf-dataset username/my-caption-dataset[/dim]"
+                        )
+                        sys.exit(1)
+
+                    # Parse tags
+                    tag_list = None
+                    if tags:
+                        tag_list = [tag.strip() for tag in tags.split(",")]
+
+                    console.print(f"\n[cyan]Uploading to Hugging Face Hub:[/cyan] {hf_dataset}")
+                    if private:
+                        console.print("[dim]Privacy: Private dataset[/dim]")
+                    if nsfw:
+                        console.print("[dim]Content: Not for all audiences[/dim]")
+                    if tag_list:
+                        console.print(f"[dim]Tags: {', '.join(tag_list)}[/dim]")
+
+                    url = exporter.to_huggingface_hub(
+                        dataset_name=hf_dataset,
+                        license=license,
+                        private=private,
+                        nsfw=nsfw,
+                        tags=tag_list,
+                    )
+                    console.print(f"[green]✓ Dataset uploaded to: {url}[/green]")
+
+            except ExportError as e:
+                console.print(f"[red]Export error: {e}[/red]")
+                sys.exit(1)
+
+        # Show export metadata
+        if verbose and contents.metadata:
+            console.print("\n[dim]Export metadata:[/dim]")
+            console.print(f"  Timestamp: {contents.metadata.get('export_timestamp')}")
+            console.print(f"  Total available: {contents.metadata.get('total_available_rows'):,}")
+            console.print(f"  Rows exported: {contents.metadata.get('rows_exported'):,}")
+
+    # Run the async export
+    try:
+        asyncio.run(run_export())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Export cancelled[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error: {e}[/red]")
+        if verbose:
+            import traceback
+
+            traceback.print_exc()
+        sys.exit(1)
+
+
+@main.command()
 @click.option("--domain", help="Domain for Let's Encrypt certificate")
 @click.option("--email", help="Email for Let's Encrypt registration")
 @click.option("--self-signed", is_flag=True, help="Generate self-signed certificate")

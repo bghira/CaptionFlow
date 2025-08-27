@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 import time
 import numpy as np
 
-from .models import Job, Caption, Contributor, JobStatus, JobId
+from ..models import Job, Caption, Contributor, StorageContents, JobId
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -575,6 +575,7 @@ class StorageManager:
         logger.info("Starting storage optimization...")
 
         # Read the full table
+        backup_path = None
         table = pq.read_table(self.captions_path)
         df = table.to_pandas()
         original_columns = len(df.columns)
@@ -789,6 +790,89 @@ class StorageManager:
                 job_ids.add(row["job_id"])
 
         return job_ids
+
+    async def get_storage_contents(
+        self,
+        limit: Optional[int] = None,
+        columns: Optional[List[str]] = None,
+        include_metadata: bool = True,
+    ) -> StorageContents:
+        """Retrieve storage contents for export.
+
+        Args:
+            limit: Maximum number of rows to retrieve
+            columns: Specific columns to include (None for all)
+            include_metadata: Whether to include metadata in the result
+
+        Returns:
+            StorageContents instance with the requested data
+        """
+        if not self.captions_path.exists():
+            return StorageContents(
+                rows=[],
+                columns=[],
+                output_fields=list(self.known_output_fields),
+                total_rows=0,
+                metadata={"message": "No captions file found"},
+            )
+
+        # Flush buffers first to ensure all data is on disk
+        await self.checkpoint()
+
+        # Determine columns to read
+        if columns:
+            # Validate requested columns exist
+            table_metadata = pq.read_metadata(self.captions_path)
+            available_columns = set(table_metadata.schema.names)
+            invalid_columns = set(columns) - available_columns
+            if invalid_columns:
+                raise ValueError(f"Columns not found: {invalid_columns}")
+            columns_to_read = columns
+        else:
+            # Read all columns
+            columns_to_read = None
+
+        # Read the table
+        table = pq.read_table(self.captions_path, columns=columns_to_read)
+        df = table.to_pandas()
+
+        # Apply limit if specified
+        if limit:
+            df = df.head(limit)
+
+        # Convert to list of dicts
+        rows = df.to_dict("records")
+
+        # Parse metadata JSON strings back to dicts if present
+        if "metadata" in df.columns:
+            for row in rows:
+                if row.get("metadata"):
+                    try:
+                        row["metadata"] = json.loads(row["metadata"])
+                    except:
+                        pass  # Keep as string if parsing fails
+
+        # Prepare metadata
+        metadata = {}
+        if include_metadata:
+            stats = await self.get_caption_stats()
+            metadata.update(
+                {
+                    "export_timestamp": pd.Timestamp.now().isoformat(),
+                    "total_available_rows": stats.get("total_rows", 0),
+                    "rows_exported": len(rows),
+                    "storage_path": str(self.captions_path),
+                    "field_stats": stats.get("field_stats", {}),
+                }
+            )
+
+        return StorageContents(
+            rows=rows,
+            columns=list(df.columns),
+            output_fields=list(self.known_output_fields),
+            total_rows=len(df),
+            metadata=metadata,
+        )
 
     async def get_processed_jobs_for_chunk(self, chunk_id: str) -> Set[str]:
         """Get all processed job_ids for a given chunk."""
