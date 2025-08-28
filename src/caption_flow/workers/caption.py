@@ -198,8 +198,8 @@ class CaptionWorker(BaseWorker):
         self.current_unit: Optional[WorkUnit] = None
 
         # Processing queues
-        self.readahead_queue = Queue(maxsize=256)
-        self.inference_queue = Queue(maxsize=128)
+        self.readahead_queue = Queue(maxsize=2560)
+        self.inference_queue = Queue(maxsize=2048)
         self.result_queue = Queue()
 
         # Processing control
@@ -539,11 +539,13 @@ class CaptionWorker(BaseWorker):
                     with self.work_lock:
                         queue_size = len(self.assigned_units)
 
-                    if queue_size < 2 and self.websocket and self.main_loop:
+                    if queue_size < self.units_per_request and self.websocket and self.main_loop:
                         try:
                             asyncio.run_coroutine_threadsafe(
                                 self.websocket.send(
-                                    json.dumps({"type": "get_work_units", "count": 2})
+                                    json.dumps(
+                                        {"type": "get_work_units", "count": self.units_per_request}
+                                    )
                                 ),
                                 self.main_loop,
                             ).result(timeout=5)
@@ -581,6 +583,8 @@ class CaptionWorker(BaseWorker):
                     image_data=item_data.get("image_data", b""),
                     metadata=item_data.get("metadata", {}),
                 )
+                if "_processed_indices" in item_data:
+                    context["_processed_indices"] = item_data.pop("_processed_indices", [])
 
                 # Add to readahead queue
                 timeout_end = time.time() + 30
@@ -625,7 +629,7 @@ class CaptionWorker(BaseWorker):
                     self.main_loop,
                 ).result(timeout=5)
 
-        logger.info(f"Unit {unit.unit_id} processed {items_processed} items")
+        logger.info(f"Unit {unit.unit_id} processed {items_processed} items: {context}")
 
     def _batch_for_inference(self):
         """Batch items from readahead queue for inference."""
