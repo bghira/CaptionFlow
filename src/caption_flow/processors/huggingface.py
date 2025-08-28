@@ -313,6 +313,10 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 # Only add incomplete chunks to pending
                 if chunk_state.status != "completed":
                     self.pending_units.append(chunk_id)
+                elif chunk_state.status == "completed" and chunk_state.processed_ranges:
+                    logger.warning(
+                        f"Chunk {chunk_id} has processed_ranges stored in the checkpoint."
+                    )
 
             self.current_chunk_index = max_chunk_index + 1
             logger.info(f"Resuming from chunk index {self.current_chunk_index}")
@@ -598,6 +602,11 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
         self.url_column = self.dataset_config.get("dataset_url_column", "image_url")
         self.dataset_path = self.dataset_config.get("dataset_path", None)
 
+        # Add mock results flag
+        self.mock_results = self.dataset_config.get("mock_results", False)
+        if self.mock_results:
+            logger.info("Mock results mode enabled - will generate dummy images")
+
     def _get_shard_path(self, dataset_name: str, shard_filename: str) -> str:
         """Get local path for a shard, downloading if needed."""
         return hf_hub_download(
@@ -611,9 +620,33 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
             return match.group(1)
         return url.split("/")[-1]
 
+    def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image.Image:
+        """Create a dummy image with some visual indication of the index."""
+        # Create a simple colored image with the index written on it
+        import numpy as np
+        from PIL import ImageDraw, ImageFont
+
+        # Use different colors based on index for visual variety
+        colors = [
+            (255, 200, 200),  # Light red
+            (200, 255, 200),  # Light green
+            (200, 200, 255),  # Light blue
+            (255, 255, 200),  # Light yellow
+            (255, 200, 255),  # Light magenta
+            (200, 255, 255),  # Light cyan
+        ]
+
+        color = colors[index % len(colors)]
+
+        # Create image
+        width, height = 8, 8  # Common size for ML datasets
+        image = Image.new("RGB", (width, height), color=color)
+
+        return image
+
     def process_unit(self, unit: WorkUnit, context: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         """Process a work unit, yielding items to be captioned."""
-        logger.debug("Processing unit: %s", unit.unit_id)
+        logger.debug("Processing unit: %s (mock_results=%s)", unit.unit_id, self.mock_results)
         log_memory(f"start processing unit {unit.unit_id}")
 
         dataset_name = unit.data["dataset_name"]
@@ -728,22 +761,42 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                             image = None
                             image_url = None
 
-                            if self.url_column and self.url_column in item:
-                                image_url = item[self.url_column]
-                                try:
-                                    response = requests.get(image_url, timeout=30)
-                                    response.raise_for_status()
-                                    image = Image.open(io.BytesIO(response.content))
-                                except Exception as e:
-                                    logger.error(f"Error downloading image from {image_url}: {e}")
-                                    continue
+                            if self.mock_results:
+                                # In mock mode, create a dummy image
+                                logger.debug(f"Creating mock image for index {global_idx}")
 
-                            elif self.image_column and self.image_column in item:
-                                image_data = item[self.image_column]
-                                if isinstance(image_data, dict) and "bytes" in image_data:
-                                    image = Image.open(io.BytesIO(image_data["bytes"]))
-                                elif isinstance(image_data, bytes):
-                                    image = Image.open(io.BytesIO(image_data))
+                                # Still extract URL if available for metadata
+                                if self.url_column and self.url_column in item:
+                                    image_url = item[self.url_column]
+
+                                # Create dummy image with metadata context
+                                image = self._create_dummy_image(
+                                    global_idx,
+                                    {
+                                        "_shard_id": shard_id,
+                                        "_local_index": local_idx,
+                                    },
+                                )
+                            else:
+                                # Normal processing - load real images
+                                if self.url_column and self.url_column in item:
+                                    image_url = item[self.url_column]
+                                    try:
+                                        response = requests.get(image_url, timeout=30)
+                                        response.raise_for_status()
+                                        image = Image.open(io.BytesIO(response.content))
+                                    except Exception as e:
+                                        logger.error(
+                                            f"Error downloading image from {image_url}: {e}"
+                                        )
+                                        continue
+
+                                elif self.image_column and self.image_column in item:
+                                    image_data = item[self.image_column]
+                                    if isinstance(image_data, dict) and "bytes" in image_data:
+                                        image = Image.open(io.BytesIO(image_data["bytes"]))
+                                    elif isinstance(image_data, bytes):
+                                        image = Image.open(io.BytesIO(image_data))
 
                             if image is None:
                                 logger.warning(f"No image found for item at index {global_idx}")
@@ -775,6 +828,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                     "_shard_id": shard_id,
                                     "_local_index": local_idx,
                                     "_url": image_url,
+                                    "_mock": self.mock_results,  # Add flag to indicate mock data
                                 }
                             )
 
@@ -784,6 +838,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                 "item_index": global_idx,
                                 "metadata": clean_metadata,
                                 "job_id": job_id,
+                                "_processed_indices": processed_indices,
                             }
 
                             processed_indices.append(global_idx)
@@ -800,10 +855,9 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
 
         # Store processed indices in context
         context["_processed_indices"] = processed_indices
-        logger.debug("Processed indices for unit %s: %s", unit.unit_id, len(processed_indices))
-
-        # Force garbage collection
-        gc.collect()
+        logger.debug(
+            f"Processed {len(processed_indices)} indices for unit {unit.unit_id}: {processed_indices}, {context}"
+        )
         log_memory(f"end processing unit {unit.unit_id}")
 
     def prepare_result(
