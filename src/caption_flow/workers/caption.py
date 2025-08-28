@@ -297,7 +297,7 @@ class CaptionWorker(BaseWorker):
 
         self.processor.initialize(processor_config)
         self.dataset_path = self.processor.dataset_path
-        self.units_per_request = processor_config.get("chunks_per_request", 1)
+        self.units_per_request = processor_config.config.get("chunks_per_request", 1)
 
         # Update vLLM config if provided
         new_vllm_config = welcome_data.get("processor_config", {}).get("vllm")
