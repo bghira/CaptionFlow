@@ -297,6 +297,7 @@ class CaptionWorker(BaseWorker):
 
         self.processor.initialize(processor_config)
         self.dataset_path = self.processor.dataset_path
+        self.units_per_request = processor_config.get("chunks_per_request", 1)
 
         # Update vLLM config if provided
         new_vllm_config = welcome_data.get("processor_config", {}).get("vllm")
@@ -309,7 +310,7 @@ class CaptionWorker(BaseWorker):
 
         # Request initial work
         if self.websocket:
-            await self.websocket.send(json.dumps({"type": "request_work", "count": 2}))
+            await self.websocket.send(json.dumps({"type": "get_work_units", "count": 2}))
 
     async def _handle_message(self, data: Dict[str, Any]):
         """Handle message from orchestrator."""
@@ -327,7 +328,7 @@ class CaptionWorker(BaseWorker):
             await asyncio.sleep(10)
 
             if self.websocket and self.connected.is_set():
-                await self.websocket.send(json.dumps({"type": "request_work", "count": 2}))
+                await self.websocket.send(json.dumps({"type": "get_work_units", "count": 2}))
 
     def _parse_stages_config(self, vllm_config: Dict[str, Any]) -> List[ProcessingStage]:
         """Parse stages configuration from vLLM config."""
@@ -517,7 +518,7 @@ class CaptionWorker(BaseWorker):
                         try:
                             asyncio.run_coroutine_threadsafe(
                                 self.websocket.send(
-                                    json.dumps({"type": "request_work", "count": 2})
+                                    json.dumps({"type": "get_work_units", "count": 2})
                                 ),
                                 self.main_loop,
                             ).result(timeout=5)
