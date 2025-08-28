@@ -355,7 +355,8 @@ class Orchestrator:
 
                 logger.debug(f"Assigned {len(units)} work units to worker {worker_id}")
             else:
-                await self.workers[worker_id].send(safe_json_dumps({"type": "no_work"}))
+                if worker_id in self.workers:
+                    await self.workers[worker_id].send(safe_json_dumps({"type": "no_work"}))
 
         elif msg_type == "work_complete":
             unit_id = data["unit_id"]
@@ -378,7 +379,6 @@ class Orchestrator:
         """Process results submission from worker."""
         # Extract user from worker_id
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
-
         # Create work result
         _job_id = data.get("job_id")
         job_id = JobId.from_str(_job_id)
@@ -882,23 +882,23 @@ class Orchestrator:
             await asyncio.sleep(10)
 
             # Update rate tracking
-            # storage_stats = await self.storage.get_storage_stats()
-            # current_total = storage_stats["total_captions"]
-            # current_time = time.time()
+            storage_stats = await self.storage.get_storage_stats()
+            current_total = storage_stats["total_captions"]
+            current_time = time.time()
 
-            # elapsed = current_time - self.rate_tracker["last_update_time"]
-            # if elapsed > 0:
-            #     output_diff = current_total - self.rate_tracker["last_output_count"]
-            #     self.rate_tracker["current_rate"] = (output_diff / elapsed) * 60
-            #     self.rate_tracker["last_output_count"] = current_total
-            #     self.rate_tracker["last_update_time"] = current_time
+            elapsed = current_time - self.rate_tracker["last_update_time"]
+            if elapsed > 0:
+                output_diff = current_total - self.rate_tracker["last_output_count"]
+                self.rate_tracker["current_rate"] = (output_diff / elapsed) * 60
+                self.rate_tracker["last_output_count"] = current_total
+                self.rate_tracker["last_update_time"] = current_time
 
-            #     # Average rate since start
-            #     total_elapsed = current_time - self.rate_tracker["start_time"]
-            #     if total_elapsed > 0:
-            #         self.rate_tracker["average_rate"] = (current_total / total_elapsed) * 60
+                # Average rate since start
+                total_elapsed = current_time - self.rate_tracker["start_time"]
+                if total_elapsed > 0:
+                    self.rate_tracker["average_rate"] = (current_total / total_elapsed) * 60
 
-            # await self._broadcast_stats()
+            await self._broadcast_stats()
 
     async def shutdown(self):
         """Graceful shutdown."""
