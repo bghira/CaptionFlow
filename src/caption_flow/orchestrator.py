@@ -1,3 +1,6 @@
+import tracemalloc
+
+tracemalloc.start()
 import time
 import asyncio
 import json
@@ -28,7 +31,7 @@ from .processors import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class Orchestrator:
@@ -66,7 +69,7 @@ class Orchestrator:
         self.processor.initialize(processor_config, self.storage)
 
         # Processing configuration
-        self.units_per_request = config.get("units_per_request", 2)
+        self.chunks_per_request = config.get("chunks_per_request", 2)
 
         # Track connections
         self.workers: Dict[str, WebSocketServerProtocol] = {}
@@ -284,10 +287,10 @@ class Orchestrator:
                     self.processor.initialize(processor_config)
                     updated_sections.append("processor_config")
 
-            # Update units per request
-            if "units_per_request" in orchestrator_config:
-                self.units_per_request = orchestrator_config["units_per_request"]
-                updated_sections.append("units_per_request")
+            # Update chunks per request
+            if "chunks_per_request" in orchestrator_config:
+                self.chunks_per_request = orchestrator_config["chunks_per_request"]
+                updated_sections.append("chunks_per_request")
 
             # Update auth configuration
             if "auth" in orchestrator_config:
@@ -332,8 +335,8 @@ class Orchestrator:
         """Process message from worker."""
         msg_type = data.get("type")
 
-        if msg_type == "request_work":
-            count = data.get("count", self.units_per_request)
+        if msg_type == "get_work_units":
+            count = data.get("count", self.chunks_per_request)
             units = self.processor.get_work_units(count, worker_id)
             logger.debug(f"Assigning units: {[unit.chunk_id for unit in units]}")
 
@@ -880,22 +883,22 @@ class Orchestrator:
 
             # Update rate tracking
             storage_stats = await self.storage.get_storage_stats()
-            current_total = storage_stats["total_captions"]
-            current_time = time.time()
+            # current_total = storage_stats["total_captions"]
+            # current_time = time.time()
 
-            elapsed = current_time - self.rate_tracker["last_update_time"]
-            if elapsed > 0:
-                output_diff = current_total - self.rate_tracker["last_output_count"]
-                self.rate_tracker["current_rate"] = (output_diff / elapsed) * 60
-                self.rate_tracker["last_output_count"] = current_total
-                self.rate_tracker["last_update_time"] = current_time
+            # elapsed = current_time - self.rate_tracker["last_update_time"]
+            # if elapsed > 0:
+            #     output_diff = current_total - self.rate_tracker["last_output_count"]
+            #     self.rate_tracker["current_rate"] = (output_diff / elapsed) * 60
+            #     self.rate_tracker["last_output_count"] = current_total
+            #     self.rate_tracker["last_update_time"] = current_time
 
-                # Average rate since start
-                total_elapsed = current_time - self.rate_tracker["start_time"]
-                if total_elapsed > 0:
-                    self.rate_tracker["average_rate"] = (current_total / total_elapsed) * 60
+            #     # Average rate since start
+            #     total_elapsed = current_time - self.rate_tracker["start_time"]
+            #     if total_elapsed > 0:
+            #         self.rate_tracker["average_rate"] = (current_total / total_elapsed) * 60
 
-            await self._broadcast_stats()
+            # await self._broadcast_stats()
 
     async def shutdown(self):
         """Graceful shutdown."""
