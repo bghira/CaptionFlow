@@ -882,7 +882,7 @@ class Orchestrator:
             await asyncio.sleep(10)
 
             # Update rate tracking
-            storage_stats = await self.storage.get_storage_stats()
+            # storage_stats = await self.storage.get_storage_stats()
             # current_total = storage_stats["total_captions"]
             # current_time = time.time()
 
