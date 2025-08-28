@@ -695,7 +695,8 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                         current_row += rg_num_rows
 
                     # Read only necessary row groups
-                    table = pq.read_table(shard_path, row_groups=list(row_groups_to_read))
+                    parquet_file = pq.ParquetFile(shard_path)
+                    table = parquet_file.read_row_groups(list(row_groups_to_read))
 
                     # Process items
                     for global_idx, local_idx in batch_pairs:
