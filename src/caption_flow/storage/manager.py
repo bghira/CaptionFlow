@@ -1,6 +1,7 @@
 """Arrow/Parquet storage management with dynamic column support for outputs."""
 
 import asyncio
+import gc
 import json
 import logging
 from dataclasses import asdict
@@ -18,7 +19,7 @@ import numpy as np
 from ..models import Job, Caption, Contributor, StorageContents, JobId
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class StorageManager:
@@ -28,8 +29,7 @@ class StorageManager:
         self,
         data_dir: Path,
         caption_buffer_size: int = 100,
-        job_buffer_size: int = 100,
-        contributor_buffer_size: int = 10,
+        contributor_buffer_size: int = 50,
     ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -46,7 +46,6 @@ class StorageManager:
 
         # Buffer size configuration
         self.caption_buffer_size = caption_buffer_size
-        self.job_buffer_size = job_buffer_size
         self.contributor_buffer_size = contributor_buffer_size
 
         # Track existing job_ids to prevent duplicates
@@ -64,7 +63,7 @@ class StorageManager:
         self.duplicates_skipped = 0
 
         # Rate tracking
-        self.row_additions = deque(maxlen=10000)  # Store (timestamp, row_count) tuples
+        self.row_additions = deque(maxlen=100)  # Store (timestamp, row_count) tuples
         self.start_time = time.time()
         self.last_rate_log_time = time.time()
 
@@ -399,41 +398,26 @@ class StorageManager:
         found_row = False
         for idx, row in enumerate(self.caption_buffer):
             check_key = row.get("job_id")
-            logger.debug(f"Checking buffer row {idx}: check_key={check_key}, group_key={group_key}")
             if check_key == group_key:
                 found_row = True
-                logger.debug(f"Found existing buffer row for group_key={group_key} at index {idx}")
                 # Merge outputs into existing row
                 for field_name, field_values in outputs.items():
                     if field_name not in self.known_output_fields:
                         self.known_output_fields.add(field_name)
-                        logger.info(f"New output field detected: {field_name}")
                     if field_name in row and isinstance(row[field_name], list):
-                        logger.debug(
-                            f"Merging output field '{field_name}' into existing row: before={row[field_name]}, adding={field_values}"
-                        )
                         row[field_name].extend(field_values)
-                        logger.debug(f"After merge: {row[field_name]}")
                     else:
-                        logger.debug(
-                            f"Setting new output field '{field_name}' in existing row: {field_values}"
-                        )
                         row[field_name] = list(field_values)
                 # Optionally update other fields (e.g., caption_count)
                 if "caption_count" in caption_dict:
                     old_count = row.get("caption_count", 0)
                     row["caption_count"] = old_count + caption_dict["caption_count"]
-                    logger.debug(
-                        f"Updated caption_count for group_key={group_key}: {old_count} + {caption_dict['caption_count']} = {row['caption_count']}"
-                    )
                 return  # Already merged, no need to add new row
-            else:
-                logger.debug(f"Caption row not found for group key: {group_key} vs {check_key}")
 
-        if not found_row:
-            logger.debug(
-                f"No existing buffer row found for group_key={group_key}, creating new row."
-            )
+        # if not found_row:
+        #     logger.debug(
+        #         f"No existing buffer row found for group_key={group_key}, creating new row."
+        #     )
 
         # If not found, create new row
         for field_name, field_values in outputs.items():
@@ -441,7 +425,7 @@ class StorageManager:
                 self.known_output_fields.add(field_name)
                 logger.info(f"New output field detected: {field_name}")
             caption_dict[field_name] = list(field_values)
-            logger.debug(f"Adding output field '{field_name}' to new row: {field_values}")
+            # logger.debug(f"Adding output field '{field_name}' to new row: {field_values}")
 
         # Serialize metadata to JSON if present
         if "metadata" in caption_dict:
@@ -466,105 +450,94 @@ class StorageManager:
         if not self.caption_buffer:
             return
 
-        num_rows = len(self.caption_buffer)
+        try:
+            num_rows = len(self.caption_buffer)
 
-        # Count total outputs across all fields
-        total_outputs = 0
-        for row in self.caption_buffer:
-            for field_name in self.known_output_fields:
-                if field_name in row and isinstance(row[field_name], list):
-                    total_outputs += len(row[field_name])
+            # Count total outputs across all fields
+            total_outputs = 0
+            for row in self.caption_buffer:
+                for field_name in self.known_output_fields:
+                    if field_name in row and isinstance(row[field_name], list):
+                        total_outputs += len(row[field_name])
 
-        logger.debug(f"Flushing {num_rows} rows with {total_outputs} total outputs to disk")
+            logger.debug(
+                f"Flushing {num_rows} rows with {total_outputs} total outputs to disk. preparing data..."
+            )
 
-        # Prepare data with all required columns
-        prepared_buffer = []
-        for row in self.caption_buffer:
-            prepared_row = row.copy()
+            # Prepare data with all required columns
+            prepared_buffer = []
+            for row in self.caption_buffer:
+                prepared_row = row.copy()
 
-            # Ensure all base fields are present
-            for field_name, field_type in self.base_caption_fields:
-                if field_name not in prepared_row:
-                    prepared_row[field_name] = None
+                # Ensure all base fields are present
+                for field_name, field_type in self.base_caption_fields:
+                    if field_name not in prepared_row:
+                        prepared_row[field_name] = None
 
-            # Ensure all output fields are present (even if None)
-            for field_name in self.known_output_fields:
-                if field_name not in prepared_row:
-                    prepared_row[field_name] = None
+                # Ensure all output fields are present (even if None)
+                for field_name in self.known_output_fields:
+                    if field_name not in prepared_row:
+                        prepared_row[field_name] = None
 
-            prepared_buffer.append(prepared_row)
+                prepared_buffer.append(prepared_row)
 
-        # Build schema with all known fields (base + output)
-        schema = self._build_caption_schema(self.known_output_fields)
-        table = pa.Table.from_pylist(prepared_buffer, schema=schema)
+            # Build schema with all known fields (base + output)
+            logger.debug("building schema...")
+            schema = self._build_caption_schema(self.known_output_fields)
+            logger.debug("schema built, creating table...")
+            table = pa.Table.from_pylist(prepared_buffer, schema=schema)
 
-        if self.captions_path.exists():
-            # Read existing table
-            existing = pq.read_table(self.captions_path)
+            if self.captions_path.exists():
+                # Read existing table
+                logger.debug("Reading existing captions file for deduplication...")
+                existing = pq.read_table(self.captions_path)
 
-            # Get existing job_ids for deduplication
-            existing_job_ids = set(existing.column("job_id").to_pylist())
-
-            # Filter new data to exclude duplicates
-            new_rows = []
-            duplicate_rows = []
-            for row in prepared_buffer:
-                if row["job_id"] not in existing_job_ids:
-                    new_rows.append(row)
-                elif row not in duplicate_rows:
-                    duplicate_rows.append(
-                        {
-                            "input": row,
-                            "existing_job": existing.to_pandas()[
-                                existing.to_pandas()["job_id"] == row["job_id"]
-                            ].to_dict(orient="records"),
-                        }
-                    )
-
-            if duplicate_rows:
-                logger.info(f"Example duplicate row: {duplicate_rows[0]}")
-
-            if new_rows:
+                logger.debug("writing new rows...")
                 # Create table from new rows only
-                new_table = pa.Table.from_pylist(new_rows, schema=schema)
-
                 # Concatenate with promote_options="default" to handle schema differences automatically
-                combined = pa.concat_tables([existing, new_table], promote_options="default")
+                logger.debug("concat tables...")
+                combined = pa.concat_tables([existing, table], promote_options="default")
 
                 # Write combined table
                 pq.write_table(combined, self.captions_path, compression="snappy")
 
-                self.duplicates_skipped = num_rows - len(new_rows)
-                actual_new = len(new_rows)
+                actual_new = len(table)
             else:
-                logger.info(f"All {num_rows} rows were duplicates, exiting")
-                raise SystemError("No duplicates can be submitted")
-        else:
-            # Write new file with all fields
-            pq.write_table(table, self.captions_path, compression="snappy")
-            actual_new = num_rows
+                # Write new file with all fields
+                pq.write_table(table, self.captions_path, compression="snappy")
+                actual_new = num_rows
+            logger.debug("write complete.")
 
-        # Update statistics
-        self.total_captions_written += actual_new
-        self.total_caption_entries_written += total_outputs
-        self.total_flushes += 1
-        self.caption_buffer.clear()
+            # Clean up
+            del prepared_buffer, table
 
-        # Track row additions for rate calculation
-        if actual_new > 0:
-            current_time = time.time()
-            self.row_additions.append((current_time, actual_new))
+            # Update statistics
+            self.total_captions_written += actual_new
+            self.total_caption_entries_written += total_outputs
+            self.total_flushes += 1
+            self.caption_buffer.clear()
 
-            # Log rates
-            self._log_rates(actual_new)
+            # Track row additions for rate calculation
+            if actual_new > 0:
+                current_time = time.time()
+                self.row_additions.append((current_time, actual_new))
 
-        logger.info(
-            f"Successfully wrote captions (new rows: {actual_new}, "
-            f"total rows written: {self.total_captions_written}, "
-            f"total captions written: {self.total_caption_entries_written}, "
-            f"duplicates skipped: {self.duplicates_skipped}, "
-            f"output fields: {sorted(list(self.known_output_fields))})"
-        )
+                # Log rates
+                self._log_rates(actual_new)
+
+            logger.info(
+                f"Successfully wrote captions (new rows: {actual_new}, "
+                f"total rows written: {self.total_captions_written}, "
+                f"total captions written: {self.total_caption_entries_written}, "
+                f"duplicates skipped: {self.duplicates_skipped}, "
+                f"output fields: {sorted(list(self.known_output_fields))})"
+            )
+        finally:
+            self.caption_buffer.clear()
+            # Force garbage collection
+            import gc
+
+            gc.collect()
 
     async def optimize_storage(self):
         """Optimize storage by dropping empty columns. Run this periodically or on-demand."""
@@ -894,6 +867,7 @@ class StorageManager:
 
         table = pq.read_table(self.captions_path)
         df = table.to_pandas()
+        del table  # Free memory
 
         if len(df) == 0:
             return {"total_rows": 0, "total_outputs": 0, "output_fields": [], "field_stats": {}}
@@ -983,12 +957,17 @@ class StorageManager:
         return total
 
     async def count_caption_rows(self) -> int:
-        """Count total rows (unique images with captions)."""
+        """Count total rows (unique images with captions) with minimal memory usage."""
         if not self.captions_path.exists():
             return 0
 
-        table = pq.read_table(self.captions_path)
-        return len(table)
+        # Only read a single column to minimize memory usage
+        table = pq.read_table(self.captions_path, columns=["job_id"])
+        length = table.num_rows
+        del table
+        gc.collect()
+
+        return length
 
     async def get_contributor(self, contributor_id: str) -> Optional[Contributor]:
         """Retrieve a contributor by ID."""
@@ -1055,7 +1034,7 @@ class StorageManager:
         if not columns_to_read:
             return {"total_fields": 0, "field_counts": {}}
 
-        table = pq.read_table(self.captions_path, columns=columns_to_read)
+        table = pq.read_table(self.captions_path, memory_map=True, columns=columns_to_read)
         df = table.to_pandas()
 
         if len(df) == 0:
@@ -1106,21 +1085,31 @@ class StorageManager:
     async def get_storage_stats(self) -> Dict[str, Any]:
         """Get all storage-related statistics."""
         # Count outputs on disk
-        disk_outputs = await self.count_captions()
+        # disk_outputs = await self.count_captions()
+        disk_outputs = 0
 
         # Count outputs in buffer
         buffer_outputs = 0
-        for row in self.caption_buffer:
-            for field_name in self.known_output_fields:
-                if field_name in row and isinstance(row[field_name], list):
-                    buffer_outputs += len(row[field_name])
+        # for row in self.caption_buffer:
+        #     for field_name in self.known_output_fields:
+        #         if field_name in row and isinstance(row[field_name], list):
+        #             buffer_outputs += len(row[field_name])
 
         # Get field-specific stats
-        field_stats = await self.get_caption_stats()
-        total_rows_including_buffer = await self.count_caption_rows() + len(self.caption_buffer)
+        # field_stats = await self.get_caption_stats()
+        field_stats = {}
+        total_rows_including_buffer = 0
+        # total_rows_including_buffer = await self.count_caption_rows() + len(self.caption_buffer)
 
         # Calculate rates
-        rates = self._calculate_rates()
+        # rates = self._calculate_rates()
+        rates = {
+            "instant": 0,
+            "5min": 0,
+            "15min": 0,
+            "60min": 0,
+            "overall": 0,
+        }
 
         return {
             "total_captions": disk_outputs + buffer_outputs,
@@ -1132,7 +1121,6 @@ class StorageManager:
             "total_flushes": self.total_flushes,
             "output_fields": sorted(list(self.known_output_fields)),
             "field_breakdown": field_stats.get("field_stats", None),
-            "job_buffer_size": len(self.job_buffer),
             "contributor_buffer_size": len(self.contributor_buffer),
             "rates": {
                 "instant": f"{rates['instant']:.1f} rows/s",
