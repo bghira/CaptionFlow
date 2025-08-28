@@ -259,7 +259,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 }
 
                 cumulative_offset += size
-                logger.info(f"Shard {i}: {size} rows")
+                logger.info(f"Shard {i} ({filename}): {size} rows")
 
             except Exception as e:
                 logger.error(f"Failed to discover shard {i}: {e}")
@@ -381,8 +381,18 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 if self.current_chunk_index * self.chunk_size >= self.total_items:
                     threading.Event().wait(30)
                     break
+                # Get shard info for proper unit_id
+                current_index = self.current_chunk_index * self.chunk_size
+                if current_index < self.total_items:
+                    shard_id, _ = self._get_shard_for_index(current_index)
+                    shard_name = Path(self.shard_info[shard_id]["filename"]).stem
 
-                unit_id = f"{self.dataset_name}:chunk:{self.current_chunk_index}"
+                    job_id_obj = JobId(
+                        shard_id=shard_name,
+                        chunk_id=self.current_chunk_index,
+                        sample_id=current_index,
+                    )
+                    unit_id = job_id_obj.get_chunk_str()
 
                 with self.lock:
                     # Check if already tracked
@@ -453,9 +463,15 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             if self.chunk_tracker:
                 self.chunk_tracker.mark_completed(unit_id)
 
+            # remove from pending deque if it's there.
+            try:
+                self.pending_units.remove(unit_id)
+            except:
+                pass
+
     def mark_failed(self, unit_id: str, worker_id: str, error: str) -> None:
         """Mark a work unit as failed."""
-        logger.debug("Marking unit %s as failed by worker %s, error: %s", unit_id, worker_id, error)
+        logger.error("Marking unit %s as failed by worker %s, error: %s", unit_id, worker_id, error)
         with self.lock:
             self.assigned_units[worker_id].discard(unit_id)
             self.pending_units.append(unit_id)
@@ -470,6 +486,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             unit_ids = list(self.assigned_units.get(worker_id, []))
 
             for unit_id in unit_ids:
+                logger.debug(f"Adding {unit_id} to pending queue")
                 self.pending_units.append(unit_id)
 
             if worker_id in self.assigned_units:
