@@ -900,13 +900,15 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
 
         processed_indices = []
 
-        # Iterate through shard
+        # Create a list to hold shard data temporarily
+        shard_data = []
+
+        # Collect all relevant items from shard first
         for idx, (key, url, image_data, metadata) in enumerate(
             self._iterate_shard_with_metadata(shard_url)
         ):
             # Skip if not in our chunk range
             if idx < start_index or idx >= start_index + chunk_size:
-                # logger.debug(f"Skipping idx={idx} not in chunk range")
                 continue
 
             # Skip if already processed
@@ -914,6 +916,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 logger.debug(f"Skipping idx={idx} already processed")
                 continue
 
+            # Store detached copies of the data
+            shard_data.append((idx, key, url, image_data, metadata))
+
+        # Now process the collected data
+        for idx, key, url, image_data, metadata in shard_data:
             try:
                 if self.mock_results:
                     # In mock mode, create a dummy image
@@ -929,33 +936,32 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                         },
                     )
                 else:
-                    # Load real image
+                    # Load real image - PIL will create its own copy when opening
                     image = Image.open(io.BytesIO(image_data))
 
                 job_id = f"{shard_name}:chunk:{chunk_index}:idx:{idx}"
 
-                # Clean metadata - remove sensitive and redundant fields
+                # Create a fresh metadata dict with only what we need
                 clean_metadata = {
-                    k: v
-                    for k, v in metadata.items()
-                    if k not in ["url", "_shard_url", "shard_name"]  # Remove these fields
+                    "_item_index": idx,
+                    "_chunk_relative_index": idx - start_index,
+                    "_job_id": job_id,
+                    "_mock": self.mock_results,
                 }
 
-                # Add only necessary index information
-                clean_metadata.update(
-                    {
-                        "_item_index": idx,
-                        "_chunk_relative_index": idx - start_index,
-                        "_job_id": job_id,
-                        "_mock": self.mock_results,  # Add flag to indicate mock data
-                    }
-                )
+                # Add any non-sensitive metadata from original
+                for k, v in metadata.items():
+                    if k not in ["url", "_shard_url", "shard_name"] and not k.startswith("__"):
+                        # Make a copy of the value if it's mutable
+                        if isinstance(v, (dict, list)):
+                            clean_metadata[k] = v.copy() if isinstance(v, dict) else v[:]
+                        else:
+                            clean_metadata[k] = v
 
                 # Prepare item for captioning
-                # logger.debug("Yielding item idx=%d key=%s", idx, key)
                 yield {
                     "image": image,
-                    "item_key": key,
+                    "item_key": str(key),  # Ensure string copy
                     "item_index": idx,
                     "metadata": clean_metadata,
                     "job_id": job_id,
@@ -965,6 +971,9 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
 
             except Exception as e:
                 logger.error(f"Error processing item {key}: {e}")
+
+        # Explicitly delete shard data before garbage collection
+        del shard_data
 
         # Store processed indices in context for result preparation
         context["_processed_indices"] = processed_indices
@@ -1044,23 +1053,41 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                         )
                         continue
 
-                    # Extract metadata (all non-system and non-image keys)
-                    metadata = {
-                        k: v
-                        for k, v in item.items()
-                        if not k.startswith("__")
-                        and k not in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]
-                    }
+                    # Create a detached copy of metadata
+                    metadata = {}
+                    for k, v in item.items():
+                        if not k.startswith("__") and k not in [
+                            "jpg",
+                            "jpeg",
+                            "png",
+                            "webp",
+                            "bmp",
+                            "jxl",
+                        ]:
+                            # Make copies of mutable values
+                            if isinstance(v, dict):
+                                metadata[k] = v.copy()
+                            elif isinstance(v, list):
+                                metadata[k] = v[:]
+                            else:
+                                metadata[k] = v
 
                     # Add image format but not URLs
                     if image_ext:
                         metadata["_image_format"] = image_ext
 
-                    yield key, url, image_data, metadata
+                    # Create a copy of image data to detach from original
+                    image_data_copy = bytes(image_data)
+
+                    yield str(key), str(url), image_data_copy, metadata
 
                 # Clear the batch and force garbage collection
                 batch_items.clear()
+                del batch_items[:]  # Ensure list is completely cleared
                 gc.collect()
+
+                # Recreate batch_items list to ensure no lingering references
+                batch_items = []
 
         # Process remaining items in the last batch
         for item in batch_items:
@@ -1079,20 +1106,27 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             if not image_data:
                 continue
 
-            # Extract metadata
-            metadata = {
-                k: v
-                for k, v in item.items()
-                if not k.startswith("__") and k not in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]
-            }
+            # Create a detached copy of metadata
+            metadata = {}
+            for k, v in item.items():
+                if not k.startswith("__") and k not in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]:
+                    if isinstance(v, dict):
+                        metadata[k] = v.copy()
+                    elif isinstance(v, list):
+                        metadata[k] = v[:]
+                    else:
+                        metadata[k] = v
 
             if image_ext:
                 metadata["_image_format"] = image_ext
 
-            yield key, url, image_data, metadata
+            # Create a copy of image data
+            image_data_copy = bytes(image_data)
 
-        # Final cleanup
-        batch_items.clear()
+            yield str(key), str(url), image_data_copy, metadata
+
+        # Final cleanup - explicitly delete the batch
+        del batch_items
         gc.collect()
 
     def prepare_result(
