@@ -157,20 +157,38 @@ class DatasetLoader:
                 wds.SimpleShardList(url_cmd),
                 wds.tarfile_to_samples(),
                 wds.select(lambda x: x.get("__key__", "") not in processed_keys),
-            )
+            ).with_length(
+                1000000
+            )  # Set a large length to prevent issues
         else:
             # Local file access
             ds = wds.DataPipeline(
                 wds.SimpleShardList(shard_url),
                 wds.tarfile_to_samples(),
                 wds.select(lambda x: x.get("__key__", "") not in processed_keys),
-            )
+            ).with_length(
+                1000000
+            )  # Set a large length to prevent issues
+
+        # IMPORTANT: Disable WebDataset's internal buffering to prevent memory issues
+        # This ensures we process items one at a time without accumulating in memory
+        ds = ds.batched(1, partial=True)  # Process one item at a time
 
         # Return full samples as dictionaries
-        for sample in ds:
-            # Ensure it's a dict and has required fields
-            if isinstance(sample, dict) and "__key__" in sample:
-                yield sample
+        for batch in ds:
+            # Since we're batching by 1, each batch contains a single item
+            if batch and len(batch) > 0:
+                sample = batch[0] if isinstance(batch, list) else batch
+                # Ensure it's a dict and has required fields
+                if isinstance(sample, dict) and "__key__" in sample:
+                    yield sample
+                    # Explicitly delete the batch to free memory
+                    del batch
+
+        # Force garbage collection after processing the shard
+        import gc
+
+        gc.collect()
 
     def count_shard_items(self, shard_url: str, processed_keys: Optional[set] = None) -> int:
         """Count items in a shard (can be slow for large shards)."""
