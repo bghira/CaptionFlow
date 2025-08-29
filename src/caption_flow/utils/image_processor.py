@@ -118,7 +118,7 @@ class ImageProcessor:
     @staticmethod
     def prepare_for_inference(image: Image) -> Image:
         """
-        Prepare image for inference, handling transparency and mostly black/white images.
+        Prepare image for inference.
 
         Args:
             image: PIL Image to prepare
@@ -126,43 +126,9 @@ class ImageProcessor:
         Returns:
             Prepared PIL Image
         """
-        # Convert to RGBA to handle transparency
-        if hasattr(image, "convert"):
-            image = image.convert("RGBA")
-            image = image.convert("RGB")
-        np_img = np.array(image)
+        # We used to do a lot more hand-holding here with transparency, but oh well.
 
-        # Calculate percentage of pixels that are (0,0,0) or (255,255,255)
-        total_pixels = np_img.shape[0] * np_img.shape[1]
-        black_pixels = np.all(np_img == [0, 0, 0], axis=-1).sum()
-        white_pixels = np.all(np_img == [255, 255, 255], axis=-1).sum()
-        black_pct = black_pixels / total_pixels
-        white_pct = white_pixels / total_pixels
-
-        threshold = 0.90  # 90% threshold
-
-        is_mostly_black = black_pct >= threshold
-        is_mostly_white = white_pct >= threshold
-
-        if is_mostly_black or is_mostly_white:
-            # Replace background with opposite color for better contrast
-            bg_color = (255, 255, 255) if is_mostly_black else (0, 0, 0)
-            background = Image.new("RGB", img_rgba.size, bg_color)
-            # Use alpha channel as mask if present
-            if img_rgba.mode == "RGBA":
-                background.paste(img_rgba.convert("RGB"), mask=img_rgba.split()[3])
-            else:
-                background.paste(img_rgba.convert("RGB"))
-
-            color_type = "black" if is_mostly_black else "white"
-            pct = black_pct if is_mostly_black else white_pct
-            logger.debug(
-                f"Image is {pct*100:.1f}% {color_type}; background replaced with {bg_color}"
-            )
-
-            return background
-        else:
-            return rgb_img
+        return image
 
     def shutdown(self):
         """Shutdown the executor."""
