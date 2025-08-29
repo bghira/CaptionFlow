@@ -924,8 +924,14 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                         },
                     )
                 else:
-                    image = Image.open(io.BytesIO(image_data))
+                    bio = io.BytesIO(image_data)
+                    with Image.open(bio) as im:
+                        im.load()
+                        image = im.convert(
+                            "RGB"
+                        ).copy()  # detach from fp/buffer and drop tiled decoders
                     del image_data
+                    del bio
 
                 job_id = f"{shard_name}:chunk:{chunk_index}:idx:{idx}"
                 clean_metadata = {
