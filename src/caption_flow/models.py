@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
-from PIL import Image
+from puhu import Image
 
 
 class JobStatus(Enum):
@@ -169,7 +169,7 @@ class ProcessingItem:
 
     chunk_id: str
     item_key: str
-    image: Image.Image
+    image: Image
     image_data: bytes
     metadata: Dict[str, Any] = field(default_factory=dict)
     stage_results: Dict[str, StageResult] = field(default_factory=dict)  # Accumulated results

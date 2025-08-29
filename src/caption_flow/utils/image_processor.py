@@ -3,13 +3,12 @@
 import asyncio
 import logging
 from concurrent.futures import ProcessPoolExecutor
-from io import BytesIO
 from pathlib import Path
 from typing import List, Any, Optional, Tuple, Union
 
 import numpy as np
 import requests
-from PIL import Image
+from puhu import Image
 
 
 logger = logging.getLogger(__name__)
@@ -53,7 +52,7 @@ class ImageProcessor:
         return arr
 
     @staticmethod
-    def process_image_data(img_data: Union[str, bytes, Image.Image]) -> Optional[bytes]:
+    def process_image_data(img_data: Union[str, bytes, Image]) -> Optional[bytes]:
         """
         Process various types of image data into bytes.
 
@@ -77,7 +76,7 @@ class ImageProcessor:
                     image_data = response.content
 
                     # Verify it's an image by trying to open it
-                    img = Image.open(BytesIO(image_data))
+                    img = Image.open(response.content)
                     img.verify()  # Verify it's a valid image
 
                     return image_data
@@ -100,7 +99,7 @@ class ImageProcessor:
             elif isinstance(img_data, bytes):
                 # Already bytes - validate it's an image
                 try:
-                    img = Image.open(BytesIO(img_data))
+                    img = Image.open(img_data)
                     img.verify()
                     return img_data
                 except Exception as e:
@@ -116,7 +115,7 @@ class ImageProcessor:
             return None
 
     @staticmethod
-    def prepare_for_inference(image: Image.Image) -> Image.Image:
+    def prepare_for_inference(image: Image) -> Image:
         """
         Prepare image for inference, handling transparency and mostly black/white images.
 

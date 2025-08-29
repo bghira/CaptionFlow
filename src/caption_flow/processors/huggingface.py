@@ -15,7 +15,7 @@ from typing import Dict, Any, List, Optional, Iterator, Set, Deque, Tuple
 from collections import deque, defaultdict
 from pathlib import Path
 from datetime import datetime
-from PIL import Image
+from puhu import Image
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import get_dataset_config_names, get_dataset_split_names
@@ -759,7 +759,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
             return match.group(1)
         return url.split("/")[-1]
 
-    def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image.Image:
+    def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image:
         """Create a dummy image"""
         color = (0, 0, 0)
         width, height = 128, 128
@@ -905,7 +905,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                     try:
                                         response = requests.get(image_url, timeout=30)
                                         response.raise_for_status()
-                                        image = Image.open(io.BytesIO(response.content))
+                                        image = Image.open(response.content)
                                     except Exception as e:
                                         logger.error(
                                             f"Error downloading image from {image_url}: {e}"
@@ -915,9 +915,9 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                 elif self.image_column and self.image_column in item:
                                     image_data = item[self.image_column]
                                     if isinstance(image_data, dict) and "bytes" in image_data:
-                                        image = Image.open(io.BytesIO(image_data["bytes"]))
+                                        image = Image.open(image_data["bytes"])
                                     elif isinstance(image_data, bytes):
-                                        image = Image.open(io.BytesIO(image_data))
+                                        image = Image.open(image_data)
 
                             if image is None:
                                 logger.warning(f"No image found for item at index {global_idx}")

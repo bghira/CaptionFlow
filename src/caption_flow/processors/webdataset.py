@@ -13,8 +13,10 @@ from pathlib import Path
 import json
 import io
 from datetime import datetime
-from PIL import Image
+from puhu import Image
 from caption_flow.storage import StorageManager
+import pyarrow as pa
+
 
 from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkUnit, WorkResult
 from ..utils import DatasetLoader, ChunkTracker
@@ -821,7 +823,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         # Save final state
         if self.chunk_tracker:
-            self.chunk_tracker.save_checkpoint()
+            self.chunk_tracker.save()
 
 
 class WebDatasetWorkerProcessor(WorkerProcessor):
@@ -865,7 +867,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         else:
             logger.error("No dataset_path provided in worker config")
 
-    def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image.Image:
+    def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image:
         """Create a dummy image"""
         color = (0, 0, 0)
         width, height = 128, 128
@@ -918,6 +920,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
 
             # Store detached copies of the data
             shard_data.append((idx, key, url, image_data, metadata))
+        log_memory(f"after preparing unit {unit.unit_id}")
 
         # Now process the collected data
         for idx, key, url, image_data, metadata in shard_data:
@@ -935,9 +938,6 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                             "_key": key,
                         },
                     )
-                else:
-                    # Load real image - PIL will create its own copy when opening
-                    image = Image.open(io.BytesIO(image_data))
 
                 job_id = f"{shard_name}:chunk:{chunk_index}:idx:{idx}"
 
@@ -960,12 +960,13 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
 
                 # Prepare item for captioning
                 yield {
-                    "image": image,
+                    "image": image_data,
                     "item_key": str(key),  # Ensure string copy
                     "item_index": idx,
                     "metadata": clean_metadata,
                     "job_id": job_id,
                 }
+                log_memory(f"after yielding index {idx}")
 
                 processed_indices.append(idx)
 

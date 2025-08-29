@@ -10,7 +10,7 @@ import json
 import io
 import mimetypes
 from datetime import datetime
-from PIL import Image
+from puhu import Image
 import aiofiles
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -610,7 +610,7 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
                     try:
                         response = requests.get(image_url, timeout=30)
                         response.raise_for_status()
-                        image = Image.open(io.BytesIO(response.content))
+                        image = Image.open(response.content)
                         logger.debug(f"Loaded image via HTTP: {image_url}")
                     except Exception as e:
                         logger.error(f"Error downloading image from {image_url}: {e}")
