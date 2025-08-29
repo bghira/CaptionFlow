@@ -1,7 +1,12 @@
-"""WebDataset processor implementation."""
+"""WebDataset processor implementation with non-blocking HPC optimizations."""
 
 import logging
 import threading
+import queue
+import gc
+import os
+import psutil
+from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Dict, Any, List, Optional, Iterator, Set, Deque, Tuple
 from collections import deque, defaultdict
 from pathlib import Path
@@ -15,14 +20,79 @@ from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkU
 from ..utils import DatasetLoader, ChunkTracker
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
+
+
+def log_memory(location: str):
+    """Log memory usage at specific location."""
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    logger.info(
+        f"Memory at {location}: RSS={mem_info.rss/1024/1024:.1f}MB, VMS={mem_info.vms/1024/1024:.1f}MB"
+    )
+    # Force garbage collection
+    gc.collect()
+
+
+class NonBlockingQueueHandler:
+    """Handles non-blocking retrieval from queues using concurrent futures."""
+
+    def __init__(self, max_workers: int = 1):
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.pending_futures: Dict[int, Future] = {}  # queue_id -> Future
+
+    def get_from_queue_async(self, response_queue: queue.Queue, timeout: float = None) -> Future:
+        """Start an async queue retrieval."""
+        queue_id = id(response_queue)
+
+        # Check if we already have a pending future for this queue
+        if queue_id in self.pending_futures and not self.pending_futures[queue_id].done():
+            return self.pending_futures[queue_id]
+
+        # Start new async retrieval
+        future = self.executor.submit(response_queue.get, timeout=timeout)
+        self.pending_futures[queue_id] = future
+        return future
+
+    def check_response(self, response_queue: queue.Queue, timeout: float = None) -> Optional[Any]:
+        """Non-blocking check for queue response."""
+        queue_id = id(response_queue)
+
+        # Start async retrieval if needed
+        future = self.get_from_queue_async(response_queue, timeout)
+
+        # Check if result is ready (non-blocking)
+        if future.done():
+            try:
+                result = future.result(timeout=0)
+                # Clear future for next retrieval
+                if queue_id in self.pending_futures:
+                    del self.pending_futures[queue_id]
+                return result
+            except queue.Empty:
+                # Queue was empty, clear future
+                if queue_id in self.pending_futures:
+                    del self.pending_futures[queue_id]
+                return None
+            except Exception as e:
+                logger.error(f"Error retrieving from queue: {e}")
+                if queue_id in self.pending_futures:
+                    del self.pending_futures[queue_id]
+                return None
+
+        # Result not ready yet
+        return None
+
+    def shutdown(self):
+        """Shutdown the executor."""
+        self.executor.shutdown(wait=True)
 
 
 class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
-    """Orchestrator processor for WebDataset shards."""
+    """Memory-optimized orchestrator processor for WebDataset shards with non-blocking operations."""
 
     def __init__(self):
-        logger.debug("Initializing WebDatasetOrchestratorProcessor")
+        logger.debug("Initializing WebDatasetOrchestratorProcessor (Optimized + Non-blocking)")
         self.dataset_loader: Optional[DatasetLoader] = None
         self.chunk_tracker: Optional[ChunkTracker] = None
         self.chunk_size: int = 1000
@@ -42,9 +112,18 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         self.unit_creation_thread: Optional[threading.Thread] = None
         self.stop_creation = threading.Event()
 
+        # Non-blocking queue handler
+        self.queue_handler = NonBlockingQueueHandler()
+
+        # Response processing state
+        self.last_maintenance_time = datetime.now()
+        self.maintenance_interval = 30  # seconds
+
     def initialize(self, config: ProcessorConfig, storage: StorageManager) -> None:
         """Initialize WebDataset processor."""
         logger.debug("Initializing orchestrator with config: %s", config.config)
+        log_memory("start of initialize")
+
         cfg = config.config
 
         # Dataset configuration
@@ -100,55 +179,106 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         else:
             logger.error("No dataset_path provided in config")
 
+        log_memory("end of initialize")
+
+    def process_responses_non_blocking(self, response_queue: queue.Queue) -> Optional[WorkResult]:
+        """
+        Non-blocking method to process responses from workers.
+        Returns a WorkResult if one is available, None otherwise.
+        """
+        # Check for response without blocking
+        response = self.queue_handler.check_response(response_queue, timeout=0.1)
+
+        if response is not None:
+            # Process the response
+            if isinstance(response, WorkResult):
+                logger.debug(f"Processing response for unit {response.unit_id}")
+                return response
+            else:
+                logger.warning(f"Unexpected response type: {type(response)}")
+
+        # Perform periodic maintenance tasks
+        now = datetime.now()
+        if (now - self.last_maintenance_time).total_seconds() > self.maintenance_interval:
+            self._perform_maintenance()
+            self.last_maintenance_time = now
+
+        return None
+
+    def _perform_maintenance(self):
+        """Perform periodic maintenance tasks."""
+        with self.lock:
+            # Log current state
+            pending_count = len(self.pending_units)
+            assigned_count = sum(len(units) for units in self.assigned_units.values())
+            logger.debug(f"Maintenance: {pending_count} pending, {assigned_count} assigned units")
+
+            # Check for stale assignments (workers that might have disconnected)
+            # This would be implemented based on your worker heartbeat mechanism
+
+            # Force checkpoint save if needed
+            if self.chunk_tracker:
+                self.chunk_tracker.save_checkpoint()
+
+        # Log memory usage periodically
+        log_memory("periodic maintenance")
+
     def _restore_state(self, storage: StorageManager) -> None:
         """Restore state from chunk tracker."""
         logger.debug("Restoring state from chunk tracker")
         if not self.chunk_tracker:
             return
 
-        shards_summary = self.chunk_tracker.get_shards_summary()
-
         # Get all processed job_ids from storage
         all_processed_jobs = storage.get_all_processed_job_ids()
 
         with self.lock:
-            for shard_name, shard_info in shards_summary.items():
-                for chunk_state in shard_info["chunks"]:
-                    # Calculate actual unprocessed ranges based on what's in storage
-                    chunk_range = (
-                        chunk_state.start_index,
-                        chunk_state.start_index + chunk_state.chunk_size - 1,
+            # Iterate through all chunks in the chunk tracker
+            for chunk_id, chunk_state in self.chunk_tracker.chunks.items():
+                # Skip completed chunks
+                if chunk_state.status == "completed":
+                    logger.debug(f"Skipping completed chunk {chunk_id}")
+                    continue
+
+                # Calculate actual unprocessed ranges based on what's in storage
+                chunk_range = (
+                    chunk_state.start_index,
+                    chunk_state.start_index + chunk_state.chunk_size - 1,
+                )
+
+                # Get processed indices for this chunk
+                processed_ranges = self.chunk_tracker.get_processed_indices_for_chunk(
+                    chunk_id, all_processed_jobs
+                )
+
+                # Calculate unprocessed ranges
+                unprocessed_ranges = self._subtract_ranges([chunk_range], processed_ranges)
+
+                if unprocessed_ranges:
+                    # Create work unit for unprocessed items
+                    logger.debug(f"Creating WorkUnit for chunk {chunk_state}")
+
+                    # Extract shard name from chunk_id (format: "shard_name:chunk:N")
+                    shard_name = chunk_id.split(":")[0]
+
+                    unit = WorkUnit(
+                        unit_id=chunk_id,
+                        chunk_id=chunk_id,
+                        source_id=shard_name,
+                        data={
+                            "shard_url": chunk_state.shard_url,
+                            "start_index": chunk_state.start_index,
+                            "chunk_size": chunk_state.chunk_size,
+                            "unprocessed_ranges": unprocessed_ranges,
+                        },
+                        metadata={
+                            "shard_name": shard_name,
+                            "chunk_index": chunk_state.start_index // self.chunk_size,
+                        },
                     )
 
-                    # Get processed indices for this chunk
-                    processed_ranges = self.chunk_tracker.get_processed_indices_for_chunk(
-                        chunk_state.chunk_id, all_processed_jobs
-                    )
-
-                    # Calculate unprocessed ranges
-                    unprocessed_ranges = self._subtract_ranges([chunk_range], processed_ranges)
-
-                    if unprocessed_ranges:
-                        # Create work unit for unprocessed items
-                        logger.debug(f"Creating WorkUnit for chunk {chunk_state}")
-                        unit = WorkUnit(
-                            unit_id=chunk_state.chunk_id,
-                            chunk_id=chunk_state.chunk_id,
-                            source_id=shard_name,
-                            data={
-                                "shard_url": chunk_state.shard_url,
-                                "start_index": chunk_state.start_index,
-                                "chunk_size": chunk_state.chunk_size,
-                                "unprocessed_ranges": unprocessed_ranges,
-                            },
-                            metadata={
-                                "shard_name": shard_name,
-                                "chunk_index": chunk_state.start_index // self.chunk_size,
-                            },
-                        )
-
-                        self.work_units[unit.unit_id] = unit
-                        self.pending_units.append(unit.unit_id)
+                    self.work_units[unit.unit_id] = unit
+                    self.pending_units.append(unit.unit_id)
 
     def _create_units_background(self) -> None:
         """Background thread to create work units on demand."""
@@ -159,6 +289,9 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         current_shard_name = None
         current_shard_items = 0
         current_index = 0
+
+        # Cache shard sizes to avoid re-counting
+        shard_sizes = {}
 
         while not self.stop_creation.is_set():
             # Check if we need more units
@@ -193,14 +326,40 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         current_shard_name = Path(current_shard_url).stem
 
                         logger.debug("Loading shard: %s", current_shard_url)
-                        # Count items in shard
-                        current_shard_items = sum(
-                            1 for _ in self.dataset_loader.iterate_shard(current_shard_url)
-                        )
-                        logger.info(
-                            f"Processing shard {current_shard_name} with {current_shard_items} items"
-                        )
+
+                        # Check cache first
+                        if current_shard_url in shard_sizes:
+                            current_shard_items = shard_sizes[current_shard_url]
+                            logger.info(
+                                f"Using cached size for shard {current_shard_name}: {current_shard_items} items"
+                            )
+                        else:
+                            # For WebDataset, we can estimate or use a default chunk size
+                            # instead of counting all items (which loads the entire shard)
+                            if (
+                                self.dataset_loader
+                                and self.dataset_loader.dataset_format == "webdataset"
+                            ):
+                                # Use a reasonable estimate for WebDataset shards
+                                # Most WebDataset shards have 1000-10000 items
+                                current_shard_items = 10000  # Conservative estimate
+                                logger.info(
+                                    f"Using estimated size for WebDataset shard {current_shard_name}: ~{current_shard_items} items"
+                                )
+                            else:
+                                # Only count if absolutely necessary (non-WebDataset)
+                                current_shard_items = sum(
+                                    1 for _ in self.dataset_loader.iterate_shard(current_shard_url)
+                                )
+                                shard_sizes[current_shard_url] = current_shard_items
+                                logger.info(
+                                    f"Counted shard {current_shard_name}: {current_shard_items} items"
+                                )
+
                         current_index = 0
+
+                        # Force garbage collection after shard change
+                        gc.collect()
 
                     except StopIteration:
                         logger.info("All shards processed")
@@ -340,9 +499,16 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
             if units_created > 0:
                 logger.debug(f"Created {units_created} work units")
 
+        logger.info("Thread for creating units has completed. Exiting thread.")
+
     def get_work_units(self, count: int, worker_id: str) -> List[WorkUnit]:
         """Get available work units for a worker."""
-        logger.debug("get_work_units called: count=%d worker_id=%s", count, worker_id)
+        logger.debug(
+            "get_work_units called: count=%d worker_id=%s, pending: %d",
+            count,
+            worker_id,
+            len(self.pending_units),
+        )
         assigned = []
 
         with self.lock:
@@ -389,7 +555,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
     def mark_failed(self, unit_id: str, worker_id: str, error: str) -> None:
         """Mark a work unit as failed."""
-        logger.debug("Marking unit %s as failed by worker %s, error: %s", unit_id, worker_id, error)
+        logger.error("Marking unit %s as failed by worker %s, error: %s", unit_id, worker_id, error)
         with self.lock:
             if unit_id in self.work_units:
                 self.assigned_units[worker_id].discard(unit_id)
@@ -485,7 +651,6 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
     def handle_result(self, result: WorkResult) -> Dict[str, Any]:
         """Handle WebDataset-specific result processing."""
-        # logger.debug("Handling result for unit %s", result.unit_id)
         base_result = super().handle_result(result)
 
         # Track processed items if we have chunk tracker
@@ -587,15 +752,32 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         f"unprocessed ranges: {unprocessed_ranges}"
                     )
 
+    def cleanup(self):
+        """Clean up resources."""
+        logger.info("Cleaning up orchestrator resources")
+
+        # Stop background threads
+        self.stop_creation.set()
+        if self.unit_creation_thread:
+            self.unit_creation_thread.join(timeout=5)
+
+        # Shutdown queue handler
+        self.queue_handler.shutdown()
+
+        # Save final state
+        if self.chunk_tracker:
+            self.chunk_tracker.save_checkpoint()
+
 
 class WebDatasetWorkerProcessor(WorkerProcessor):
-    """Worker processor for WebDataset shards."""
+    """Memory-optimized worker processor for WebDataset shards."""
 
     def __init__(self):
-        logger.debug("Initializing WebDatasetWorkerProcessor")
+        logger.debug("Initializing WebDatasetWorkerProcessor (Optimized)")
         self.dataset_loader: Optional[DatasetLoader] = None
         self.dataset_config: Dict[str, Any] = {}
         self.dataset_name: Optional[str] = None
+        self.mock_results = False
 
     def initialize(self, config: ProcessorConfig) -> None:
         """Initialize WebDataset processor."""
@@ -612,6 +794,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         dataset_split = cfg.get("dataset_split", "train")
         image_column = cfg.get("dataset_image_column", "image")
 
+        # Add mock results flag
+        self.mock_results = cfg.get("mock_results", False)
+        if self.mock_results:
+            logger.info("Mock results mode enabled - will generate dummy images")
+
         if dataset_path:
             self.dataset_loader = DatasetLoader(
                 dataset_path=dataset_path,
@@ -623,10 +810,19 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         else:
             logger.error("No dataset_path provided in worker config")
 
+    def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image.Image:
+        """Create a dummy image"""
+        color = (0, 0, 0)
+        width, height = 128, 128
+        image = Image.new("RGB", (width, height), color=color)
+        return image
+
     def process_unit(self, unit: WorkUnit, context: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         """Process a WebDataset chunk, yielding items to be captioned."""
-        logger.debug("Processing unit: %s", unit.unit_id)
-        if not self.dataset_loader:
+        logger.debug("Processing unit: %s (mock_results=%s)", unit.unit_id, self.mock_results)
+        log_memory(f"start processing unit {unit.unit_id}")
+
+        if not self.dataset_loader and not self.mock_results:
             logger.error("Dataset loader not initialized")
             return
 
@@ -664,8 +860,23 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 continue
 
             try:
-                # Load image
-                image = Image.open(io.BytesIO(image_data))
+                if self.mock_results:
+                    # In mock mode, create a dummy image
+                    logger.debug(f"Creating mock image for index {idx}")
+
+                    # Create dummy image with metadata context
+                    image = self._create_dummy_image(
+                        idx,
+                        {
+                            "_shard_name": shard_name,
+                            "_idx": idx,
+                            "_key": key,
+                        },
+                    )
+                else:
+                    # Load real image
+                    image = Image.open(io.BytesIO(image_data))
+
                 job_id = f"{shard_name}:chunk:{chunk_index}:idx:{idx}"
 
                 # Clean metadata - remove sensitive and redundant fields
@@ -681,6 +892,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                         "_item_index": idx,
                         "_chunk_relative_index": idx - start_index,
                         "_job_id": job_id,
+                        "_mock": self.mock_results,  # Add flag to indicate mock data
                     }
                 )
 
@@ -702,6 +914,10 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         # Store processed indices in context for result preparation
         context["_processed_indices"] = processed_indices
         logger.debug("Processed indices for unit %s: %s", unit.unit_id, processed_indices)
+        log_memory(f"end processing unit {unit.unit_id}")
+
+        # Force garbage collection
+        gc.collect()
 
     def _iterate_shard_with_metadata(
         self, shard_url: str
@@ -709,9 +925,37 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         """Iterate through a shard with metadata."""
         logger.debug("Iterating shard with metadata: %s", shard_url)
 
+        if self.mock_results:
+            # In mock mode, generate synthetic data
+            # Extract expected number of items from shard name
+            shard_name = Path(shard_url).stem
+            num_items = 100  # Default number of items per shard
+
+            for i in range(num_items):
+                key = f"{shard_name}_{i:06d}"
+                url = f"mock://dataset/{shard_name}/{key}.jpg"
+
+                # Mock metadata
+                metadata = {
+                    "_shard": shard_name,
+                    "_index": i,
+                    "caption": f"Mock caption for item {i}",
+                    "_image_format": "jpg",
+                }
+
+                # We don't need actual image data for mocks
+                image_data = b""
+
+                yield key, url, image_data, metadata
+            return
+
         if not self.dataset_loader:
             logger.error("Dataset loader not initialized")
             return
+
+        # Process in smaller batches to control memory usage
+        batch_size = 10  # Process only 10 items at a time
+        batch_items = []
 
         # Use the DatasetLoader that returns full samples
         for sample in self.dataset_loader.iterate_shard(shard_url):
@@ -719,38 +963,82 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 logger.warning("Unexpected sample format: %s", type(sample))
                 continue
 
-            key = sample.get("__key__", "unknown")
-            url = sample.get("__url__", "")  # Don't use shard_url as default
+            batch_items.append(sample)
+
+            # Process batch when it's full
+            if len(batch_items) >= batch_size:
+                # Process items in the batch
+                for item in batch_items:
+                    key = item.get("__key__", "unknown")
+                    url = item.get("__url__", "")
+
+                    # Find image data
+                    image_data = None
+                    image_ext = None
+                    for ext in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]:
+                        if ext in item:
+                            image_data = item[ext]
+                            image_ext = ext
+                            break
+
+                    if not image_data:
+                        logger.debug(
+                            "No image data found for item key=%s, available keys: %s",
+                            key,
+                            list(item.keys()),
+                        )
+                        continue
+
+                    # Extract metadata (all non-system and non-image keys)
+                    metadata = {
+                        k: v
+                        for k, v in item.items()
+                        if not k.startswith("__")
+                        and k not in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]
+                    }
+
+                    # Add image format but not URLs
+                    if image_ext:
+                        metadata["_image_format"] = image_ext
+
+                    yield key, url, image_data, metadata
+
+                # Clear the batch and force garbage collection
+                batch_items.clear()
+                gc.collect()
+
+        # Process remaining items in the last batch
+        for item in batch_items:
+            key = item.get("__key__", "unknown")
+            url = item.get("__url__", "")
 
             # Find image data
             image_data = None
             image_ext = None
             for ext in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]:
-                if ext in sample:
-                    image_data = sample[ext]
+                if ext in item:
+                    image_data = item[ext]
                     image_ext = ext
                     break
 
             if not image_data:
-                logger.debug(
-                    "No image data found for item key=%s, available keys: %s",
-                    key,
-                    list(sample.keys()),
-                )
                 continue
 
-            # Extract metadata (all non-system and non-image keys)
+            # Extract metadata
             metadata = {
                 k: v
-                for k, v in sample.items()
+                for k, v in item.items()
                 if not k.startswith("__") and k not in ["jpg", "jpeg", "png", "webp", "bmp", "jxl"]
             }
 
-            # Add image format but not URLs
             if image_ext:
                 metadata["_image_format"] = image_ext
 
             yield key, url, image_data, metadata
+
+        # Final cleanup
+        batch_items.clear()
+        gc.collect()
 
     def prepare_result(
         self, unit: WorkUnit, outputs: List[Dict[str, Any]], processing_time_ms: float
@@ -772,11 +1060,13 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         """Get dataset information."""
         if self.dataset_loader:
             info = self.dataset_loader.get_dataset_info()
+            info["mock_results"] = self.mock_results
             logger.debug("Dataset info: %s", info)
             return info
         info = {
             "dataset_path": self.dataset_config.get("dataset_path"),
             "dataset_type": self.dataset_config.get("type", "huggingface"),
+            "mock_results": self.mock_results,
         }
         logger.debug("Dataset info (no loader): %s", info)
         return info
