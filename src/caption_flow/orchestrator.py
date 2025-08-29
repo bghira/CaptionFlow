@@ -1,6 +1,3 @@
-import tracemalloc
-
-tracemalloc.start()
 import time
 import asyncio
 import json
