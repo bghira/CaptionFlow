@@ -746,7 +746,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
 
     def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image.Image:
         """Create a dummy image"""
-        color = (0,0,0)
+        color = (0, 0, 0)
         width, height = 128, 128
         image = Image.new("RGB", (width, height), color=color)
 
