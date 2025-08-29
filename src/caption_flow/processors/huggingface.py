@@ -859,11 +859,9 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                     # Process items
                     for global_idx, local_idx in batch_pairs:
                         try:
-                            # Get item as dictionary
-                            item = {}
-                            for col_name in table.column_names:
-                                value = table[col_name][local_idx].as_py()
-                                item[col_name] = value
+                            # Get item as dictionary (efficient row extraction)
+                            row_dict = table.slice(local_idx, 1).to_pydict()
+                            item = {k: v[0] for k, v in row_dict.items()}
 
                             # Process image
                             image = None

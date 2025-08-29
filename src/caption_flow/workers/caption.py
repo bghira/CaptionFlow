@@ -198,8 +198,10 @@ class CaptionWorker(BaseWorker):
         self.current_unit: Optional[WorkUnit] = None
 
         # Processing queues
-        self.readahead_queue = Queue(maxsize=2560)
-        self.inference_queue = Queue(maxsize=2048)
+        readahead_queue_size = config.get("readahead_queue_size", 2560)
+        inference_queue_size = config.get("inference_queue_size", 2048)
+        self.readahead_queue = Queue(maxsize=readahead_queue_size)
+        self.inference_queue = Queue(maxsize=inference_queue_size)
         self.result_queue = Queue()
 
         # Processing control
