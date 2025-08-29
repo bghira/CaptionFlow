@@ -745,25 +745,9 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
         return url.split("/")[-1]
 
     def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image.Image:
-        """Create a dummy image with some visual indication of the index."""
-        # Create a simple colored image with the index written on it
-        import numpy as np
-        from PIL import ImageDraw, ImageFont
-
-        # Use different colors based on index for visual variety
-        colors = [
-            (255, 200, 200),  # Light red
-            (200, 255, 200),  # Light green
-            (200, 200, 255),  # Light blue
-            (255, 255, 200),  # Light yellow
-            (255, 200, 255),  # Light magenta
-            (200, 255, 255),  # Light cyan
-        ]
-
-        color = colors[index % len(colors)]
-
-        # Create image
-        width, height = 1024, 1024  # Common size for ML datasets
+        """Create a dummy image"""
+        color = (0,0,0)
+        width, height = 128, 128
         image = Image.new("RGB", (width, height), color=color)
 
         return image
