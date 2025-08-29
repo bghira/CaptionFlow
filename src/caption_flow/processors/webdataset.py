@@ -224,61 +224,45 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         log_memory("periodic maintenance")
 
     def _restore_state(self, storage: StorageManager) -> None:
-        """Restore state from chunk tracker."""
+        """Restore state from chunk tracker - matching original WebDataset implementation."""
         logger.debug("Restoring state from chunk tracker")
         if not self.chunk_tracker:
             return
 
-        # Get all processed job_ids from storage
-        all_processed_jobs = storage.get_all_processed_job_ids()
+        shards_summary = self.chunk_tracker.get_shards_summary()
 
         with self.lock:
-            # Iterate through all chunks in the chunk tracker
-            for chunk_id, chunk_state in self.chunk_tracker.chunks.items():
-                # Skip completed chunks
-                if chunk_state.status == "completed":
-                    logger.debug(f"Skipping completed chunk {chunk_id}")
-                    continue
+            for shard_name, shard_info in shards_summary.items():
+                # Check if 'chunks' exists in shard_info
+                chunks = shard_info.get("chunks", [])
+                for chunk_state in chunks:
+                    # Only add incomplete chunks
+                    if chunk_state.status != "completed":
+                        logger.debug(f"Creating WorkUnit for chunk {chunk_state}")
+                        unit = WorkUnit(
+                            unit_id=chunk_state.chunk_id,
+                            chunk_id=chunk_state.chunk_id,
+                            source_id=shard_name,
+                            data={
+                                "shard_url": chunk_state.shard_url,
+                                "start_index": chunk_state.start_index,
+                                "chunk_size": chunk_state.chunk_size,
+                                # Use full chunk range as unprocessed for now
+                                "unprocessed_ranges": [
+                                    (
+                                        chunk_state.start_index,
+                                        chunk_state.start_index + chunk_state.chunk_size - 1,
+                                    )
+                                ],
+                            },
+                            metadata={
+                                "shard_name": shard_name,
+                                "chunk_index": chunk_state.start_index // self.chunk_size,
+                            },
+                        )
 
-                # Calculate actual unprocessed ranges based on what's in storage
-                chunk_range = (
-                    chunk_state.start_index,
-                    chunk_state.start_index + chunk_state.chunk_size - 1,
-                )
-
-                # Get processed indices for this chunk
-                processed_ranges = self.chunk_tracker.get_processed_indices_for_chunk(
-                    chunk_id, all_processed_jobs
-                )
-
-                # Calculate unprocessed ranges
-                unprocessed_ranges = self._subtract_ranges([chunk_range], processed_ranges)
-
-                if unprocessed_ranges:
-                    # Create work unit for unprocessed items
-                    logger.debug(f"Creating WorkUnit for chunk {chunk_state}")
-
-                    # Extract shard name from chunk_id (format: "shard_name:chunk:N")
-                    shard_name = chunk_id.split(":")[0]
-
-                    unit = WorkUnit(
-                        unit_id=chunk_id,
-                        chunk_id=chunk_id,
-                        source_id=shard_name,
-                        data={
-                            "shard_url": chunk_state.shard_url,
-                            "start_index": chunk_state.start_index,
-                            "chunk_size": chunk_state.chunk_size,
-                            "unprocessed_ranges": unprocessed_ranges,
-                        },
-                        metadata={
-                            "shard_name": shard_name,
-                            "chunk_index": chunk_state.start_index // self.chunk_size,
-                        },
-                    )
-
-                    self.work_units[unit.unit_id] = unit
-                    self.pending_units.append(unit.unit_id)
+                        self.work_units[unit.unit_id] = unit
+                        self.pending_units.append(unit.unit_id)
 
     def _create_units_background(self) -> None:
         """Background thread to create work units on demand."""
@@ -334,20 +318,87 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                                 f"Using cached size for shard {current_shard_name}: {current_shard_items} items"
                             )
                         else:
-                            # For WebDataset, we can estimate or use a default chunk size
-                            # instead of counting all items (which loads the entire shard)
+                            # For WebDataset, check for accompanying .json metadata file
                             if (
                                 self.dataset_loader
                                 and self.dataset_loader.dataset_format == "webdataset"
                             ):
-                                # Use a reasonable estimate for WebDataset shards
-                                # Most WebDataset shards have 1000-10000 items
-                                current_shard_items = 10000  # Conservative estimate
-                                logger.info(
-                                    f"Using estimated size for WebDataset shard {current_shard_name}: ~{current_shard_items} items"
-                                )
+                                # Try to read metadata from .json file
+                                json_url = current_shard_url.replace(".tar", ".json")
+                                try:
+                                    if self.dataset_loader.dataset_type == "huggingface":
+                                        # Download and read JSON metadata
+                                        import requests
+
+                                        headers = {
+                                            "Authorization": f"Bearer {self.dataset_loader.token}"
+                                        }
+                                        response = requests.get(json_url, headers=headers)
+                                        response.raise_for_status()
+                                        metadata = response.json()
+
+                                        # Extract count from metadata (common formats)
+                                        if "count" in metadata:
+                                            current_shard_items = metadata["count"]
+                                        elif "num_samples" in metadata:
+                                            current_shard_items = metadata["num_samples"]
+                                        elif "length" in metadata:
+                                            current_shard_items = metadata["length"]
+                                        else:
+                                            # If metadata exists but no count, look at the data
+                                            if isinstance(metadata, list):
+                                                current_shard_items = len(metadata)
+                                            else:
+                                                raise ValueError(
+                                                    "Could not find item count in metadata"
+                                                )
+
+                                        logger.info(
+                                            f"Read shard size from metadata for {current_shard_name}: {current_shard_items} items"
+                                        )
+                                        shard_sizes[current_shard_url] = current_shard_items
+                                    else:
+                                        # Local file - read JSON directly
+                                        json_path = Path(current_shard_url.replace(".tar", ".json"))
+                                        if json_path.exists():
+                                            with open(json_path, "r") as f:
+                                                metadata = json.load(f)
+                                                if "count" in metadata:
+                                                    current_shard_items = metadata["count"]
+                                                elif "num_samples" in metadata:
+                                                    current_shard_items = metadata["num_samples"]
+                                                elif isinstance(metadata, list):
+                                                    current_shard_items = len(metadata)
+                                                else:
+                                                    raise ValueError(
+                                                        "Could not find count in metadata"
+                                                    )
+                                            logger.info(
+                                                f"Read shard size from local metadata: {current_shard_items} items"
+                                            )
+                                        else:
+                                            raise FileNotFoundError("No metadata file found")
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Could not read metadata for {current_shard_name}: {e}"
+                                    )
+                                    # Fall back to counting (with warning)
+                                    logger.warning(
+                                        f"WARNING: Counting items in shard {current_shard_name} - this will load the entire tar file!"
+                                    )
+                                    current_shard_items = sum(
+                                        1
+                                        for _ in self.dataset_loader.iterate_shard(
+                                            current_shard_url
+                                        )
+                                    )
+                                    shard_sizes[current_shard_url] = current_shard_items
+                                    gc.collect()
                             else:
-                                # Only count if absolutely necessary (non-WebDataset)
+                                # For non-WebDataset formats, actually count
+                                logger.warning(
+                                    f"Counting items in non-WebDataset shard {current_shard_name} - this may use significant memory"
+                                )
                                 current_shard_items = sum(
                                     1 for _ in self.dataset_loader.iterate_shard(current_shard_url)
                                 )
@@ -355,6 +406,8 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                                 logger.info(
                                     f"Counted shard {current_shard_name}: {current_shard_items} items"
                                 )
+                                # Force cleanup after counting
+                                gc.collect()
 
                         current_index = 0
 
