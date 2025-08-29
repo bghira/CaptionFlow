@@ -938,8 +938,6 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                             "_key": key,
                         },
                     )
-                else:
-                    image = Image.open(image_data)
 
                 job_id = f"{shard_name}:chunk:{chunk_index}:idx:{idx}"
 
@@ -962,7 +960,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
 
                 # Prepare item for captioning
                 yield {
-                    "image": image,
+                    "image": image_data,
                     "item_key": str(key),  # Ensure string copy
                     "item_index": idx,
                     "metadata": clean_metadata,
