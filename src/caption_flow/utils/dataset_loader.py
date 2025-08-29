@@ -173,7 +173,70 @@ class DatasetLoader:
                 yield sample
 
     def count_shard_items(self, shard_url: str, processed_keys: Optional[set] = None) -> int:
-        """Count items in a shard (can be slow for large shards)."""
+        """Count items in a shard using metadata when available."""
+        # Try to read count from JSON metadata first
+        if self.dataset_format == "webdataset":
+            json_url = shard_url.replace(".tar", ".json")
+            try:
+                if self.dataset_type == "huggingface":
+                    # Download and read JSON metadata
+                    import requests
+
+                    headers = {"Authorization": f"Bearer {self.token}"}
+                    response = requests.get(json_url, headers=headers)
+                    response.raise_for_status()
+                    metadata = response.json()
+
+                    # Extract count from metadata (common formats)
+                    count = None
+                    if "count" in metadata:
+                        count = metadata["count"]
+                    elif "num_samples" in metadata:
+                        count = metadata["num_samples"]
+                    elif "length" in metadata:
+                        count = metadata["length"]
+                    elif "files" in metadata:
+                        count = len(metadata["files"])
+                    elif isinstance(metadata, list):
+                        count = len(metadata)
+
+                    if count is not None:
+                        logger.info(f"Got shard count from metadata for {shard_url}: {count} items")
+                        # If processed_keys provided, subtract their count
+                        if processed_keys:
+                            return count - len(processed_keys)
+                        return count
+                    else:
+                        logger.warning(f"Could not find count in metadata for {shard_url}")
+
+                else:  # Local file
+                    json_path = Path(shard_url.replace(".tar", ".json"))
+                    if json_path.exists():
+                        with open(json_path, "r") as f:
+                            metadata = json.load(f)
+                            count = None
+                            if "count" in metadata:
+                                count = metadata["count"]
+                            elif "num_samples" in metadata:
+                                count = metadata["num_samples"]
+                            elif "length" in metadata:
+                                count = metadata["length"]
+                            elif isinstance(metadata, list):
+                                count = len(metadata)
+
+                            if count is not None:
+                                logger.info(f"Got shard count from local metadata: {count} items")
+                                if processed_keys:
+                                    return count - len(processed_keys)
+                                return count
+
+            except Exception as e:
+                logger.warning(f"Could not read metadata for {shard_url}: {e}")
+
+        # Fall back to counting (with warning)
+        logger.warning(
+            f"WARNING: Counting items in shard {shard_url} - this will load the entire tar file!"
+        )
         count = 0
         try:
             for _ in self.iterate_shard(shard_url, processed_keys):
