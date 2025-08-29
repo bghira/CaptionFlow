@@ -3,12 +3,14 @@
 import logging
 import threading
 import re
+import queue
 import requests
 import json
 import io
 import os
 import gc
 import psutil
+from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Dict, Any, List, Optional, Iterator, Set, Deque, Tuple
 from collections import deque, defaultdict
 from pathlib import Path
@@ -39,11 +41,71 @@ def log_memory(location: str):
     gc.collect()
 
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+
+class NonBlockingQueueHandler:
+    """Handles non-blocking retrieval from queues using concurrent futures."""
+
+    def __init__(self, max_workers: int = 1):
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.pending_futures: Dict[int, Future] = {}  # queue_id -> Future
+
+    def get_from_queue_async(self, response_queue: queue.Queue, timeout: float = None) -> Future:
+        """Start an async queue retrieval."""
+        queue_id = id(response_queue)
+
+        # Check if we already have a pending future for this queue
+        if queue_id in self.pending_futures and not self.pending_futures[queue_id].done():
+            return self.pending_futures[queue_id]
+
+        # Start new async retrieval
+        future = self.executor.submit(response_queue.get, timeout=timeout)
+        self.pending_futures[queue_id] = future
+        return future
+
+    def check_response(self, response_queue: queue.Queue, timeout: float = None) -> Optional[Any]:
+        """Non-blocking check for queue response."""
+        queue_id = id(response_queue)
+
+        # Start async retrieval if needed
+        future = self.get_from_queue_async(response_queue, timeout)
+
+        # Check if result is ready (non-blocking)
+        if future.done():
+            try:
+                result = future.result(timeout=0)
+                # Clear future for next retrieval
+                if queue_id in self.pending_futures:
+                    del self.pending_futures[queue_id]
+                return result
+            except queue.Empty:
+                # Queue was empty, clear future
+                if queue_id in self.pending_futures:
+                    del self.pending_futures[queue_id]
+                return None
+            except Exception as e:
+                logger.error(f"Error retrieving from queue: {e}")
+                if queue_id in self.pending_futures:
+                    del self.pending_futures[queue_id]
+                return None
+
+        # Result not ready yet
+        return None
+
+    def shutdown(self):
+        """Shutdown the executor."""
+        self.executor.shutdown(wait=True)
+
+
 class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
-    """Memory-optimized orchestrator processor for HuggingFace datasets."""
+    """Memory-optimized orchestrator processor for HuggingFace datasets with non-blocking operations."""
 
     def __init__(self):
-        logger.debug("Initializing HuggingFaceDatasetOrchestratorProcessor (Optimized)")
+        logger.debug(
+            "Initializing HuggingFaceDatasetOrchestratorProcessor (Optimized + Non-blocking)"
+        )
         self.dataset_name: Optional[str] = None
         self.config: Optional[str] = None
         self.split: Optional[str] = None
@@ -69,6 +131,13 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         # Background thread for creating work units
         self.unit_creation_thread: Optional[threading.Thread] = None
         self.stop_creation = threading.Event()
+
+        # Non-blocking queue handler
+        self.queue_handler = NonBlockingQueueHandler()
+
+        # Response processing state
+        self.last_maintenance_time = datetime.now()
+        self.maintenance_interval = 30  # seconds
 
     def initialize(self, config: ProcessorConfig, storage: StorageManager) -> None:
         """Initialize HuggingFace dataset processor."""
@@ -429,6 +498,45 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         logger.info("Thread for creating units has completed. Exiting thread.")
 
+    def process_responses_non_blocking(self, response_queue: queue.Queue) -> Optional[WorkResult]:
+        """
+        Non-blocking method to process responses from workers.
+        Returns a WorkResult if one is available, None otherwise.
+        """
+        # Check for response without blocking
+        response = self.queue_handler.check_response(response_queue, timeout=0.1)
+
+        if response is not None:
+            # Process the response
+            if isinstance(response, WorkResult):
+                logger.debug(f"Processing response for unit {response.unit_id}")
+                return response
+            else:
+                logger.warning(f"Unexpected response type: {type(response)}")
+
+        # Perform periodic maintenance tasks
+        now = datetime.now()
+        if (now - self.last_maintenance_time).total_seconds() > self.maintenance_interval:
+            self._perform_maintenance()
+            self.last_maintenance_time = now
+
+        return None
+
+    def _perform_maintenance(self):
+        """Perform periodic maintenance tasks."""
+        with self.lock:
+            # Log current state
+            pending_count = len(self.pending_units)
+            assigned_count = sum(len(units) for units in self.assigned_units.values())
+            logger.debug(f"Maintenance: {pending_count} pending, {assigned_count} assigned units")
+
+            # Check for stale assignments (workers that might have disconnected)
+            # This would be implemented based on your worker heartbeat mechanism
+
+            # Force checkpoint save if needed
+            if self.chunk_tracker:
+                self.chunk_tracker.save_checkpoint()
+
     def get_work_units(self, count: int, worker_id: str) -> List[WorkUnit]:
         """Get available work units for a worker."""
 
@@ -579,6 +687,22 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         return unprocessed_ranges
 
+    def cleanup(self):
+        """Clean up resources."""
+        logger.info("Cleaning up orchestrator resources")
+
+        # Stop background threads
+        self.stop_creation.set()
+        if self.unit_creation_thread:
+            self.unit_creation_thread.join(timeout=5)
+
+        # Shutdown queue handler
+        self.queue_handler.shutdown()
+
+        # Save final state
+        if self.chunk_tracker:
+            self.chunk_tracker.save_checkpoint()
+
 
 class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
     """Memory-optimized worker processor for HuggingFace datasets."""
@@ -639,7 +763,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
         color = colors[index % len(colors)]
 
         # Create image
-        width, height = 8, 8  # Common size for ML datasets
+        width, height = 1024, 1024  # Common size for ML datasets
         image = Image.new("RGB", (width, height), color=color)
 
         return image
