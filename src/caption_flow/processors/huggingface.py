@@ -406,6 +406,21 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         job_id_obj = JobId(shard_id=shard_name, chunk_id=chunk_index, sample_id=current_index)
         unit_id = job_id_obj.get_chunk_str()
 
+        # Calculate unprocessed ranges based on existing chunk state
+        unprocessed_ranges = [(current_index, current_index + chunk_size - 1)]
+
+        if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
+            chunk_state = self.chunk_tracker.chunks[unit_id]
+            if chunk_state.processed_ranges:
+                # Subtract processed ranges from total range
+                unprocessed_ranges = self._subtract_ranges(
+                    [(current_index, current_index + chunk_size - 1)], chunk_state.processed_ranges
+                )
+
+        # If all ranges are processed, return None (shouldn't happen if status tracking is correct)
+        if not unprocessed_ranges:
+            return None
+
         unit = WorkUnit(
             unit_id=unit_id,
             chunk_id=unit_id,
@@ -416,9 +431,9 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 "split": self.split,
                 "start_index": current_index,
                 "chunk_size": chunk_size,
-                "unprocessed_ranges": [(current_index, current_index + chunk_size - 1)],
+                "unprocessed_ranges": unprocessed_ranges,  # Use calculated ranges
                 "shard_ids": [shard_id],
-                "data_files": self.data_files,  # Pass ALL data files for offset calculation
+                "data_files": self.data_files,
             },
             metadata={
                 "dataset": self.dataset_name,
