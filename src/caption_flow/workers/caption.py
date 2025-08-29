@@ -15,7 +15,7 @@ from queue import Queue, Empty
 from threading import Thread, Event, Lock
 from collections import defaultdict, deque
 
-from puhu import Image
+from PIL import Image
 from huggingface_hub import get_token
 
 from .base import BaseWorker
@@ -46,7 +46,7 @@ class ProcessingItem:
     chunk_id: str
     item_key: str
     item_index: int
-    image: Image
+    image: Image.Image
     image_data: bytes
     metadata: Dict[str, Any]
     stage_results: Dict[str, StageResult] = None
@@ -857,7 +857,7 @@ class CaptionWorker(BaseWorker):
 
         return results
 
-    def _build_vllm_input(self, image: Image, prompt: str, processor, tokenizer) -> Dict:
+    def _build_vllm_input(self, image: Image.Image, prompt: str, processor, tokenizer) -> Dict:
         """Build vLLM input."""
         try:
             from qwen_vl_utils import process_vision_info

@@ -13,7 +13,7 @@ from threading import Thread, Event
 
 import pandas as pd
 import pyarrow.parquet as pq
-from puhu import Image
+from PIL import Image
 import boto3
 from botocore.config import Config
 
