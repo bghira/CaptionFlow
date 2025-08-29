@@ -127,9 +127,10 @@ class ImageProcessor:
             Prepared PIL Image
         """
         # Convert to RGBA to handle transparency
-        img_rgba = image.convert("RGBA")
-        rgb_img = img_rgba.convert("RGB")
-        np_img = np.array(rgb_img)
+        if hasattr(image, "convert"):
+            image = image.convert("RGBA")
+            image = image.convert("RGB")
+        np_img = np.array(image)
 
         # Calculate percentage of pixels that are (0,0,0) or (255,255,255)
         total_pixels = np_img.shape[0] * np_img.shape[1]
