@@ -92,7 +92,8 @@ class ImageProcessor:
                 # Save as PNG bytes
                 img_bytes = io.BytesIO()
                 # Convert to RGB
-                img_data = img_data.convert("RGB")
+                if hasattr(img_data, "convert"):
+                    img_data = img_data.convert("RGB")
                 img_data.save(img_bytes, format="PNG")
                 return img_bytes.getvalue()
 
