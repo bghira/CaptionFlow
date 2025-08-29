@@ -631,7 +631,7 @@ class CaptionWorker(BaseWorker):
                     self.main_loop,
                 ).result(timeout=5)
 
-        logger.info(f"Unit {unit.unit_id} processed {items_processed} items: {context}")
+        logger.info(f"Unit {unit.unit_id} processed {items_processed} items")
 
     def _batch_for_inference(self):
         """Batch items from readahead queue for inference."""
