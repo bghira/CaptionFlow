@@ -344,6 +344,8 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                                             current_shard_items = metadata["num_samples"]
                                         elif "length" in metadata:
                                             current_shard_items = metadata["length"]
+                                        elif "files" in metadata:
+                                            current_shard_items = len(metadata["files"])
                                         else:
                                             # If metadata exists but no count, look at the data
                                             if isinstance(metadata, list):
