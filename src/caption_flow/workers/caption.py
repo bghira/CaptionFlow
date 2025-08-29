@@ -761,7 +761,7 @@ class CaptionWorker(BaseWorker):
                 for idx, (original_idx, item, attempt_count) in enumerate(items_to_process):
                     current_batch.append((original_idx, item, attempt_count))
 
-                    # Prepare image from PIL frame or bytes
+                    # Prepare image from PIL frame or bytes and remove it from the object.
                     converted_img = ImageProcessor.prepare_for_inference(item)
 
                     # Create template manager
@@ -950,8 +950,16 @@ class CaptionWorker(BaseWorker):
                         metadata={
                             "item_key": item.item_key,
                             "item_index": item.metadata.get("_item_index"),
-                            "image_width": item.image.width,
-                            "image_height": item.image.height,
+                            "image_width": (
+                                item.image.width
+                                if item.image is not None
+                                else item.metadata.get("image_width")
+                            ),
+                            "image_height": (
+                                item.image.height
+                                if item.image is not None
+                                else item.metadata.get("image_height")
+                            ),
                             "image_format": item.image.format or "unknown",
                             "file_size": len(item.image_data) if item.image_data else 0,
                             **item.metadata,

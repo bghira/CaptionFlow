@@ -36,9 +36,17 @@ class ImageProcessor:
         # We used to do a lot more hand-holding here with transparency, but oh well.
 
         if item.image is not None:
-            return item.image
+            image = item.image
+            item.metadata["image_width"], item.metadata["image_height"] = image.size
+            item.image = None
+            return image
 
-        return Image.open(BytesIO(item.image_data))
+        item.image = None
+        image = Image.open(BytesIO(item.image_data))
+        item.image_data = b""
+        item.metadata["image_width"], item.metadata["image_height"] = image.size
+
+        return image
 
     def shutdown(self):
         """Shutdown the executor."""
