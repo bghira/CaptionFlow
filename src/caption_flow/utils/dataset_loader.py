@@ -172,6 +172,8 @@ class DatasetLoader:
             if isinstance(sample, dict) and "__key__" in sample:
                 yield sample
 
+        del ds
+
     def count_shard_items(self, shard_url: str, processed_keys: Optional[set] = None) -> int:
         """Count items in a shard using metadata when available."""
         # Try to read count from JSON metadata first

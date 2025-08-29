@@ -581,7 +581,7 @@ class CaptionWorker(BaseWorker):
                     job_id=item_data["job_id"],
                     item_key=item_data["item_key"],
                     item_index=item_data["item_index"],
-                    image=item_data["image"],
+                    image=item_data.get("image", None),
                     image_data=item_data.get("image_data", b""),
                     metadata=item_data.get("metadata", {}),
                 )
@@ -761,8 +761,8 @@ class CaptionWorker(BaseWorker):
                 for idx, (original_idx, item, attempt_count) in enumerate(items_to_process):
                     current_batch.append((original_idx, item, attempt_count))
 
-                    # Prepare image
-                    converted_img = ImageProcessor.prepare_for_inference(item.image)
+                    # Prepare image from PIL frame or bytes
+                    converted_img = ImageProcessor.prepare_for_inference(item)
 
                     # Create template manager
                     template_manager = PromptTemplateManager(stage.prompts)

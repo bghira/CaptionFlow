@@ -915,6 +915,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 image = None
                 if self.mock_results:
                     logger.debug(f"Creating mock image for index {idx}")
+                    image_data = None
                     image = self._create_dummy_image(
                         idx,
                         {
@@ -923,15 +924,6 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                             "_key": key,
                         },
                     )
-                else:
-                    bio = io.BytesIO(image_data)
-                    with Image.open(bio) as im:
-                        im.load()
-                        image = im.convert(
-                            "RGB"
-                        ).copy()  # detach from fp/buffer and drop tiled decoders
-                    del image_data
-                    del bio
 
                 job_id = f"{shard_name}:chunk:{chunk_index}:idx:{idx}"
                 clean_metadata = {
@@ -952,6 +944,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 # Yield item for captioning
                 yield {
                     "image": image,
+                    "image_data": image_data,
                     "item_key": str(key),
                     "item_index": idx,
                     "metadata": clean_metadata,

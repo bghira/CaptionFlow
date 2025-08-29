@@ -10,6 +10,7 @@ from typing import List, Any, Optional, Tuple, Union
 import numpy as np
 import requests
 from PIL import Image
+from ..models import ProcessingItem
 
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ class ImageProcessor:
         self.executor = ProcessPoolExecutor(max_workers=num_workers)
 
     @staticmethod
-    def prepare_for_inference(image: Image.Image) -> Image.Image:
+    def prepare_for_inference(item: ProcessingItem) -> Image.Image:
         """
         Prepare image for inference.
 
@@ -34,7 +35,10 @@ class ImageProcessor:
         """
         # We used to do a lot more hand-holding here with transparency, but oh well.
 
-        return image
+        if item.image is not None:
+            return item.image
+
+        return Image.open(BytesIO(item.image_data))
 
     def shutdown(self):
         """Shutdown the executor."""
