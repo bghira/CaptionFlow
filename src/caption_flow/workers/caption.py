@@ -601,6 +601,9 @@ class CaptionWorker(BaseWorker):
                     except:
                         if time.time() > timeout_end:
                             raise TimeoutError("Queue put timeout")
+                        logger.warning(
+                            f"Could not put index {item.metadata.get('image_index')} into queue"
+                        )
                         continue
 
                 if not self.connected.is_set() or self.should_stop_processing.is_set():

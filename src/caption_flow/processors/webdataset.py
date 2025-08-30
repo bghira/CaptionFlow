@@ -951,6 +951,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                     "job_id": job_id,
                 }
 
+                logger.debug(f"Yielded item idx={idx} key={key} job_id={job_id}")
                 processed_indices.append(idx)
                 if len(processed_indices) % 10 == 0:
                     gc.collect()
