@@ -38,12 +38,14 @@ class ImageProcessor:
         if item.image is not None:
             image = item.image
             item.metadata["image_width"], item.metadata["image_height"] = image.size
+            item.metadata["image_format"] = image.format or "unknown"
             item.image = None
             return image
 
         item.image = None
         image = Image.open(BytesIO(item.image_data))
         item.image_data = b""
+        item.metadata["image_format"] = image.format or "unknown"
         item.metadata["image_width"], item.metadata["image_height"] = image.size
 
         return image

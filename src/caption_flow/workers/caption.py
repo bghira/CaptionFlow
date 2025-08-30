@@ -963,7 +963,11 @@ class CaptionWorker(BaseWorker):
                                 if item.image is not None
                                 else item.metadata.get("image_height")
                             ),
-                            "image_format": item.image.format or "unknown",
+                            "image_format": (
+                                item.image.format
+                                if item.image is not None
+                                else item.metadata.get("image_format", "unknown")
+                            ),
                             "file_size": len(item.image_data) if item.image_data else 0,
                             **item.metadata,
                         },
