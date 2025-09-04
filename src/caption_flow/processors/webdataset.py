@@ -523,7 +523,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
 
     def process_unit(self, unit: WorkUnit, context: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         """Process a work unit by iterating specified ranges."""
-        logger.debug(f"Processing unit: {unit.unit_id}")
+        logger.debug(f"Processing unit: {unit}")
 
         shard_name = unit.data["shard_name"]
         shard_idx = unit.data.get("shard_idx")
