@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
