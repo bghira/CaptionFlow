@@ -14,6 +14,7 @@ class WorkUnit:
     unit_id: str  # usually, but not always, the chunk id
     chunk_id: str  # always the chunk id
     source_id: str  # the shard name
+    unit_size: int  # how many elements are in the workunit
     data: Dict[str, Any]
     metadata: Dict[str, Any] = field(default_factory=dict)
     priority: int = 0
@@ -44,6 +45,7 @@ class WorkAssignment:
                     "unit_id": u.unit_id,
                     "source_id": u.source_id,
                     "chunk_id": u.chunk_id,
+                    "unit_size": u.unit_size,
                     "data": u.data,
                     "metadata": u.metadata,
                     "priority": u.priority,
@@ -62,6 +64,7 @@ class WorkAssignment:
                 unit_id=u["unit_id"],
                 chunk_id=u["chunk_id"],
                 source_id=u["source_id"],
+                unit_size=u["unit_size"],
                 data=u["data"],
                 metadata=u.get("metadata", {}),
                 priority=u.get("priority", 0),

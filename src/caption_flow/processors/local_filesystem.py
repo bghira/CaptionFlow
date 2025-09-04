@@ -251,6 +251,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                         unit_id=chunk_id,
                         chunk_id=chunk_id,
                         source_id="local",
+                        unit_size=chunk_state.chunk_size,
                         data={
                             "start_index": chunk_state.start_index,
                             "chunk_size": chunk_state.chunk_size,
@@ -319,6 +320,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                         unit_id=unit_id,
                         chunk_id=unit_id,
                         source_id="local",
+                        unit_size=chunk_size,
                         data={
                             "start_index": self.current_index,
                             "chunk_size": chunk_size,

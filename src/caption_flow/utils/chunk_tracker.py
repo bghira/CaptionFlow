@@ -10,6 +10,7 @@ from dataclasses import dataclass, asdict, field
 from .checkpoint_tracker import CheckpointTracker
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 @dataclass
