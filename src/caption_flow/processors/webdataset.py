@@ -140,6 +140,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                             unit_id=chunk_state.chunk_id,
                             chunk_id=chunk_state.chunk_id,
                             source_id=shard_name,
+                            unit_size=chunk_state.chunk_size,
                             data={
                                 "shard_url": chunk_state.shard_url,
                                 "shard_name": shard_name,
@@ -231,6 +232,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         unit_id=chunk_id,
                         chunk_id=chunk_id,
                         source_id=shard_name,
+                        unit_size=chunk_size,
                         data={
                             "shard_url": shard_url,
                             "shard_name": shard_name,

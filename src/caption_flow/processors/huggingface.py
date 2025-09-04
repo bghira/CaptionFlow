@@ -425,6 +425,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             unit_id=unit_id,
             chunk_id=unit_id,
             source_id=shard_name,
+            unit_size=chunk_size,
             data={
                 "dataset_name": self.dataset_name,
                 "config": self.config,

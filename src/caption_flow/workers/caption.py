@@ -607,7 +607,7 @@ class CaptionWorker(BaseWorker):
         # Notify orchestrator that unit is complete
         # Check if the number of processed items matches the expected count for the unit.
         # The context dictionary holds the count of items yielded by the processor.
-        total_items_in_unit = unit.end_index - unit.start_index
+        total_items_in_unit = unit.unit_size
 
         if (
             not self.should_stop_processing.is_set()
