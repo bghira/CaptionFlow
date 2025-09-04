@@ -64,6 +64,7 @@ class WorkAssignment:
                 unit_id=u["unit_id"],
                 chunk_id=u["chunk_id"],
                 source_id=u["source_id"],
+                unit_size=u["unit_size"],
                 data=u["data"],
                 metadata=u.get("metadata", {}),
                 priority=u.get("priority", 0),
