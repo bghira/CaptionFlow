@@ -283,6 +283,25 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 unit = self.work_units.get(unit_id)
 
                 if unit:
+                    # Update unprocessed ranges from chunk tracker before assigning
+                    if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
+                        chunk_state = self.chunk_tracker.chunks[unit_id]
+                        relative_unprocessed = chunk_state.get_unprocessed_ranges()
+
+                        # Convert relative to absolute indices
+                        absolute_ranges = []
+                        for start, end in relative_unprocessed:
+                            abs_start = chunk_state.start_index + start
+                            abs_end = chunk_state.start_index + end
+                            absolute_ranges.append((abs_start, abs_end))
+
+                        # Update the work unit's unprocessed ranges
+                        unit.data["unprocessed_ranges"] = absolute_ranges
+
+                        logger.debug(
+                            f"Updated unit {unit_id} with unprocessed ranges: {absolute_ranges}"
+                        )
+
                     self.assigned_units[worker_id].add(unit_id)
                     assigned.append(unit)
 
@@ -427,12 +446,6 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         logger.debug(f"Marking ranges {ranges} as processed in chunk {chunk_id}")
                         for start_idx, end_idx in ranges:
                             self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
-                        first_idx, last_idx = sorted_indices[0], sorted_indices[-1]
-                        logger.debug(
-                            f"Marking {sorted_indices} items processed in {chunk_id}:{first_idx} through {chunk_id}:{last_idx}"
-                        )
-                        for idx in sorted_indices:
-                            self.chunk_tracker.mark_items_processed(chunk_id, idx, idx)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get processor statistics."""
@@ -647,8 +660,8 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         result = super().prepare_result(unit, outputs, processing_time_ms)
 
         # Add processed indices for chunk tracker
-        if outputs and "_processed_indices" in outputs[0].get("metadata", {}):
-            result.metadata["item_indices"] = outputs[0]["metadata"]["_processed_indices"]
+        if hasattr(self, "_last_context") and "_processed_indices" in self._last_context:
+            result.metadata["item_indices"] = self._last_context["_processed_indices"]
 
         return result
 
