@@ -124,12 +124,13 @@ class Orchestrator:
 
         # Initialize storage
         await self.storage.initialize()
-        await self.update_unprocessed_ranges()
 
         # Start background tasks
         asyncio.create_task(self._heartbeat_loop())
         asyncio.create_task(self._checkpoint_loop())
         asyncio.create_task(self._stats_update_loop())
+
+        await self.update_unprocessed_ranges()
 
         # Start WebSocket server
         websocket_logger = logging.getLogger("websockets")

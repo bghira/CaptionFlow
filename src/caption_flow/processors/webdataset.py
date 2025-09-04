@@ -110,58 +110,86 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         return self.shard_info_cache[shard_idx]
 
     def _restore_state(self, storage: StorageManager) -> None:
-        """Restore state from chunk tracker."""
-        logger.debug("Restoring state from chunk tracker")
+        """Restore state from chunk tracker and synchronize with storage."""
+        logger.info("Restoring state from chunk tracker and synchronizing with storage")
         if not self.chunk_tracker:
             return
 
+        # First, update chunk tracker from storage
+        processed_job_ids = storage.get_all_processed_job_ids()
+        if processed_job_ids:
+            logger.info(
+                f"Synchronizing chunk tracker with {len(processed_job_ids)} processed items from storage"
+            )
+            self.update_from_storage(processed_job_ids)
+
+        # Then restore work units from chunk tracker
         shards_summary = self.chunk_tracker.get_shards_summary()
-        logger.debug(f"Restoring state: {shards_summary}")
+        logger.info(f"Restoring work units from chunk tracker: {len(shards_summary)} shards")
 
         with self.lock:
+            restored_count = 0
             for shard_name, shard_info in shards_summary.items():
                 chunks = shard_info.get("chunks", [])
-                logger.debug(f"Existing job ids: {storage.get_all_processed_job_ids()}")
                 for chunk_state in chunks:
                     # Only add incomplete chunks
-                    if chunk_state.status != "completed":
-                        logger.debug(f"Restoring incomplete chunk {chunk_state}")
+                    if chunk_state.status == "completed":
+                        logger.debug(f"Skipping completed chunk {chunk_state.chunk_id}")
+                        continue
 
-                        # Get unprocessed ranges
-                        unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+                    # Get unprocessed ranges
+                    unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+                    if not unprocessed_ranges:
                         logger.debug(
-                            f"Chunk {chunk_state.chunk_id} unprocessed ranges: {unprocessed_ranges}"
+                            f"Chunk {chunk_state.chunk_id} has no unprocessed ranges, marking as completed"
                         )
-                        if not unprocessed_ranges:
-                            continue
+                        self.chunk_tracker.mark_completed(chunk_state.chunk_id)
+                        continue
 
-                        # Convert relative ranges to absolute file indices
-                        absolute_ranges = []
-                        for start, end in unprocessed_ranges:
-                            abs_start = chunk_state.start_index + start
-                            abs_end = chunk_state.start_index + end
-                            absolute_ranges.append((abs_start, abs_end))
+                    logger.info(
+                        f"Restoring chunk {chunk_state.chunk_id} with unprocessed ranges: {unprocessed_ranges}"
+                    )
 
-                        unit = WorkUnit(
-                            unit_id=chunk_state.chunk_id,
-                            chunk_id=chunk_state.chunk_id,
-                            source_id=shard_name,
-                            unit_size=chunk_state.chunk_size,
-                            data={
-                                "shard_url": chunk_state.shard_url,
-                                "shard_name": shard_name,
-                                "start_index": chunk_state.start_index,
-                                "chunk_size": chunk_state.chunk_size,
-                                "unprocessed_ranges": absolute_ranges,
-                            },
-                            metadata={
-                                "shard_name": shard_name,
-                                "chunk_index": chunk_state.start_index // self.chunk_size,
-                            },
-                        )
+                    # Convert relative ranges to absolute file indices
+                    absolute_ranges = []
+                    for start, end in unprocessed_ranges:
+                        abs_start = chunk_state.start_index + start
+                        abs_end = chunk_state.start_index + end
+                        absolute_ranges.append((abs_start, abs_end))
 
-                        self.work_units[unit.unit_id] = unit
-                        self.pending_units.append(unit.unit_id)
+                    # Get shard index if available
+                    shard_idx = None
+                    if self.dataset:
+                        for idx in range(self.dataset.num_shards):
+                            shard_info = self._get_shard_info_cached(idx)
+                            if shard_info and shard_info["name"] == shard_name:
+                                shard_idx = idx
+                                break
+
+                    unit = WorkUnit(
+                        unit_id=chunk_state.chunk_id,
+                        chunk_id=chunk_state.chunk_id,
+                        source_id=shard_name,
+                        unit_size=chunk_state.chunk_size,
+                        data={
+                            "shard_url": chunk_state.shard_url,
+                            "shard_name": shard_name,
+                            "shard_idx": shard_idx,
+                            "start_index": chunk_state.start_index,
+                            "chunk_size": chunk_state.chunk_size,
+                            "unprocessed_ranges": absolute_ranges,
+                        },
+                        metadata={
+                            "shard_name": shard_name,
+                            "chunk_index": chunk_state.start_index // self.chunk_size,
+                        },
+                    )
+
+                    self.work_units[unit.unit_id] = unit
+                    self.pending_units.append(unit.unit_id)
+                    restored_count += 1
+
+            logger.info(f"Restored {restored_count} incomplete work units")
 
     def _create_units_background(self) -> None:
         """Background thread to create work units on demand."""
@@ -407,22 +435,46 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
             # Group by chunk
             processed_by_chunk = defaultdict(set)
 
-            for job_id in processed_job_ids:
-                # Parse job_id to extract chunk and index
-                # Expected format: "shard:chunk:X:idx:Y"
-                parts = job_id.split(":")
-                if len(parts) >= 5 and parts[3] == "idx":
-                    chunk_id = ":".join(parts[:3])  # "shard:chunk:X"
-                    try:
-                        idx = int(parts[4])
-                        processed_by_chunk[chunk_id].add(idx)
-                    except ValueError:
-                        continue
+            for job_id_str in processed_job_ids:
+                try:
+                    # Use JobId to parse the job ID string
+                    job_id = JobId.from_str(job_id_str)
+                    chunk_id = job_id.get_chunk_str()
+                    sample_idx = int(job_id.sample_id)
+                    processed_by_chunk[chunk_id].add(sample_idx)
+                except ValueError as e:
+                    logger.warning(f"Invalid job ID format: {job_id_str} - {e}")
+                    continue
 
             # Update chunk tracker with processed items
             if self.chunk_tracker:
                 for chunk_id, indices in processed_by_chunk.items():
                     if indices:
+                        # Get or create chunk state
+                        chunk_state = self.chunk_tracker.chunks.get(chunk_id)
+                        if not chunk_state:
+                            # Parse chunk_id using JobId to get shard info
+                            try:
+                                # chunk_id format: "shard_id:chunk:chunk_idx"
+                                parts = chunk_id.split(":")
+                                if len(parts) >= 3:
+                                    shard_name = parts[0]
+                                    chunk_idx = int(parts[2])
+                                    # Infer start index from chunk index and size
+                                    start_index = chunk_idx * self.chunk_size
+                                    # Create chunk state
+                                    self.chunk_tracker.add_chunk(
+                                        chunk_id,
+                                        shard_name,
+                                        f"{shard_name}.tar",
+                                        start_index,
+                                        self.chunk_size,
+                                    )
+                                    logger.info(f"Created missing chunk state for {chunk_id}")
+                            except (ValueError, IndexError) as e:
+                                logger.error(f"Failed to create chunk state for {chunk_id}: {e}")
+                                continue
+
                         # Sort indices and convert to ranges
                         sorted_indices = sorted(indices)
                         if not sorted_indices:
@@ -443,9 +495,12 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         ranges.append((start_range, end_range))
 
                         # Mark each contiguous range as processed
-                        logger.debug(f"Marking ranges {ranges} as processed in chunk {chunk_id}")
+                        logger.info(f"Marking ranges {ranges} as processed in chunk {chunk_id}")
                         for start_idx, end_idx in ranges:
                             self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
+
+                # Save checkpoint after updating
+                self.chunk_tracker.save()
 
     def get_stats(self) -> Dict[str, Any]:
         """Get processor statistics."""
@@ -555,7 +610,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             # Generate mock results for unprocessed ranges
             for start_idx, end_idx in unprocessed_ranges:
                 for idx in range(start_idx, end_idx + 1):
-                    job_id = f"{shard_name}:chunk:{chunk_index}:idx:{idx}"
+                    # Use JobId to create consistent job ID
+                    job_id = JobId.from_values(
+                        shard_id=shard_name, chunk_id=str(chunk_index), sample_id=str(idx)
+                    )
+                    job_id_str = job_id.get_sample_str()
 
                     yield {
                         "image": self._create_mock_image(idx),
@@ -565,11 +624,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                         "metadata": {
                             "_item_index": idx,
                             "_chunk_relative_index": idx - unit.data["start_index"],
-                            "_job_id": job_id,
+                            "_job_id": job_id_str,
                             "_mock": True,
                             "_processed_indices": processed_indices,
                         },
-                        "job_id": job_id,
+                        "job_id": job_id_str,
                     }
 
                     processed_indices.append(idx)
@@ -614,8 +673,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                                         f"Error decoding image {entry.path} with cv2: {img_e}"
                                     )
 
-                            # Generate job ID compatible with chunk tracker
-                            job_id = f"{shard_name}:chunk:{chunk_index}:idx:{idx}"
+                            # Generate job ID using JobId class
+                            job_id = JobId.from_values(
+                                shard_id=shard_name, chunk_id=str(chunk_index), sample_id=str(idx)
+                            )
+                            job_id_str = job_id.get_sample_str()
 
                             yield {
                                 "image": image,
@@ -625,12 +687,12 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                                 "metadata": {
                                     "_item_index": idx,
                                     "_chunk_relative_index": idx - unit.data["start_index"],
-                                    "_job_id": job_id,
+                                    "_job_id": job_id_str,
                                     "_filename": entry.path,
                                     "_file_size": entry.size,
                                     "_processed_indices": processed_indices,
                                 },
-                                "job_id": job_id,
+                                "job_id": job_id_str,
                             }
 
                             processed_indices.append(idx)
