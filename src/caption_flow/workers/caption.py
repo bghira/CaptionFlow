@@ -181,6 +181,9 @@ class CaptionWorker(BaseWorker):
         self.vllm_config_manager = VLLMConfigManager()
         self.model_manager = None
 
+        # Mock mode flag
+        self.mock_mode = False
+
         # GPU selection
         self.gpu_id = config.get("gpu_id", 0)
         self.hf_token = get_token()
@@ -195,8 +198,10 @@ class CaptionWorker(BaseWorker):
         self.current_unit: Optional[WorkUnit] = None
 
         # Processing queues
-        self.readahead_queue = Queue(maxsize=256)
-        self.inference_queue = Queue(maxsize=128)
+        readahead_queue_size = config.get("readahead_queue_size", 2560)
+        inference_queue_size = config.get("inference_queue_size", 2048)
+        self.readahead_queue = Queue(maxsize=readahead_queue_size)
+        self.inference_queue = Queue(maxsize=inference_queue_size)
         self.result_queue = Queue()
 
         # Processing control
@@ -230,9 +235,15 @@ class CaptionWorker(BaseWorker):
                 logger.error(f"Failed to get config: {e}")
                 await asyncio.sleep(5)
 
-        # Initialize vLLM once we have config
-        if self.vllm_config:
-            self._setup_vllm()
+        # Check for mock mode
+        self.mock_mode = self.vllm_config.get("mock_results", False) if self.vllm_config else False
+
+        if self.mock_mode:
+            logger.info("🎭 MOCK MODE ENABLED - No vLLM models will be loaded")
+        else:
+            # Initialize vLLM once we have config
+            if self.vllm_config:
+                self._setup_vllm()
 
         # Start background threads
         Thread(target=self._unit_processor_thread, daemon=True).start()
@@ -297,6 +308,7 @@ class CaptionWorker(BaseWorker):
 
         self.processor.initialize(processor_config)
         self.dataset_path = self.processor.dataset_path
+        self.units_per_request = processor_config.config.get("chunks_per_request", 1)
 
         # Update vLLM config if provided
         new_vllm_config = welcome_data.get("processor_config", {}).get("vllm")
@@ -309,7 +321,7 @@ class CaptionWorker(BaseWorker):
 
         # Request initial work
         if self.websocket:
-            await self.websocket.send(json.dumps({"type": "request_work", "count": 2}))
+            await self.websocket.send(json.dumps({"type": "get_work_units", "count": 2}))
 
     async def _handle_message(self, data: Dict[str, Any]):
         """Handle message from orchestrator."""
@@ -327,7 +339,7 @@ class CaptionWorker(BaseWorker):
             await asyncio.sleep(10)
 
             if self.websocket and self.connected.is_set():
-                await self.websocket.send(json.dumps({"type": "request_work", "count": 2}))
+                await self.websocket.send(json.dumps({"type": "get_work_units", "count": 2}))
 
     def _parse_stages_config(self, vllm_config: Dict[str, Any]) -> List[ProcessingStage]:
         """Parse stages configuration from vLLM config."""
@@ -405,6 +417,7 @@ class CaptionWorker(BaseWorker):
         self.model_manager = MultiStageVLLMManager(self.gpu_id)
 
         # Get base config for models
+        logger.info(f"vLLM config: {self.vllm_config}")
         base_config = {
             "tensor_parallel_size": self.vllm_config.get("tensor_parallel_size", 1),
             "max_model_len": self.vllm_config.get("max_model_len", 16384),
@@ -437,6 +450,13 @@ class CaptionWorker(BaseWorker):
         if not new_config:
             return True
 
+        # Check if mock mode changed
+        old_mock_mode = self.mock_mode
+        self.mock_mode = new_config.get("mock_results", False)
+
+        if old_mock_mode != self.mock_mode:
+            logger.info(f"Mock mode changed from {old_mock_mode} to {self.mock_mode}")
+
         # Parse new stages
         new_stages = self._parse_stages_config(new_config)
 
@@ -453,29 +473,37 @@ class CaptionWorker(BaseWorker):
                     stages_changed = True
                     break
 
-        if stages_changed:
-            logger.info("Stage configuration changed, reloading all models")
+        if stages_changed or old_mock_mode != self.mock_mode:
+            logger.info("Configuration changed significantly")
 
             old_config = self.vllm_config
             self.vllm_config = new_config
             self.stages = new_stages
             self.stage_order = self._topological_sort_stages(self.stages)
 
-            try:
+            if not self.mock_mode:
+                try:
+                    if self.model_manager:
+                        self.model_manager.cleanup()
+                    self._setup_vllm()
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to reload vLLM: {e}")
+                    self.vllm_config = old_config
+                    return False
+            else:
+                # Clean up models if switching to mock mode
                 if self.model_manager:
                     self.model_manager.cleanup()
-                self._setup_vllm()
+                    self.model_manager = None
                 return True
-            except Exception as e:
-                logger.error(f"Failed to reload vLLM: {e}")
-                self.vllm_config = old_config
-                return False
         else:
             # Just update sampling params
-            logger.info("Updating sampling parameters without model reload")
-            base_sampling = new_config.get("sampling", {})
-            for stage in self.stages:
-                self.model_manager.create_sampling_params(stage, base_sampling)
+            if not self.mock_mode:
+                logger.info("Updating sampling parameters without model reload")
+                base_sampling = new_config.get("sampling", {})
+                for stage in self.stages:
+                    self.model_manager.create_sampling_params(stage, base_sampling)
             self.vllm_config = new_config
             return True
 
@@ -513,11 +541,13 @@ class CaptionWorker(BaseWorker):
                     with self.work_lock:
                         queue_size = len(self.assigned_units)
 
-                    if queue_size < 2 and self.websocket and self.main_loop:
+                    if queue_size < self.units_per_request and self.websocket and self.main_loop:
                         try:
                             asyncio.run_coroutine_threadsafe(
                                 self.websocket.send(
-                                    json.dumps({"type": "request_work", "count": 2})
+                                    json.dumps(
+                                        {"type": "get_work_units", "count": self.units_per_request}
+                                    )
                                 ),
                                 self.main_loop,
                             ).result(timeout=5)
@@ -551,10 +581,12 @@ class CaptionWorker(BaseWorker):
                     job_id=item_data["job_id"],
                     item_key=item_data["item_key"],
                     item_index=item_data["item_index"],
-                    image=item_data["image"],
+                    image=item_data.get("image", None),
                     image_data=item_data.get("image_data", b""),
                     metadata=item_data.get("metadata", {}),
                 )
+                if "_processed_indices" in item_data:
+                    context["_processed_indices"] = item_data.pop("_processed_indices", [])
 
                 # Add to readahead queue
                 timeout_end = time.time() + 30
@@ -569,6 +601,9 @@ class CaptionWorker(BaseWorker):
                     except:
                         if time.time() > timeout_end:
                             raise TimeoutError("Queue put timeout")
+                        logger.warning(
+                            f"Could not put index {item.metadata.get('image_index')} into queue"
+                        )
                         continue
 
                 if not self.connected.is_set() or self.should_stop_processing.is_set():
@@ -635,7 +670,10 @@ class CaptionWorker(BaseWorker):
                 start_time = time.time()
 
                 # Process batch through all stages
-                results = self._process_batch_multi_stage(batch)
+                if self.mock_mode:
+                    results = self._process_batch_mock(batch)
+                else:
+                    results = self._process_batch_multi_stage(batch)
 
                 # Calculate processing time
                 if results:
@@ -658,6 +696,47 @@ class CaptionWorker(BaseWorker):
                 if self.should_stop_processing.is_set():
                     continue
                 logger.error(f"Inference error: {e}", exc_info=True)
+
+    def _process_batch_mock(self, batch: List[ProcessingItem]) -> List[Tuple[ProcessingItem, Dict]]:
+        """Process a batch in mock mode - return dummy captions."""
+        results = []
+
+        # Simulate some processing time
+        time.sleep(0.1)
+
+        for item in batch:
+            # Generate mock outputs for each stage
+            for stage_name in self.stage_order:
+                stage = next(s for s in self.stages if s.name == stage_name)
+
+                # Create mock outputs based on stage prompts
+                stage_outputs = []
+                for i, prompt in enumerate(stage.prompts):
+                    mock_output = (
+                        f"Mock {stage_name} output {i+1} for job {item.job_id} - {item.item_key}"
+                    )
+                    stage_outputs.append(mock_output)
+
+                # Store stage result
+                stage_result = StageResult(
+                    stage_name=stage_name,
+                    output_field=stage.output_field,
+                    outputs=stage_outputs,
+                )
+                item.stage_results[stage_name] = stage_result
+
+            # Aggregate outputs by field
+            outputs_by_field = defaultdict(list)
+            for stage_result in item.stage_results.values():
+                outputs_by_field[stage_result.output_field].extend(stage_result.outputs)
+
+            results.append((item, dict(outputs_by_field)))
+            self.items_processed += 1
+
+            if self.items_processed % 10 == 0:
+                logger.info(f"🎭 Mock mode: Processed {self.items_processed} items")
+
+        return results
 
     def _process_batch_multi_stage(
         self, batch: List[ProcessingItem], max_attempts: int = 3
@@ -685,8 +764,8 @@ class CaptionWorker(BaseWorker):
                 for idx, (original_idx, item, attempt_count) in enumerate(items_to_process):
                     current_batch.append((original_idx, item, attempt_count))
 
-                    # Prepare image
-                    converted_img = ImageProcessor.prepare_for_inference(item.image)
+                    # Prepare image from PIL frame or bytes and remove it from the object.
+                    converted_img = ImageProcessor.prepare_for_inference(item)
 
                     # Create template manager
                     template_manager = PromptTemplateManager(stage.prompts)
@@ -838,6 +917,7 @@ class CaptionWorker(BaseWorker):
             },
             "stages": len(self.stages),
             "models_loaded": len(self.model_manager.models) if self.model_manager else 0,
+            "mock_mode": self.mock_mode,
         }
 
     async def _create_tasks(self) -> list:
@@ -873,9 +953,21 @@ class CaptionWorker(BaseWorker):
                         metadata={
                             "item_key": item.item_key,
                             "item_index": item.metadata.get("_item_index"),
-                            "image_width": item.image.width,
-                            "image_height": item.image.height,
-                            "image_format": item.image.format or "unknown",
+                            "image_width": (
+                                item.image.width
+                                if item.image is not None
+                                else item.metadata.get("image_width")
+                            ),
+                            "image_height": (
+                                item.image.height
+                                if item.image is not None
+                                else item.metadata.get("image_height")
+                            ),
+                            "image_format": (
+                                item.image.format
+                                if item.image is not None
+                                else item.metadata.get("image_format", "unknown")
+                            ),
                             "file_size": len(item.image_data) if item.image_data else 0,
                             **item.metadata,
                         },

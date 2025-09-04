@@ -66,7 +66,7 @@ class Orchestrator:
         self.processor.initialize(processor_config, self.storage)
 
         # Processing configuration
-        self.units_per_request = config.get("units_per_request", 2)
+        self.chunks_per_request = config.get("chunks_per_request", 2)
 
         # Track connections
         self.workers: Dict[str, WebSocketServerProtocol] = {}
@@ -284,10 +284,10 @@ class Orchestrator:
                     self.processor.initialize(processor_config)
                     updated_sections.append("processor_config")
 
-            # Update units per request
-            if "units_per_request" in orchestrator_config:
-                self.units_per_request = orchestrator_config["units_per_request"]
-                updated_sections.append("units_per_request")
+            # Update chunks per request
+            if "chunks_per_request" in orchestrator_config:
+                self.chunks_per_request = orchestrator_config["chunks_per_request"]
+                updated_sections.append("chunks_per_request")
 
             # Update auth configuration
             if "auth" in orchestrator_config:
@@ -332,8 +332,8 @@ class Orchestrator:
         """Process message from worker."""
         msg_type = data.get("type")
 
-        if msg_type == "request_work":
-            count = data.get("count", self.units_per_request)
+        if msg_type == "get_work_units":
+            count = data.get("count", self.chunks_per_request)
             units = self.processor.get_work_units(count, worker_id)
             logger.debug(f"Assigning units: {[unit.chunk_id for unit in units]}")
 
@@ -352,7 +352,8 @@ class Orchestrator:
 
                 logger.debug(f"Assigned {len(units)} work units to worker {worker_id}")
             else:
-                await self.workers[worker_id].send(safe_json_dumps({"type": "no_work"}))
+                if worker_id in self.workers:
+                    await self.workers[worker_id].send(safe_json_dumps({"type": "no_work"}))
 
         elif msg_type == "work_complete":
             unit_id = data["unit_id"]
@@ -375,7 +376,6 @@ class Orchestrator:
         """Process results submission from worker."""
         # Extract user from worker_id
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
-
         # Create work result
         _job_id = data.get("job_id")
         job_id = JobId.from_str(_job_id)
