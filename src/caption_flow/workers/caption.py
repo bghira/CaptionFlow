@@ -34,7 +34,7 @@ from ..utils.prompt_template import PromptTemplateManager
 from ..models import ProcessingStage, StageResult
 
 logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 @dataclass
@@ -163,14 +163,14 @@ class CaptionWorker(BaseWorker):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
 
-        # Processor configuration - will be set from orchestrator
+        # Processor configuration
         self.processor_type = None
         self.processor: Optional[
             Union[
                 WebDatasetWorkerProcessor,
                 HuggingFaceDatasetWorkerProcessor,
                 LocalFilesystemWorkerProcessor,
-            ],
+            ]
         ] = None
         self.dataset_path: Optional[str] = None
 
@@ -189,7 +189,8 @@ class CaptionWorker(BaseWorker):
         self.hf_token = get_token()
 
         # Image processor
-        batch_image_processing = config.get("batch_image_processing", False)
+        batch_image_processing = config.get("batch_image_processing", True)
+        logger.info(f"Using batch processing: {batch_image_processing}")
         self.image_processor = ImageProcessor() if batch_image_processing else None
 
         # Work processing
@@ -197,11 +198,7 @@ class CaptionWorker(BaseWorker):
         self.assigned_units = deque()
         self.current_unit: Optional[WorkUnit] = None
 
-        # Processing queues
-        readahead_queue_size = config.get("readahead_queue_size", 2560)
-        inference_queue_size = config.get("inference_queue_size", 2048)
-        self.readahead_queue = Queue(maxsize=readahead_queue_size)
-        self.inference_queue = Queue(maxsize=inference_queue_size)
+        # Single result queue for sending back to orchestrator
         self.result_queue = Queue()
 
         # Processing control
@@ -245,9 +242,8 @@ class CaptionWorker(BaseWorker):
             if self.vllm_config:
                 self._setup_vllm()
 
-        # Start background threads
-        Thread(target=self._unit_processor_thread, daemon=True).start()
-        Thread(target=self._inference_thread, daemon=True).start()
+        # Start processing thread
+        Thread(target=self._processing_thread, daemon=True).start()
 
     async def _initial_connect_for_config(self):
         """Connect initially just to get configuration."""
@@ -280,8 +276,6 @@ class CaptionWorker(BaseWorker):
             self.assigned_units.clear()
             self.current_unit = None
 
-        self._clear_queue(self.readahead_queue)
-        self._clear_queue(self.inference_queue)
         self._clear_queue(self.result_queue)
 
         # Reset counters
@@ -507,9 +501,9 @@ class CaptionWorker(BaseWorker):
             self.vllm_config = new_config
             return True
 
-    def _unit_processor_thread(self):
-        """Background thread that processes work units."""
-        logger.info("Starting unit processor thread")
+    def _processing_thread(self):
+        """Main processing thread that handles work units."""
+        logger.info("Starting processing thread")
 
         while self.running:
             if self.should_stop_processing.is_set():
@@ -563,16 +557,20 @@ class CaptionWorker(BaseWorker):
                     self.current_unit = None
 
     def _process_work_unit(self, unit: WorkUnit):
-        """Process a single work unit."""
+        """Process a single work unit with batching."""
         if not self.processor:
             logger.error("Processor not initialized")
             return
 
-        items_processed = 0
-        context = {}  # Will store processed indices
+        batch = []
+        batch_size = self.vllm_config.get("batch_size", 8)
+        context = {}
 
-        # Get items from processor
+        # Collect items for batching
         for item_data in self.processor.process_unit(unit, context):
+            if self.should_stop_processing.is_set() or not self.connected.is_set():
+                break
+
             try:
                 # Create processing item
                 item = ProcessingItem(
@@ -588,33 +586,12 @@ class CaptionWorker(BaseWorker):
                 if "_processed_indices" in item_data:
                     context["_processed_indices"] = item_data.pop("_processed_indices", [])
 
-                # Add to readahead queue
-                timeout_end = time.time() + 30
-                while (
-                    self.running
-                    and not self.should_stop_processing.is_set()
-                    and self.connected.is_set()
-                ):
-                    try:
-                        self.readahead_queue.put(item, timeout=1)
-                        break
-                    except:
-                        if time.time() > timeout_end:
-                            raise TimeoutError("Queue put timeout")
-                        logger.warning(
-                            f"Could not put index {item.metadata.get('image_index')} into queue"
-                        )
-                        continue
+                batch.append(item)
 
-                if not self.connected.is_set() or self.should_stop_processing.is_set():
-                    break
-
-                items_processed += 1
-
-                # Batch items for inference
-                batch_size = self.vllm_config.get("batch_size", 8)
-                if self.readahead_queue.qsize() >= batch_size:
-                    self._batch_for_inference()
+                # Process batch when it reaches size
+                if len(batch) >= batch_size:
+                    self._process_batch(batch)
+                    batch = []
 
             except Exception as e:
                 if self.should_stop_processing.is_set():
@@ -622,80 +599,54 @@ class CaptionWorker(BaseWorker):
                 logger.error(f"Error processing item {item_data.get('item_key')}: {e}")
                 self.items_failed += 1
 
-        # Process any remaining items
-        if not self.should_stop_processing.is_set():
-            self._batch_for_inference()
-            if self.connected.is_set():
-                # Notify orchestrator that unit is complete
+        # Process remaining items in batch
+        if batch and not self.should_stop_processing.is_set():
+            self._process_batch(batch)
+
+        # Notify orchestrator that unit is complete
+        if self.connected.is_set() and self.websocket:
+            try:
                 asyncio.run_coroutine_threadsafe(
                     self.websocket.send(
                         json.dumps({"type": "work_complete", "unit_id": unit.unit_id})
                     ),
                     self.main_loop,
                 ).result(timeout=5)
+            except Exception as e:
+                logger.warning(f"Could not notify work complete: {e}")
 
-        logger.info(f"Unit {unit.unit_id} processed {items_processed} items")
+    def _process_batch(self, batch: List[ProcessingItem]):
+        """Process a batch of items through all stages."""
+        if not batch:
+            return
 
-    def _batch_for_inference(self):
-        """Batch items from readahead queue for inference."""
-        batch = []
-        batch_size = self.vllm_config.get("batch_size", 8)
+        logger.debug(f"Processing batch of {len(batch)} images")
+        start_time = time.time()
 
         try:
-            while len(batch) < batch_size:
-                item = self.readahead_queue.get_nowait()
-                batch.append(item)
-        except Empty:
-            pass
+            # Process batch through all stages
+            if self.mock_mode:
+                results = self._process_batch_mock(batch)
+            else:
+                results = self._process_batch_multi_stage(batch)
 
-        if batch:
-            self.inference_queue.put(batch)
+            # Calculate processing time
+            if results:
+                processing_time_per_item = (time.time() - start_time) * 1000 / len(batch)
 
-    def _inference_thread(self):
-        """Background thread for multi-stage vLLM inference."""
-        logger.info("Starting multi-stage inference thread")
+                for item, result_outputs in results:
+                    self.result_queue.put(
+                        {
+                            "item": item,
+                            "outputs": result_outputs,
+                            "processing_time_ms": processing_time_per_item,
+                        }
+                    )
 
-        while self.running:
-            try:
-                batch = self.inference_queue.get(timeout=1)
-                if not batch:
-                    continue
+            logger.debug(f"Batch processing complete: {len(results)} successful")
 
-                if self.should_stop_processing.is_set():
-                    continue
-
-                logger.debug(
-                    f"Processing batch of {len(batch)} images through {len(self.stages)} stages"
-                )
-                start_time = time.time()
-
-                # Process batch through all stages
-                if self.mock_mode:
-                    results = self._process_batch_mock(batch)
-                else:
-                    results = self._process_batch_multi_stage(batch)
-
-                # Calculate processing time
-                if results:
-                    processing_time_per_item = (time.time() - start_time) * 1000 / len(batch)
-
-                    for item, result_outputs in results:
-                        self.result_queue.put(
-                            {
-                                "item": item,
-                                "outputs": result_outputs,
-                                "processing_time_ms": processing_time_per_item,
-                            }
-                        )
-
-                logger.debug(f"Batch processing complete: {len(results)} successful")
-
-            except Empty:
-                continue
-            except Exception as e:
-                if self.should_stop_processing.is_set():
-                    continue
-                logger.error(f"Inference error: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Batch processing error: {e}", exc_info=True)
 
     def _process_batch_mock(self, batch: List[ProcessingItem]) -> List[Tuple[ProcessingItem, Dict]]:
         """Process a batch in mock mode - return dummy captions."""
@@ -764,7 +715,7 @@ class CaptionWorker(BaseWorker):
                 for idx, (original_idx, item, attempt_count) in enumerate(items_to_process):
                     current_batch.append((original_idx, item, attempt_count))
 
-                    # Prepare image from PIL frame or bytes and remove it from the object.
+                    # Prepare image from PIL frame or bytes
                     converted_img = ImageProcessor.prepare_for_inference(item)
 
                     # Create template manager
@@ -911,8 +862,6 @@ class CaptionWorker(BaseWorker):
             "units_completed": self.units_completed,
             "current_unit": self._get_current_unit_id() if self.current_unit else None,
             "queue_sizes": {
-                "readahead": self.readahead_queue.qsize(),
-                "inference": self.inference_queue.qsize(),
                 "results": self.result_queue.qsize(),
             },
             "stages": len(self.stages),
@@ -932,7 +881,7 @@ class CaptionWorker(BaseWorker):
         """Send results back to orchestrator."""
         while self.running and self.connected.is_set():
             try:
-                # Get result
+                # Get result with timeout
                 result_data = await asyncio.get_event_loop().run_in_executor(
                     None, self.result_queue.get, True, 1
                 )
@@ -943,7 +892,6 @@ class CaptionWorker(BaseWorker):
                     outputs = result_data["outputs"]
 
                     # Create work result
-                    # logger.info(f"Processed item: {item}")
                     work_result = WorkResult(
                         unit_id=item.unit_id,
                         source_id=item.metadata.get("shard_name", "unknown"),
@@ -975,7 +923,7 @@ class CaptionWorker(BaseWorker):
                         error=result_data.get("error", None),
                     )
 
-                    # Send result in format that orchestrator expects
+                    # Send result
                     await self.websocket.send(
                         json.dumps(
                             {
@@ -1012,9 +960,7 @@ class CaptionWorker(BaseWorker):
             self.assigned_units.clear()
             self.current_unit = None
 
-        # Clear queues
-        self._clear_queue(self.readahead_queue)
-        self._clear_queue(self.inference_queue)
+        # Clear result queue
         self._clear_queue(self.result_queue)
 
     def _clear_queue(self, queue: Queue):
@@ -1027,9 +973,6 @@ class CaptionWorker(BaseWorker):
 
     async def _pre_shutdown(self):
         """Cleanup before shutdown."""
-        self.readahead_queue.put(None)
-        self.inference_queue.put(None)
-
         if self.image_processor:
             self.image_processor.shutdown()
 
