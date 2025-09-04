@@ -12,6 +12,7 @@ from datetime import datetime
 from PIL import Image
 import io
 
+from caption_flow.models import JobId
 from caption_flow.storage import StorageManager
 from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkUnit, WorkResult
 from ..utils import ChunkTracker
@@ -201,7 +202,13 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                 # Create chunk for current position
                 chunk_size = min(self.chunk_size, shard_files - current_file_idx)
-                chunk_id = f"{shard_name}:chunk:{current_file_idx // self.chunk_size}"
+                self.current_chunk_index = current_file_idx // self.chunk_size
+                job_id_obj = JobId(
+                    shard_id=shard_name,
+                    chunk_id=self.current_chunk_index,
+                    sample_id=current_file_idx,
+                )
+                chunk_id = job_id_obj.get_chunk_str()
 
                 with self.lock:
                     # Skip if already exists

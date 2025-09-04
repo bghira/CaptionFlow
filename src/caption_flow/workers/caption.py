@@ -565,7 +565,8 @@ class CaptionWorker(BaseWorker):
         batch = []
         batch_size = self.vllm_config.get("batch_size", 8)
         context = {}
-
+        self.items_processed = 0
+        self.items_failed = 0
         # Collect items for batching
         for item_data in self.processor.process_unit(unit, context):
             if self.should_stop_processing.is_set() or not self.connected.is_set():
@@ -604,16 +605,33 @@ class CaptionWorker(BaseWorker):
             self._process_batch(batch)
 
         # Notify orchestrator that unit is complete
-        if self.connected.is_set() and self.websocket:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    self.websocket.send(
-                        json.dumps({"type": "work_complete", "unit_id": unit.unit_id})
-                    ),
-                    self.main_loop,
-                ).result(timeout=5)
-            except Exception as e:
-                logger.warning(f"Could not notify work complete: {e}")
+        # Check if the number of processed items matches the expected count for the unit.
+        # The context dictionary holds the count of items yielded by the processor.
+        total_items_in_unit = unit.end_index - unit.start_index
+
+        if (
+            not self.should_stop_processing.is_set()
+            and self.connected.is_set()
+            and self.items_failed == 0
+            and self.items_processed >= total_items_in_unit
+        ):
+            if self.websocket:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.websocket.send(
+                            json.dumps({"type": "work_complete", "unit_id": unit.unit_id})
+                        ),
+                        self.main_loop,
+                    ).result(timeout=5)
+                    logger.info(
+                        f"Unit {unit.unit_id} fully processed ({self.items_processed}/{total_items_in_unit}) and marked complete."
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not notify work complete for unit {unit.unit_id}: {e}")
+        else:
+            logger.warning(
+                f"Processing of unit {unit.unit_id} was incomplete ({self.items_processed}/{total_items_in_unit}). Not marking as complete."
+            )
 
     def _process_batch(self, batch: List[ProcessingItem]):
         """Process a batch of items through all stages."""
