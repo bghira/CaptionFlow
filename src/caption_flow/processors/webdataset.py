@@ -116,17 +116,22 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
             return
 
         shards_summary = self.chunk_tracker.get_shards_summary()
+        logger.debug(f"Restoring state: {shards_summary}")
 
         with self.lock:
             for shard_name, shard_info in shards_summary.items():
                 chunks = shard_info.get("chunks", [])
+                logger.debug(f"Existing job ids: {storage.get_all_processed_job_ids()}")
                 for chunk_state in chunks:
                     # Only add incomplete chunks
                     if chunk_state.status != "completed":
-                        logger.debug(f"Restoring incomplete chunk {chunk_state.chunk_id}")
+                        logger.debug(f"Restoring incomplete chunk {chunk_state}")
 
                         # Get unprocessed ranges
                         unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+                        logger.debug(
+                            f"Chunk {chunk_state.chunk_id} unprocessed ranges: {unprocessed_ranges}"
+                        )
                         if not unprocessed_ranges:
                             continue
 
@@ -549,6 +554,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                             "_chunk_relative_index": idx - unit.data["start_index"],
                             "_job_id": job_id,
                             "_mock": True,
+                            "_processed_indices": processed_indices,
                         },
                         "job_id": job_id,
                     }
@@ -609,6 +615,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                                     "_job_id": job_id,
                                     "_filename": entry.path,
                                     "_file_size": entry.size,
+                                    "_processed_indices": processed_indices,
                                 },
                                 "job_id": job_id,
                             }
