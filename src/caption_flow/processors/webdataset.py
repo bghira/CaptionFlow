@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
@@ -400,6 +401,31 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                     if indices:
                         # Sort indices and convert to ranges
                         sorted_indices = sorted(indices)
+                        if not sorted_indices:
+                            continue
+
+                        # Condense into contiguous ranges
+                        ranges = []
+                        start_range = sorted_indices[0]
+                        end_range = sorted_indices[0]
+
+                        for i in range(1, len(sorted_indices)):
+                            if sorted_indices[i] == end_range + 1:
+                                end_range = sorted_indices[i]
+                            else:
+                                ranges.append((start_range, end_range))
+                                start_range = sorted_indices[i]
+                                end_range = sorted_indices[i]
+                        ranges.append((start_range, end_range))
+
+                        # Mark each contiguous range as processed
+                        logger.debug(f"Marking ranges {ranges} as processed in chunk {chunk_id}")
+                        for start_idx, end_idx in ranges:
+                            self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
+                        first_idx, last_idx = sorted_indices[0], sorted_indices[-1]
+                        logger.debug(
+                            f"Marking {sorted_indices} items processed in {chunk_id}:{first_idx} through {chunk_id}:{last_idx}"
+                        )
                         for idx in sorted_indices:
                             self.chunk_tracker.mark_items_processed(chunk_id, idx, idx)
 
