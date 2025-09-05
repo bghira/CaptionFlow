@@ -89,8 +89,13 @@ class BaseWorker(ABC):
     async def _connect_and_run(self):
         """Connect to orchestrator and run main loop."""
         logger.info(f"Connecting to {self.server_url}")
-
-        async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
+        async with websockets.connect(
+            self.server_url,
+            ssl=self.ssl_context,
+            ping_interval=20,
+            ping_timeout=60,
+            close_timeout=10,
+        ) as websocket:
             self.websocket = websocket
             self.connected.set()
 

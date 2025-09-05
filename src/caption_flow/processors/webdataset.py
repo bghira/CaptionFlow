@@ -306,8 +306,15 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         assigned = []
 
         with self.lock:
-            while len(assigned) < count and self.pending_units:
+            units_checked = 0
+            max_units_to_check = len(self.pending_units)
+
+            while len(assigned) < count and units_checked < max_units_to_check:
+                if not self.pending_units:
+                    break
+
                 unit_id = self.pending_units.popleft()
+                units_checked += 1
                 unit = self.work_units.get(unit_id)
 
                 if unit:
@@ -315,6 +322,16 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                     if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
                         chunk_state = self.chunk_tracker.chunks[unit_id]
                         relative_unprocessed = chunk_state.get_unprocessed_ranges()
+
+                        # If no unprocessed ranges, mark as completed and skip
+                        if not relative_unprocessed:
+                            logger.info(
+                                f"Chunk {unit_id} has no unprocessed ranges, marking as completed"
+                            )
+                            self.chunk_tracker.mark_completed(unit_id)
+                            # Remove from work units
+                            del self.work_units[unit_id]
+                            continue
 
                         # Convert relative to absolute indices
                         absolute_ranges = []
@@ -335,6 +352,9 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     if self.chunk_tracker:
                         self.chunk_tracker.mark_assigned(unit_id, worker_id)
+                else:
+                    # Put it back if we couldn't get the unit
+                    self.pending_units.append(unit_id)
 
         logger.debug(f"Assigned {len(assigned)} units to worker {worker_id}")
         return assigned
@@ -394,8 +414,20 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         logger.info(f"Released {len(unit_ids)} assignments from {worker_id}")
 
     def handle_result(self, result: WorkResult) -> Dict[str, Any]:
-        """Handle result from worker."""
-        # Track processed items if we have chunk tracker
+        """Handle result from worker and update chunk tracker."""
+        # Extract the actual item index from the metadata
+        item_index = result.metadata.get("_item_index", None)
+
+        # If we have an item index, mark it as processed in the chunk tracker
+        if self.chunk_tracker and item_index is not None and result.chunk_id:
+            try:
+                # Mark single item as processed
+                self.chunk_tracker.mark_items_processed(result.chunk_id, item_index, item_index)
+                # logger.debug(f"Marked item {item_index} as processed in chunk {result.chunk_id}")
+            except Exception as e:
+                logger.error(f"Error marking item {item_index} as processed: {e}")
+
+        # Also handle batch results if present (backward compatibility)
         if self.chunk_tracker and "item_indices" in result.metadata:
             indices = result.metadata["item_indices"]
 
@@ -419,6 +451,9 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 # Mark ranges as processed
                 for start_idx, end_idx in ranges:
                     self.chunk_tracker.mark_items_processed(result.chunk_id, start_idx, end_idx)
+                    logger.debug(
+                        f"Marked range {start_idx}-{end_idx} as processed in chunk {result.chunk_id}"
+                    )
 
         return {
             "source_id": result.source_id,
@@ -539,7 +574,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         # Save checkpoint
         if self.chunk_tracker:
-            self.chunk_tracker.save_checkpoint()
+            self.chunk_tracker.save()
 
 
 class WebDatasetWorkerProcessor(WorkerProcessor):

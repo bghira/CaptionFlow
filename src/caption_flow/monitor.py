@@ -73,6 +73,9 @@ class Monitor:
                 async with websockets.connect(
                     self.server_url,
                     ssl=self.ssl_context if self.server_url.startswith("wss://") else None,
+                    ping_interval=20,
+                    ping_timeout=60,
+                    close_timeout=10,
                 ) as websocket:
                     # Authenticate
                     await websocket.send(json.dumps({"token": self.token}))

@@ -551,7 +551,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
             # Force checkpoint save if needed
             if self.chunk_tracker:
-                self.chunk_tracker.save_checkpoint()
+                self.chunk_tracker.save()
 
     def get_work_units(self, count: int, worker_id: str) -> List[WorkUnit]:
         """Get available work units for a worker."""
@@ -717,7 +717,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         # Save final state
         if self.chunk_tracker:
-            self.chunk_tracker.save_checkpoint()
+            self.chunk_tracker.save()
 
 
 class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):

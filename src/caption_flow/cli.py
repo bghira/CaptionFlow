@@ -124,7 +124,7 @@ def setup_logging(verbose: bool = False):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(message)s",
+        format="%(name)s: %(message)s",
         datefmt="[%Y-%m-%d %H:%M:%S]",
         handlers=[
             RichHandler(
@@ -490,7 +490,9 @@ def reload_config(
 
     async def send_reload():
         try:
-            async with websockets.connect(server, ssl=ssl_context) as websocket:
+            async with websockets.connect(
+                server, ssl=ssl_context, ping_interval=20, ping_timeout=60, close_timeout=10
+            ) as websocket:
                 # Authenticate as admin
                 await websocket.send(json.dumps({"token": token, "role": "admin"}))
 

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict, field
 
 from .checkpoint_tracker import CheckpointTracker
+from threading import Lock
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -60,12 +61,12 @@ class ChunkState:
         self.status = "completed"
         self.completed_at = datetime.utcnow()
         # Clear processed_ranges since we don't need them after completion
-        self.processed_ranges = []
-        self.assigned_to = None
-        self.assigned_at = None
+        # self.processed_ranges = []
+        # self.assigned_to = None
+        # self.assigned_at = None
 
     def get_unprocessed_ranges(self) -> List[Tuple[int, int]]:
-        """Get ranges that haven't been processed yet."""
+        """Get ranges of unprocessed items within the chunk (relative indices)."""
         if self.status == "completed":
             return []
 
@@ -73,21 +74,56 @@ class ChunkState:
             logger.info(f"Chunk {self.chunk_id} has no processed ranges, returning full range")
             return [(0, self.chunk_size - 1)]
 
+        # Merge ranges first to ensure no overlaps
+        merged_ranges = self._merge_ranges(self.processed_ranges)
+
         unprocessed = []
-        current = 0
+        current_pos = 0
 
-        logger.info(
-            f"Processing {len(self.processed_ranges)} processed ranges for chunk {self.chunk_id}"
-        )
-        for start, end in self.processed_ranges:
-            if current < start:
-                unprocessed.append((current, start - 1))
-            current = max(current, end + 1)
+        for start, end in merged_ranges:
+            if current_pos < start:
+                unprocessed.append((current_pos, start - 1))
+            current_pos = max(current_pos, end + 1)
 
-        if current < self.chunk_size:
-            unprocessed.append((current, self.chunk_size - 1))
+        # Add any remaining range
+        if current_pos < self.chunk_size:
+            unprocessed.append((current_pos, self.chunk_size - 1))
+
+        # Log for debugging
+        if not unprocessed:
+            logger.info(
+                f"Chunk {self.chunk_id} has processed ranges {merged_ranges} covering entire chunk size {self.chunk_size}"
+            )
+        else:
+            total_processed = sum(end - start + 1 for start, end in merged_ranges)
+            total_unprocessed = sum(end - start + 1 for start, end in unprocessed)
+            logger.debug(
+                f"Chunk {self.chunk_id}: {total_processed} processed, {total_unprocessed} unprocessed"
+            )
 
         return unprocessed
+
+    def _merge_ranges(self, ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """Merge overlapping or adjacent ranges."""
+        if not ranges:
+            return []
+
+        # Sort ranges by start index, ensuring all are tuples
+        sorted_ranges = sorted([tuple(r) for r in ranges])
+        merged = [sorted_ranges[0]]
+
+        for current_start, current_end in sorted_ranges[1:]:
+            last_start, last_end = merged[-1]
+
+            # Check if ranges overlap or are adjacent
+            if current_start <= last_end + 1:
+                # Merge the ranges
+                merged[-1] = (last_start, max(last_end, current_end))
+            else:
+                # Add as new range
+                merged.append((current_start, current_end))
+
+        return merged
 
     def to_dict(self):
         """Convert to dictionary for JSON serialization."""
@@ -124,6 +160,7 @@ class ChunkTracker(CheckpointTracker):
         self.max_completed_chunks_in_memory = max_completed_chunks_in_memory
         self.archive_after_hours = archive_after_hours
         self._completed_count = 0  # Track count without storing all IDs
+        self.lock = Lock()
         super().__init__(checkpoint_file)
 
     def _get_default_state(self) -> Dict[str, Any]:
@@ -132,16 +169,17 @@ class ChunkTracker(CheckpointTracker):
 
     def _deserialize_state(self, data: Dict[str, Any]) -> None:
         """Deserialize loaded data into instance state."""
-        self.chunks = {}
-        self._completed_count = data.get("completed_count", 0)
+        with self.lock:
+            self.chunks = {}
+            self._completed_count = data.get("completed_count", 0)
 
-        # Load chunk states
-        completed_chunks = 0
-        for chunk_id, chunk_data in data.get("chunks", {}).items():
-            chunk_state = ChunkState.from_dict(chunk_data)
-            self.chunks[chunk_id] = chunk_state
-            if chunk_state.status == "completed":
-                completed_chunks += 1
+            # Load chunk states
+            completed_chunks = 0
+            for chunk_id, chunk_data in data.get("chunks", {}).items():
+                chunk_state = ChunkState.from_dict(chunk_data)
+                self.chunks[chunk_id] = chunk_state
+                if chunk_state.status == "completed":
+                    completed_chunks += 1
 
         logger.info(
             f"Loaded {len(self.chunks)} chunks from checkpoint, "
@@ -494,39 +532,39 @@ class ChunkTracker(CheckpointTracker):
                 for start_idx, end_idx in ranges:
                     chunk.add_processed_range(start_idx, end_idx)
 
-    def mark_items_processed(self, chunk_id: str, start_idx: int, end_idx: int):
-        """Mark a range of items as processed within a chunk (expects ABSOLUTE indices)."""
+    def mark_items_processed(self, chunk_id: str, start_idx: int, end_idx: int) -> None:
+        """Mark a range of items as processed within a chunk."""
         if chunk_id not in self.chunks:
-            logger.error(f"Unknown chunk: {chunk_id}")
+            logger.warning(f"Chunk {chunk_id} not found in tracker")
             return
 
-        chunk = self.chunks[chunk_id]
+        chunk_state = self.chunks[chunk_id]
 
-        # Convert absolute indices to chunk-relative
-        relative_start = start_idx - chunk.start_index
-        relative_end = end_idx - chunk.start_index
+        # Convert absolute indices to chunk-relative indices
+        relative_start = start_idx - chunk_state.start_index
+        relative_end = end_idx - chunk_state.start_index
 
-        # Validate boundaries
-        if relative_start < 0 or relative_end >= chunk.chunk_size:
-            logger.error(
-                f"Invalid indices for chunk {chunk_id}: "
-                f"absolute {start_idx}-{end_idx} (relative {relative_start}-{relative_end}) "
-                f"outside chunk bounds [{chunk.start_index}, {chunk.start_index + chunk.chunk_size - 1}]"
-            )
-            return
+        # Ensure indices are within chunk bounds
+        relative_start = max(0, relative_start)
+        relative_end = min(chunk_state.chunk_size - 1, relative_end)
 
-        # Add the relative range
-        chunk.add_processed_range(relative_start, relative_end)
+        # Add to processed ranges
+        chunk_state.processed_ranges.append((relative_start, relative_end))
 
-        # If chunk is now complete, increment counter
-        if chunk.status == "completed":
-            self._completed_count += 1
+        # Merge overlapping ranges
+        chunk_state.processed_ranges = chunk_state._merge_ranges(chunk_state.processed_ranges)
 
-        self.save()
         logger.debug(
-            f"Marked items {start_idx}-{end_idx} as processed in chunk {chunk_id} "
-            f"(relative indices: {relative_start}-{relative_end})"
+            f"Marked items {start_idx}-{end_idx} as processed in chunk {chunk_id} (relative indices: {relative_start}-{relative_end})"
         )
+
+        # Check if chunk is now complete
+        if chunk_state.get_unprocessed_ranges() == []:
+            logger.info(f"Chunk {chunk_id} is now complete")
+            chunk_state.status = "completed"
+
+        # Save checkpoint after updating
+        self.save()
 
     def get_chunk_with_unprocessed_items(self, chunk_id: str) -> Optional[Dict[str, Any]]:
         """Get chunk info with unprocessed item ranges."""

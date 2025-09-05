@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -52,35 +53,54 @@ class CheckpointTracker(ABC):
 
     def save(self) -> None:
         """Save checkpoint to disk atomically."""
-        try:
-            # Prepare data with metadata
-            data = self._serialize_state()
-            data["updated_at"] = datetime.utcnow().isoformat()
+        with self.lock:
+            try:
+                # Prepare data with metadata
+                data = self._serialize_state()
+                data["updated_at"] = datetime.utcnow().isoformat()
 
-            # Write atomically using temp file
-            tmp_file = self.checkpoint_path.with_suffix(".tmp")
+                # Write atomically using temp file
+                tmp_file = self.checkpoint_path.with_suffix(".tmp")
+                # If a save is already in progress, let it finish.
+                # This prevents race conditions if save() is called rapidly.
+                if (
+                    hasattr(self, "_save_future")
+                    and self._save_future
+                    and not self._save_future.done()
+                ):
+                    self._save_future.result()  # Wait for the previous save to complete
+
+                # Use an executor to run the save operation in a background thread.
+                # This makes the save call non-blocking.
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    data_to_save = data.copy()
+                    self._save_future = executor.submit(self._write_to_disk, data_to_save, tmp_file)
+            except Exception as e:
+                logger.error(f"Failed to submit save task: {e}", exc_info=True)
+
+    def _write_to_disk(self, data: Dict[str, Any]) -> None:
+        """Write checkpoint data to disk atomically."""
+        # Create a temporary file in the same directory as the checkpoint
+        tmp_file = self.checkpoint_path.with_suffix(".tmp")
+
+        try:
+            # Ensure the parent directory exists
+            self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
             with open(tmp_file, "w") as f:
                 json.dump(data, f, indent=2)
 
-            # Ensure temp file was created
-            if not tmp_file.exists():
-                raise IOError(f"Failed to create temporary file: {tmp_file}")
-
-            # Move atomically
+            # Atomically replace the checkpoint file
             tmp_file.replace(self.checkpoint_path)
-
             logger.debug(f"Saved checkpoint to {self.checkpoint_path}")
-
         except Exception as e:
-            # logger.error(f"Error saving checkpoint: {e}", exc_info=True)
-            # Try direct write as fallback
-            try:
-                with open(self.checkpoint_path, "w") as f:
-                    json.dump(data, f, indent=2)
-                # logger.info("Saved checkpoint using fallback direct write")
-            except Exception as fallback_error:
-                logger.error(f"Fallback save also failed: {fallback_error}")
+            logger.error(f"Failed to save checkpoint atomically: {e}", exc_info=True)
+            # Try to clean up the temp file if it exists
+            if tmp_file.exists():
+                try:
+                    tmp_file.unlink()
+                except:
+                    pass
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics about tracked items. Override for custom stats."""
