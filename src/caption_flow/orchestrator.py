@@ -377,16 +377,17 @@ class Orchestrator:
         """Process results submission from worker."""
         # Extract user from worker_id
         worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
+
         # Create work result
         _job_id = data.get("job_id")
         job_id = JobId.from_str(_job_id)
-        shard_name = job_id.shard_id  # >data-0000<
-        chunk_name = job_id.chunk_id  # data-0000:chunk:>0<
-        # logger.debug(f"({job_id}) Worker result: {data}")
+        shard_name = job_id.shard_id
+        chunk_name = job_id.chunk_id
+
         result = WorkResult(
             unit_id=data["unit_id"],
             source_id=shard_name,
-            chunk_id=job_id.get_chunk_str(),  # we want the full string here
+            chunk_id=job_id.get_chunk_str(),
             sample_id=data["sample_id"],
             dataset=data["dataset"],
             outputs=data["outputs"],
@@ -394,7 +395,9 @@ class Orchestrator:
             processing_time_ms=data.get("processing_time_ms", 0),
         )
 
-        # Let processor handle any custom processing
+        # Let processor handle any custom processing - this updates chunk tracker
+        # IMPORTANT: Call this BEFORE saving to storage so chunk tracker is updated
+        # regardless of whether the item is a duplicate
         processed = self.processor.handle_result(result)
 
         # Create caption record for storage
@@ -412,6 +415,7 @@ class Orchestrator:
         for key in to_delete_metadata_keys:
             if key in result.metadata:
                 del result.metadata[key]
+
         caption = Caption(
             job_id=job_id,
             dataset=result.dataset,
@@ -433,14 +437,15 @@ class Orchestrator:
             image_format=image_format,
         )
 
-        # Save to storage
-        await self.storage.save_caption(caption)
+        # Save to storage (might skip if duplicate)
+        saved = await self.storage.save_caption(caption)
 
-        # Update contributor stats
-        contributor = await self.storage.get_contributor(worker_user)
-        if contributor:
-            contributor.total_captions += total_outputs
-            await self.storage.save_contributor(contributor)
+        # Update contributor stats only if actually saved
+        if saved:
+            contributor = await self.storage.get_contributor(worker_user)
+            if contributor:
+                contributor.total_captions += total_outputs
+                await self.storage.save_contributor(contributor)
 
     async def _handle_monitor(self, websocket: WebSocketServerProtocol):
         """Handle monitor connection."""
@@ -840,39 +845,55 @@ class Orchestrator:
         self.monitors -= disconnected
 
     async def _heartbeat_loop(self):
-        """Send periodic heartbeats to maintain connections."""
+        """Collect and log worker status periodically."""
         while True:
             await asyncio.sleep(30)
 
-            disconnected = []
+            # Just collect status - no ping/pong
+            active_workers = []
             for worker_id, ws in list(self.workers.items()):
-                try:
-                    pong_waiter = await ws.ping()
-                    await asyncio.wait_for(pong_waiter, timeout=10)
-                except:
-                    disconnected.append(worker_id)
-
-            # Clean up disconnected workers
-            for worker_id in disconnected:
-                logger.warning(f"Worker {worker_id} did not respond to ping, disconnecting")
-                if worker_id in self.workers:
+                # Check if WebSocket is still open (don't ping)
+                if ws.state == websockets.protocol.State.OPEN:
+                    active_workers.append(worker_id)
+                else:
+                    # Clean up closed connections
+                    logger.info(f"Worker {worker_id} connection closed")
                     del self.workers[worker_id]
-                    logger.warning(
-                        f"Releasing assignments for worker {worker_id} because it did not respond to ping"
-                    )
                     self.processor.release_assignments(worker_id)
-                    self.stats["connected_workers"] = len(self.workers)
+
+            # Log status
+            if active_workers:
+                logger.debug(
+                    f"Active workers: {len(active_workers)} - {', '.join(active_workers[:5])}"
+                )
+                logger.debug(f"Inactive workers: {len(self.workers) - len(active_workers)}")
+            # add to self.stats
+            self.stats["active_workers"] = len(active_workers)
+            self.stats["inactive_workers"] = len(self.workers) - len(active_workers)
 
     async def _checkpoint_loop(self):
-        """Periodically checkpoint storage."""
+        """Periodically checkpoint storage and chunk tracker."""
         interval = self.config.get("storage", {}).get("checkpoint_interval", 60)
 
         while True:
             await asyncio.sleep(interval)
 
-            await self.storage.checkpoint()
-            self.stats["last_checkpoint"] = datetime.utcnow().isoformat()
-            logger.info("Storage checkpoint complete")
+            try:
+                # Checkpoint storage
+                await self.storage.checkpoint()
+
+                # Also checkpoint the chunk tracker if using webdataset processor
+                if hasattr(self.processor, "chunk_tracker") and self.processor.chunk_tracker:
+                    # Save checkpoint in thread pool to avoid blocking
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, self.processor.chunk_tracker.save
+                    )
+                    logger.debug("Saved chunk tracker checkpoint")
+
+                self.stats["last_checkpoint"] = datetime.utcnow().isoformat()
+                logger.info("Storage and chunk tracker checkpoint complete")
+            except Exception as e:
+                logger.error(f"Error during checkpoint: {e}", exc_info=True)
 
     async def _stats_update_loop(self):
         """Periodically update and broadcast stats."""

@@ -248,7 +248,13 @@ class CaptionWorker(BaseWorker):
     async def _initial_connect_for_config(self):
         """Connect initially just to get configuration."""
         logger.info(f"Connecting to {self.server_url}")
-        async with websockets.connect(self.server_url, ssl=self.ssl_context) as websocket:
+        async with websockets.connect(
+            self.server_url,
+            ssl=self.ssl_context,
+            ping_interval=20,
+            ping_timeout=60,
+            close_timeout=10,
+        ) as websocket:
             await websocket.send(json.dumps(self._get_auth_data()))
 
             welcome = await websocket.recv()
