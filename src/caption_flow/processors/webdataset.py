@@ -681,7 +681,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                     # Iterate through the range
                     for idx in range(start_idx, end_idx + 1):
                         try:
-                            entry = next(self.loader)
+                            entry = webshart.next_with_cache_wait(self.loader)
 
                             # Decode image
                             image = None
