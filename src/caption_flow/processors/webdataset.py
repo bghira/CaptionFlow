@@ -610,7 +610,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             # Enable caching
             self.dataset.enable_metadata_cache(location=str(cache_dir / "metadata_cache"))
             self.dataset.enable_shard_cache(
-                location=str(cache_dir / "shard_cache" / self.gpu_id) if split_worker_cache else str(cache_dir / "shard_cache"),
+                location=str(cache_dir / "shard_cache" / str(self.gpu_id)) if split_worker_cache else str(cache_dir / "shard_cache"),
                 cache_limit_gb=cfg.get("shard_cache_gb", 10.0),
             )
 
