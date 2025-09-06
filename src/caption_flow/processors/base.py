@@ -172,6 +172,8 @@ class OrchestratorProcessor(ABC):
 class WorkerProcessor(ABC):
     """Base processor for worker side - processes work units."""
 
+    gpu_id: Optional[int] = None
+
     @abstractmethod
     def initialize(self, config: ProcessorConfig) -> None:
         """Initialize the processor with configuration."""
