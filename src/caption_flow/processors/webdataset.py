@@ -594,6 +594,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.dataset_path = dataset_cfg.get("dataset_path")
         metadata_path = dataset_cfg.get("metadata_path", None)
         self.mock_results = dataset_cfg.get("mock_results", False)
+        split_worker_cache = dataset_cfg.get("split_worker_cache", True) # multiple workers get their own cache by default
 
         # Cache configuration
         cache_dir = Path(cfg.get("cache_dir", "./webshart_cache"))
@@ -609,7 +610,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             # Enable caching
             self.dataset.enable_metadata_cache(location=str(cache_dir / "metadata_cache"))
             self.dataset.enable_shard_cache(
-                location=str(cache_dir / "shard_cache"),
+                location=str(cache_dir / "shard_cache" / self.gpu_id) if split_worker_cache else str(cache_dir / "shard_cache"),
                 cache_limit_gb=cfg.get("shard_cache_gb", 10.0),
             )
 
