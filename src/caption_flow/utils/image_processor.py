@@ -34,6 +34,7 @@ class ImageProcessor:
             Prepared PIL Image
         """
         # We used to do a lot more hand-holding here with transparency, but oh well.
+        logger.debug(f"Preparing item for inference: {item}")
 
         if item.image is not None:
             image = item.image
