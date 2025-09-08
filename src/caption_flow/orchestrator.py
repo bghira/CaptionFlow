@@ -1,3 +1,4 @@
+import os
 import time
 import asyncio
 import json
@@ -28,7 +29,7 @@ from .processors import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 class Orchestrator:

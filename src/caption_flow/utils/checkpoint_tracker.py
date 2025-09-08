@@ -3,13 +3,14 @@
 import json
 import logging
 from abc import ABC, abstractmethod
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 class CheckpointTracker(ABC):

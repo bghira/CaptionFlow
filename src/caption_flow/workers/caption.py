@@ -34,7 +34,7 @@ from ..utils.prompt_template import PromptTemplateManager
 from ..models import ProcessingStage, StageResult
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 @dataclass
@@ -758,7 +758,9 @@ class CaptionWorker(BaseWorker):
                     too_long.append(item)
                     continue
 
-                logger.debug(f"Formatted validation prompt for {item.item_key}: {formatted_prompts[0]}")
+                logger.debug(
+                    f"Formatted validation prompt for {item.item_key}: {formatted_prompts[0]}"
+                )
 
                 # Build actual vLLM input to test
                 test_req = self._build_vllm_input(

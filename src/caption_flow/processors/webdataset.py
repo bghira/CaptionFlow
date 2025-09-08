@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 class WebDatasetOrchestratorProcessor(OrchestratorProcessor):

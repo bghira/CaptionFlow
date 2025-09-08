@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 import logging
+import os
 from pathlib import Path
 from typing import Set, Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
@@ -11,7 +12,7 @@ from .checkpoint_tracker import CheckpointTracker
 from threading import Lock
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 @dataclass

@@ -4,6 +4,7 @@ import asyncio
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from io import BytesIO
+import os
 from pathlib import Path
 from typing import List, Any, Optional, Tuple, Union
 
@@ -14,7 +15,7 @@ from ..models import ProcessingItem
 
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 class ImageProcessor:

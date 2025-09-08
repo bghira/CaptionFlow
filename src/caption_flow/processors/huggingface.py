@@ -29,7 +29,7 @@ from ..utils import ChunkTracker
 from ..models import JobId
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 def log_memory(location: str):
@@ -41,10 +41,6 @@ def log_memory(location: str):
     )
     # Force garbage collection
     gc.collect()
-
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 
 class NonBlockingQueueHandler:
@@ -378,9 +374,6 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         if storage:
             processed_job_ids = storage.get_all_processed_job_ids()
             if processed_job_ids:
-                logger.info(
-                    f"Synchronizing with {len(processed_job_ids)} processed items from storage"
-                )
                 self.update_from_storage(processed_job_ids)
 
         # THEN: Restore work units from chunk tracker
@@ -398,10 +391,6 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 # Only add incomplete chunks to pending
                 if chunk_state.status != "completed":
                     self.pending_units.append(chunk_id)
-                elif chunk_state.status == "completed" and chunk_state.processed_ranges:
-                    logger.warning(
-                        f"Chunk {chunk_id} has processed_ranges stored in the checkpoint."
-                    )
 
             self.current_chunk_index = max_chunk_index + 1
             logger.info(f"Resuming from chunk index {self.current_chunk_index}")
@@ -430,8 +419,6 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         # Calculate unprocessed ranges based on existing chunk state
         unprocessed_ranges = [(current_index, current_index + chunk_size - 1)]
-        logger.debug(f"Default unprocessed range for {chunk_index}: {unprocessed_ranges}")
-
         if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
             chunk_state = self.chunk_tracker.chunks[unit_id]
             if chunk_state.processed_ranges:
@@ -669,7 +656,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 # Parse job ID to get chunk and sample index
                 job_id = JobId.from_str(job_id_str)
                 chunk_id = job_id.get_chunk_str()
-                sample_idx = int(job_id.sample_id)  # This is ABSOLUTE
+                sample_idx = int(job_id.sample_id)
                 processed_by_chunk[chunk_id].add(sample_idx)
             except ValueError as e:
                 logger.warning(f"Invalid job ID format: {job_id_str} - {e}")
@@ -791,7 +778,6 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         # Create a set of all processed indices
         processed_indices = set()
         for start, end in processed_ranges:
-            logger.debug(f"Processed range: {start}-{end}")
             processed_indices.update(range(start, end + 1))
 
         # Find unprocessed ranges
@@ -999,7 +985,6 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                 # Still extract URL if available for metadata
                                 if self.url_column and self.url_column in item:
                                     image_url = item[self.url_column]
-                                logger.debug(f"Mock image URL: {image_url}")
 
                                 # Create dummy image with metadata context
                                 image = self._create_dummy_image(
@@ -1084,9 +1069,6 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                                 f"Error downloading image from {image_url}: {e}"
                                             )
                                             continue
-                                        logger.debug(
-                                            f"Downloaded image from URL: {image_url}: {image}"
-                                        )
                                     else:
                                         logger.warning(
                                             f"URL column '{self.url_column}' not found in item at index {global_idx}"
