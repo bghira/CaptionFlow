@@ -1,9 +1,6 @@
-# Caption Flow Configuration
-
 orchestrator:
   host: 0.0.0.0
   port: 8765
-  #ssl:
   #  # Use the paths output by 'caption-flow generate-cert' command
   #  cert: /etc/letsencrypt/live/caption.example.com/fullchain.pem  # From generate-cert output
   #  key: /etc/letsencrypt/live/caption.example.com/privkey.pem      # From generate-cert output
@@ -20,19 +17,22 @@ orchestrator:
   # Minimum chunks to keep ready
   min_chunk_buffer: 10
   dataset:
+    mock_results: false
     type: "huggingface"
-    processor_type: "huggingface_webdataset"
-    dataset_path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
-    name: "pixelvision"
+    processor_type: "huggingface_datasets"
+    dataset_path: "terminusresearch/pexels-metadata-1.71M" # HF dataset path or local directory
+    name: "pexels-1.7M"
     version: "1.0"
-    split: "images"
-    dataset_url_column: "full_image_url"
+    split: "train"
+    dataset_url_column: "url"
 
   # vLLM configuration - distributed to all workers
   vllm:
     # Model settings
+    mock_results: false
     model: "Qwen/Qwen2.5-VL-3B-Instruct"
     tensor_parallel_size: 1
+    max_num_batched_tokens: 4096
     max_model_len: 16384
     dtype: "float16" # or "float32", "bfloat16"
     gpu_memory_utilization: 0.92
@@ -56,38 +56,15 @@ orchestrator:
         - "<|endoftext|>"
         - "<|im_end|>"
 
-    # With multi-turn inference, each stage can have its own (or a shared) model, and prompt.
-    stages:
-      - name: "base_caption"
-        model: "Qwen/Qwen2.5-VL-3B-Instruct"
-        prompts: 
-          - "describe this image in detail"
-        # The field in the dataset where this caption will go, which will be available to subsequent stages.
-        output_field: "caption"
-      
-      - name: "caption_shortening"
-        model: "Qwen/Qwen2.5-VL-7B-Instruct"  # Different model
-        prompts: 
-          # The value {caption} will expand from the first stage, base_caption.
-          - "Please condense this elaborate caption to ONLY the important details: {caption}"
-        # This caption will be in its own field called "condensed_caption"
-        output_field: "condensed_caption"
-        # This stage requires the output from the base_caption stage, providing the {caption} value.
-        requires: ["base_caption"]
-        gpu_memory_utilization: 0.35  # Stage-specific override to use less memory for this model's KV cache.
-      
-      - name: "tag_variant"
-        prompts:  # Uses default model from vllm config
-          - "Please convert this caption to booru tag format instead: {condensed_caption}"
-        output_field: "caption"  # Same field - will be added to list
-        requires: ["caption_shortening"] # Can link to multiple requirements to ensure their resulting dataset fields will expand.
+    # Inference prompts - each image gets captions from all prompts
+    inference_prompts:
+      - "without repeating the prompt, complete the sentence: this image shows..."
 
   storage:
     data_dir: ./caption_data
-    checkpoint_interval: 1000
-    caption_buffer_size: 100
-    job_buffer_size: 100
-    contributor_buffer_size: 10
+    checkpoint_interval: 300
+    caption_buffer_size: 5000
+    contributor_buffer_size: 150
     checkpoint_dir: ./checkpoints
 
   auth:

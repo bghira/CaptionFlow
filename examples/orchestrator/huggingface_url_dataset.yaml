@@ -5,12 +5,19 @@ orchestrator:
   #  cert: /etc/letsencrypt/live/caption.example.com/fullchain.pem  # From generate-cert output
   #  key: /etc/letsencrypt/live/caption.example.com/privkey.pem      # From generate-cert output
 
-  # Dataset configuration - centrally managed by orchestrator
-  chunk_size: 1000 # Items per chunk
-  chunks_per_request: 2 # Chunks sent to worker at once
-  chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
-  min_chunk_buffer: 10 # Minimum chunks to keep ready
+  # Items per chunk. Having a larger chunk size reduces memory overhead on the orchestrator.
+  #  If the chunk size is too large, it can lead to uneven work distribution, especially at the end.
+  #  The ideal value depends on the overall size of the dataset, with million+ item datasets benefiting from 10000+
+  chunk_size: 1000
+  # Chunks sent to worker at once. If too many are sent, it will unevenly distribute work.
+  #  If your model is very fast and your images are very small, you may want to increase this to preload data.
+  chunks_per_request: 1
+  # Target chunks = workers * multiplier. Dynamically increases buffer for additional workers.
+  chunk_buffer_multiplier: 2
+  # Minimum chunks to keep ready
+  min_chunk_buffer: 10
   dataset:
+    mock_results: false
     type: "huggingface"
     processor_type: "huggingface_datasets"
     dataset_path: "RareConcepts/pixelvision-670k" # HF dataset path or local directory
@@ -22,8 +29,10 @@ orchestrator:
   # vLLM configuration - distributed to all workers
   vllm:
     # Model settings
+    mock_results: false
     model: "Qwen/Qwen2.5-VL-3B-Instruct"
     tensor_parallel_size: 1
+    # max_num_batched_tokens: 4096
     max_model_len: 16384
     dtype: "float16" # or "float32", "bfloat16"
     gpu_memory_utilization: 0.92
@@ -49,17 +58,16 @@ orchestrator:
 
     # Inference prompts - each image gets captions from all prompts
     inference_prompts:
-      - "You're a caption bot, ONLY designed to output image descriptions. Describe what you see. DON'T explain anything else. ONLY output the description, or the application WILL CRASH."
-      # this one references the title and description column to get more accurate results.
-      - "provide a comprehensive description of the visual content. The original user provided a title ({column:title}) and a description: {column:description}"
-      - "what are the key elements in this image?"
+      - "without repeating the prompt, complete the sentence: this image shows..."
 
   storage:
     data_dir: ./caption_data
-    checkpoint_interval: 1000
-    caption_buffer_size: 100
-    job_buffer_size: 100
-    contributor_buffer_size: 10
+    # How many seconds in-between checkpoint saves.
+    checkpoint_interval: 300
+    # How many captions to keep in memory before forcing a flush to disk.
+    caption_buffer_size: 5000
+    # How many new contributors can connect before a flush to disk will occur.
+    contributor_buffer_size: 150
     checkpoint_dir: ./checkpoints
 
   auth:

@@ -11,18 +11,21 @@ orchestrator:
   # Dataset configuration - centrally managed by orchestrator
   chunk_size: 1000 # Items per chunk
   chunks_per_request: 2 # Chunks sent to worker at once
-  chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
-  min_chunk_buffer: 10 # Minimum chunks to keep ready
+  chunk_buffer_multiplier: 10 # Target chunks = workers * multiplier
+  min_chunk_buffer: 25 # Minimum chunks to keep ready
   dataset:
+    mock_results: false
     type: "huggingface"
     processor_type: "webdataset"
     dataset_path: "NebulaeWis/e621-2024-webp-4Mpixel" # HF dataset path or local directory
     name: "e621"
     version: "1.0"
+    buffer_size: 35
 
   # vLLM configuration - distributed to all workers
   vllm:
     # Model settings
+    mock_results: false
     model: "Qwen/Qwen2.5-VL-7B-Instruct"
     tensor_parallel_size: 1
     max_model_len: 16384
@@ -34,7 +37,7 @@ orchestrator:
       image: 1
 
     # Batching
-    batch_size: 8
+    batch_size: 64
 
     # Sampling parameters
     sampling:
@@ -49,18 +52,14 @@ orchestrator:
         - "<|im_end|>"
 
     # Inference prompts - each image gets captions from all prompts
-    inference_prompts:
-      - "describe this image in detail"
-      - "provide a comprehensive description of the visual content"
-      - "what are the key elements in this image?"
       # Add more prompts for diverse captions
-      # - "describe the scene, including any notable objects, people, or activities"
-      # - "what story does this image tell?"
+    inference_prompts:
+      - "without repeating the prompt, complete the sentence: this image shows..."
 
   storage:
     data_dir: ./caption_data
-    checkpoint_interval: 1000
-    caption_buffer_size: 100
+    checkpoint_interval: 2000
+    caption_buffer_size: 10000
     job_buffer_size: 100
     contributor_buffer_size: 10
     checkpoint_dir: ./checkpoints
