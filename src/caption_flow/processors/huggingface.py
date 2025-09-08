@@ -1010,61 +1010,66 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                 )
                             else:
                                 # Normal processing - load real images
-                                if self.url_column and self.url_column in item:
-                                    image_url = item[self.url_column]
-                                    try:
-                                        max_retries = 3
-                                        backoff_factor = 2
-                                        initial_delay = 1  # seconds
-                                        response = None
+                                if self.url_column:
+                                    if self.url_column in item:
+                                        image_url = item[self.url_column]
+                                        try:
+                                            max_retries = 3
+                                            backoff_factor = 2
+                                            initial_delay = 1  # seconds
+                                            response = None
 
-                                        for attempt in range(max_retries):
-                                            try:
-                                                response = requests.get(image_url, timeout=30)
-                                                response.raise_for_status()
-                                                break  # Success
-                                            except requests.exceptions.HTTPError as http_err:
-                                                if response is not None and response.status_code == 429:
-                                                    retry_after = response.headers.get("Retry-After")
-                                                    sleep_time = initial_delay * (backoff_factor**attempt)
-                                                    if retry_after:
-                                                        try:
-                                                            sleep_time = int(retry_after)
-                                                        except ValueError:
-                                                            pass  # Keep exponential backoff
-                                                    logger.warning(
-                                                        f"Rate limited (429) for {image_url}. Retrying in {sleep_time}s..."
-                                                    )
-                                                    time.sleep(sleep_time)
-                                                elif response is not None and 500 <= response.status_code < 600:
+                                            for attempt in range(max_retries):
+                                                try:
+                                                    response = requests.get(image_url, timeout=30)
+                                                    response.raise_for_status()
+                                                    break  # Success
+                                                except requests.exceptions.HTTPError as http_err:
+                                                    if response is not None and response.status_code == 429:
+                                                        retry_after = response.headers.get("Retry-After")
+                                                        sleep_time = initial_delay * (backoff_factor**attempt)
+                                                        if retry_after:
+                                                            try:
+                                                                sleep_time = int(retry_after)
+                                                            except ValueError:
+                                                                pass  # Keep exponential backoff
+                                                        logger.warning(
+                                                            f"Rate limited (429) for {image_url}. Retrying in {sleep_time}s..."
+                                                        )
+                                                        time.sleep(sleep_time)
+                                                    elif response is not None and 500 <= response.status_code < 600:
+                                                        delay = initial_delay * (backoff_factor**attempt)
+                                                        logger.warning(
+                                                            f"Server error ({response.status_code}) for {image_url}. Retrying in {delay:.1f}s..."
+                                                        )
+                                                        time.sleep(delay)
+                                                    else:
+                                                        # Non-retriable HTTP error
+                                                        raise http_err
+                                                except requests.exceptions.RequestException as req_err:
+                                                    if attempt == max_retries - 1:
+                                                        raise req_err  # Re-raise on last attempt
                                                     delay = initial_delay * (backoff_factor**attempt)
                                                     logger.warning(
-                                                        f"Server error ({response.status_code}) for {image_url}. Retrying in {delay:.1f}s..."
+                                                        f"Request failed for {image_url}. Retrying in {delay:.1f}s... Error: {req_err}"
                                                     )
                                                     time.sleep(delay)
-                                                else:
-                                                    # Non-retriable HTTP error
-                                                    raise http_err
-                                            except requests.exceptions.RequestException as req_err:
-                                                if attempt == max_retries - 1:
-                                                    raise req_err  # Re-raise on last attempt
-                                                delay = initial_delay * (backoff_factor**attempt)
-                                                logger.warning(
-                                                    f"Request failed for {image_url}. Retrying in {delay:.1f}s... Error: {req_err}"
-                                                )
-                                                time.sleep(delay)
-                                        
-                                        if response is None or not response.ok:
-                                            logger.error(f"Failed to download image from {image_url} after {max_retries} retries.")
-                                            continue
+                                            
+                                            if response is None or not response.ok:
+                                                logger.error(f"Failed to download image from {image_url} after {max_retries} retries.")
+                                                continue
 
-                                        image = Image.open(io.BytesIO(response.content))
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Error downloading image from {image_url}: {e}"
+                                            image = Image.open(io.BytesIO(response.content))
+                                        except Exception as e:
+                                            logger.error(
+                                                f"Error downloading image from {image_url}: {e}"
+                                            )
+                                            continue
+                                        logger.debug(f"Downloaded image from URL: {image_url}")
+                                    else:
+                                        logger.warning(
+                                            f"URL column '{self.url_column}' not found in item at index {global_idx}"
                                         )
-                                        continue
-                                    logger.debug(f"Downloaded image from URL: {image_url}")
 
                                 elif self.image_column and self.image_column in item:
                                     image_data = item[self.image_column]
