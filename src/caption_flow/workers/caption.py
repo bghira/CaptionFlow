@@ -34,7 +34,7 @@ from ..utils.prompt_template import PromptTemplateManager
 from ..models import ProcessingStage, StageResult
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.debug)
 
 
 @dataclass
