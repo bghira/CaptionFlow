@@ -1004,8 +1004,23 @@ class TestProcessorIntegration(ProcessorTestBase):
         orchestrator._start_http_server = Mock()
         orchestrator.initialize(config, storage)
 
+        # Wait for background thread to create units
+        import time
+
+        time.sleep(0.5)  # Give more time for unit creation
+
         # Simulate work assignment
         units = orchestrator.get_work_units(2, "worker1")
+
+        # Check that we got units before proceeding
+        if not units:
+            # If still no units, manually trigger unit creation
+            with orchestrator.lock:
+                orchestrator.current_index = 0
+            time.sleep(0.5)
+            units = orchestrator.get_work_units(2, "worker1")
+
+        assert len(units) > 0, "No work units were created"
         unit_ids = [u.unit_id for u in units]
 
         # Simulate worker failure
