@@ -41,7 +41,7 @@ class ImageProcessor:
             image = item.image
             item.metadata["image_width"], item.metadata["image_height"] = image.size
             item.metadata["image_format"] = image.format or "unknown"
-            item.image = None
+            # item.image = None
             return image
 
         item.image = None
