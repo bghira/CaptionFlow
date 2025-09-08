@@ -72,3 +72,5 @@ datasets/
 caption_data/
 checkpoints/
 config/
+webshart_cache/
+poetry.lock
