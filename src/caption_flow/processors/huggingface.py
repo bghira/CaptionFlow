@@ -1026,9 +1026,16 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                                     response.raise_for_status()
                                                     break  # Success
                                                 except requests.exceptions.HTTPError as http_err:
-                                                    if response is not None and response.status_code == 429:
-                                                        retry_after = response.headers.get("Retry-After")
-                                                        sleep_time = initial_delay * (backoff_factor**attempt)
+                                                    if (
+                                                        response is not None
+                                                        and response.status_code == 429
+                                                    ):
+                                                        retry_after = response.headers.get(
+                                                            "Retry-After"
+                                                        )
+                                                        sleep_time = initial_delay * (
+                                                            backoff_factor**attempt
+                                                        )
                                                         if retry_after:
                                                             try:
                                                                 sleep_time = int(retry_after)
@@ -1038,8 +1045,13 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                                             f"Rate limited (429) for {image_url}. Retrying in {sleep_time}s..."
                                                         )
                                                         time.sleep(sleep_time)
-                                                    elif response is not None and 500 <= response.status_code < 600:
-                                                        delay = initial_delay * (backoff_factor**attempt)
+                                                    elif (
+                                                        response is not None
+                                                        and 500 <= response.status_code < 600
+                                                    ):
+                                                        delay = initial_delay * (
+                                                            backoff_factor**attempt
+                                                        )
                                                         logger.warning(
                                                             f"Server error ({response.status_code}) for {image_url}. Retrying in {delay:.1f}s..."
                                                         )
@@ -1047,17 +1059,23 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                                     else:
                                                         # Non-retriable HTTP error
                                                         raise http_err
-                                                except requests.exceptions.RequestException as req_err:
+                                                except (
+                                                    requests.exceptions.RequestException
+                                                ) as req_err:
                                                     if attempt == max_retries - 1:
                                                         raise req_err  # Re-raise on last attempt
-                                                    delay = initial_delay * (backoff_factor**attempt)
+                                                    delay = initial_delay * (
+                                                        backoff_factor**attempt
+                                                    )
                                                     logger.warning(
                                                         f"Request failed for {image_url}. Retrying in {delay:.1f}s... Error: {req_err}"
                                                     )
                                                     time.sleep(delay)
-                                            
+
                                             if response is None or not response.ok:
-                                                logger.error(f"Failed to download image from {image_url} after {max_retries} retries.")
+                                                logger.error(
+                                                    f"Failed to download image from {image_url} after {max_retries} retries."
+                                                )
                                                 continue
 
                                             image = Image.open(io.BytesIO(response.content))
@@ -1066,7 +1084,9 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                                 f"Error downloading image from {image_url}: {e}"
                                             )
                                             continue
-                                        logger.debug(f"Downloaded image from URL: {image_url}: {image}")
+                                        logger.debug(
+                                            f"Downloaded image from URL: {image_url}: {image}"
+                                        )
                                     else:
                                         logger.warning(
                                             f"URL column '{self.url_column}' not found in item at index {global_idx}"
