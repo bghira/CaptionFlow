@@ -8,11 +8,17 @@ orchestrator:
   #  cert: /etc/letsencrypt/live/caption.example.com/fullchain.pem  # From generate-cert output
   #  key: /etc/letsencrypt/live/caption.example.com/privkey.pem      # From generate-cert output
 
-  # Dataset configuration - centrally managed by orchestrator
-  chunk_size: 10 # Items per chunk
-  chunks_per_request: 2 # Chunks sent to worker at once
-  chunk_buffer_multiplier: 3 # Target chunks = workers * multiplier
-  min_chunk_buffer: 10 # Minimum chunks to keep ready
+  # Items per chunk. Having a larger chunk size reduces memory overhead on the orchestrator.
+  #  If the chunk size is too large, it can lead to uneven work distribution, especially at the end.
+  #  The ideal value depends on the overall size of the dataset, with million+ item datasets benefiting from 10000+
+  chunk_size: 1000
+  # Chunks sent to worker at once. If too many are sent, it will unevenly distribute work.
+  #  If your model is very fast and your images are very small, you may want to increase this to preload data.
+  chunks_per_request: 1
+  # Target chunks = workers * multiplier. Dynamically increases buffer for additional workers.
+  chunk_buffer_multiplier: 2
+  # Minimum chunks to keep ready
+  min_chunk_buffer: 10
   dataset:
     type: "huggingface"
     processor_type: "huggingface" # or "webdataset" for wds format
@@ -60,7 +66,7 @@ orchestrator:
   storage:
     data_dir: ./caption_data
     checkpoint_interval: 1000
-    caption_buffer_size: 100
+    caption_buffer_size: 10000
     job_buffer_size: 1
     contributor_buffer_size: 1
     checkpoint_dir: ./checkpoints
