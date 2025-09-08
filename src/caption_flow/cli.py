@@ -13,6 +13,7 @@ import yaml
 from rich.console import Console
 from rich.logging import RichHandler
 from datetime import datetime
+import datetime as _datetime
 
 from .orchestrator import Orchestrator
 from .monitor import Monitor
@@ -627,7 +628,7 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
     # Find abandoned chunks
     abandoned_chunks = []
     stale_threshold = 3600  # 1 hour
-    current_time = datetime.utcnow()
+    current_time = datetime.now(_datetime.UTC)
 
     for chunk_id, chunk_state in tracker.chunks.items():
         if chunk_state.status == "assigned" and chunk_state.assigned_at:
@@ -1061,13 +1062,13 @@ def inspect_cert(cert_path: str):
 
         from datetime import datetime
 
-        if info["not_after"] < datetime.utcnow():
+        if info["not_after"] < datetime.now(_datetime.UTC):
             console.print("[red]✗ Certificate has expired![/red]")
-        elif (info["not_after"] - datetime.utcnow()).days < 30:
-            days_left = (info["not_after"] - datetime.utcnow()).days
+        elif (info["not_after"] - datetime.now(_datetime.UTC)).days < 30:
+            days_left = (info["not_after"] - datetime.now(_datetime.UTC)).days
             console.print(f"[yellow]⚠ Certificate expires in {days_left} days[/yellow]")
         else:
-            days_left = (info["not_after"] - datetime.utcnow()).days
+            days_left = (info["not_after"] - datetime.now(_datetime.UTC)).days
             console.print(f"[green]✓ Certificate valid for {days_left} more days[/green]")
 
     except Exception as e:

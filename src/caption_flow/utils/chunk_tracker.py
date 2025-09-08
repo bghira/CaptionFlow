@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Set, Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
+import datetime as _datetime
 from dataclasses import dataclass, asdict, field
 
 from .checkpoint_tracker import CheckpointTracker
@@ -60,7 +61,7 @@ class ChunkState:
     def mark_completed(self):
         """Mark chunk as completed and clear unnecessary data to save memory."""
         self.status = "completed"
-        self.completed_at = datetime.utcnow()
+        self.completed_at = datetime.now(_datetime.UTC)
         # Clear processed_ranges since we don't need them after completion
         # self.processed_ranges = []
         # self.assigned_to = None
@@ -201,7 +202,7 @@ class ChunkTracker(CheckpointTracker):
         if not self.archive_after_hours:
             return
 
-        cutoff_time = datetime.utcnow() - timedelta(hours=self.archive_after_hours)
+        cutoff_time = datetime.now(_datetime.UTC) - timedelta(hours=self.archive_after_hours)
         chunks_to_remove = []
 
         for chunk_id, chunk in self.chunks.items():
@@ -269,7 +270,7 @@ class ChunkTracker(CheckpointTracker):
             chunk = self.chunks[chunk_id]
             chunk.status = "assigned"
             chunk.assigned_to = worker_id
-            chunk.assigned_at = datetime.utcnow()
+            chunk.assigned_at = datetime.now(_datetime.UTC)
             self.save()
 
     def mark_completed(self, chunk_id: str):
