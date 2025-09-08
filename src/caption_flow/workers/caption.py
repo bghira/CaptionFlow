@@ -724,6 +724,9 @@ class CaptionWorker(BaseWorker):
         max_length: int = 16384,
     ) -> Tuple[List[ProcessingItem], List[ProcessingItem]]:
         """Validate batch items and split into processable and too-long items."""
+        logger.debug(
+            f"Validating batch of size {len(batch)} for stage '{stage.name}' with max_length {max_length}"
+        )
         processable = []
         too_long = []
 
@@ -744,12 +747,18 @@ class CaptionWorker(BaseWorker):
                         context[stage_result.output_field] = stage_result.outputs[0]
                     else:
                         context[stage_result.output_field] = stage_result.outputs
+                logger.debug(f"Validation context for {item.item_key}: {context}")
 
                 # Format test prompt
                 formatted_prompts = template_manager.format_all(context)
                 if not formatted_prompts:
+                    logger.warning(
+                        f"Could not format prompt for {item.item_key}, marking as too long."
+                    )
                     too_long.append(item)
                     continue
+
+                logger.debug(f"Formatted validation prompt for {item.item_key}: {formatted_prompts[0]}")
 
                 # Build actual vLLM input to test
                 test_req = self._build_vllm_input(
@@ -775,13 +784,16 @@ class CaptionWorker(BaseWorker):
                     too_long.append(item)
                     logger.warning(
                         f"Item {item.item_key} too long: {prompt_length} tokens per prompt, "
-                        f"estimated {estimated_total} total"
+                        f"estimated {estimated_total} total vs max {max_length}"
                     )
 
             except Exception as e:
-                logger.error(f"Error validating item {item.item_key}: {e}")
+                logger.error(f"Error validating item {item.item_key}: {e}", exc_info=True)
                 too_long.append(item)
 
+        logger.debug(
+            f"Validation complete: {len(processable)} processable, {len(too_long)} too long."
+        )
         return processable, too_long
 
     def _resize_image_for_tokens(
