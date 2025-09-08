@@ -580,6 +580,7 @@ class CaptionWorker(BaseWorker):
 
             try:
                 # Create processing item
+                logger.debug(f"Processing item data: {item_data}")
                 item = ProcessingItem(
                     unit_id=unit.unit_id,
                     chunk_id=unit.chunk_id,
