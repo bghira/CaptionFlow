@@ -1,3 +1,4 @@
+import os
 import time
 import asyncio
 import json
@@ -28,7 +29,7 @@ from .processors import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 class Orchestrator:
@@ -877,9 +878,8 @@ class Orchestrator:
             # Log status
             if active_workers:
                 logger.debug(
-                    f"Active workers: {len(active_workers)} - {', '.join(active_workers[:5])}"
+                    f"Inactive workers: {len(self.workers) - len(active_workers)}/{len(active_workers)} - {', '.join(active_workers[:5])}"
                 )
-                logger.debug(f"Inactive workers: {len(self.workers) - len(active_workers)}")
             # add to self.stats
             self.stats["active_workers"] = len(active_workers)
             self.stats["inactive_workers"] = len(self.workers) - len(active_workers)

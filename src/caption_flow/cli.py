@@ -120,21 +120,74 @@ class ConfigManager:
 
 
 def setup_logging(verbose: bool = False):
-    """Configure logging with rich handler, including timestamp."""
+    """Configure logging with rich handler and file output to XDG state directory."""
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(name)s: %(message)s",
-        datefmt="[%Y-%m-%d %H:%M:%S]",
-        handlers=[
+
+    # Determine log directory based on environment or XDG spec
+    log_dir_env = os.environ.get("CAPTIONFLOW_LOG_DIR")
+    if log_dir_env:
+        log_dir = Path(log_dir_env)
+    else:
+        # Use XDG_STATE_HOME for logs, with platform-specific fallbacks
+        xdg_state_home = os.environ.get("XDG_STATE_HOME")
+        if xdg_state_home:
+            base_dir = Path(xdg_state_home)
+        elif sys.platform == "darwin":
+            base_dir = Path.home() / "Library" / "Logs"
+        else:
+            # Default to ~/.local/state on Linux and other systems
+            base_dir = Path.home() / ".local" / "state"
+        log_dir = base_dir / "caption-flow"
+
+    try:
+        # Ensure log directory exists
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file_path = log_dir / "caption_flow.log"
+
+        # Set up handlers
+        handlers: List[logging.Handler] = [
             RichHandler(
                 console=console,
                 rich_tracebacks=True,
                 show_path=False,
-                show_time=True,  # Enables timestamp in RichHandler output
+                show_time=True,
             )
-        ],
+        ]
+
+        # Add file handler
+        file_handler = logging.FileHandler(log_file_path, mode="a")
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        handlers.append(file_handler)
+        log_msg = f"Logging to {log_file_path}"
+
+    except (OSError, PermissionError) as e:
+        # Fallback to only console logging if file logging fails
+        handlers = [
+            RichHandler(
+                console=console,
+                rich_tracebacks=True,
+                show_path=False,
+                show_time=True,
+            )
+        ]
+        log_msg = f"[yellow]Warning: Could not write to log file {log_dir / 'caption_flow.log'}: {e}[/yellow]"
+
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",  # RichHandler overrides this format for console
+        datefmt="[%Y-%m-%d %H:%M:%S]",
+        handlers=handlers,
     )
+
+    # Suppress noisy libraries
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("pyarrow").setLevel(logging.WARNING)
+
+    # Use a dedicated logger to print the log file path to avoid format issues
+    if "log_msg" in locals():
+        logging.getLogger("setup").info(log_msg)
 
 
 def apply_cli_overrides(config: Dict[str, Any], **kwargs) -> Dict[str, Any]:

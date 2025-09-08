@@ -34,7 +34,7 @@ from ..utils.prompt_template import PromptTemplateManager
 from ..models import ProcessingStage, StageResult
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 @dataclass
@@ -580,6 +580,7 @@ class CaptionWorker(BaseWorker):
 
             try:
                 # Create processing item
+                logger.debug(f"Processing item data: {item_data}")
                 item = ProcessingItem(
                     unit_id=unit.unit_id,
                     chunk_id=unit.chunk_id,
@@ -713,11 +714,127 @@ class CaptionWorker(BaseWorker):
 
         return results
 
+    def _validate_and_split_batch(
+        self,
+        batch: List[ProcessingItem],
+        stage: ProcessingStage,
+        processor,
+        tokenizer,
+        sampling_params,
+        max_length: int = 16384,
+    ) -> Tuple[List[ProcessingItem], List[ProcessingItem]]:
+        """Validate batch items and split into processable and too-long items."""
+        logger.debug(
+            f"Validating batch of size {len(batch)} for stage '{stage.name}' with max_length {max_length}"
+        )
+        processable = []
+        too_long = []
+
+        for item in batch:
+            try:
+                # Create a test prompt for this item
+                converted_img = ImageProcessor.prepare_for_inference(item)
+                template_manager = PromptTemplateManager(
+                    stage.prompts[:1]
+                )  # Test with first prompt
+
+                # Build context
+                context = item.metadata.copy()
+                for prev_stage_name, stage_result in item.stage_results.items():
+                    for i, output in enumerate(stage_result.outputs):
+                        context[f"{prev_stage_name}_output_{i}"] = output
+                    if len(stage_result.outputs) == 1:
+                        context[stage_result.output_field] = stage_result.outputs[0]
+                    else:
+                        context[stage_result.output_field] = stage_result.outputs
+                logger.debug(f"Validation context for {item.item_key}: {context}")
+
+                # Format test prompt
+                formatted_prompts = template_manager.format_all(context)
+                if not formatted_prompts:
+                    logger.warning(
+                        f"Could not format prompt for {item.item_key}, marking as too long."
+                    )
+                    too_long.append(item)
+                    continue
+
+                logger.debug(
+                    f"Formatted validation prompt for {item.item_key}: {formatted_prompts[0]}"
+                )
+
+                # Build actual vLLM input to test
+                test_req = self._build_vllm_input(
+                    converted_img, formatted_prompts[0], processor, tokenizer
+                )
+
+                # Use processor to get actual token count
+                if "prompt_token_ids" in test_req:
+                    prompt_length = len(test_req["prompt_token_ids"])
+                else:
+                    # Fallback to tokenizer
+                    prompt_length = len(tokenizer.encode(test_req.get("prompt", "")))
+
+                # Account for all prompts (multiply by number of prompts as upper bound)
+                estimated_total = prompt_length * len(stage.prompts)
+
+                if estimated_total < max_length:
+                    processable.append(item)
+                    logger.debug(
+                        f"Item {item.item_key} validated: {prompt_length} tokens per prompt"
+                    )
+                else:
+                    too_long.append(item)
+                    logger.warning(
+                        f"Item {item.item_key} too long: {prompt_length} tokens per prompt, "
+                        f"estimated {estimated_total} total vs max {max_length}"
+                    )
+
+            except Exception as e:
+                logger.error(f"Error validating item {item.item_key}: {e}", exc_info=True)
+                too_long.append(item)
+
+        logger.debug(
+            f"Validation complete: {len(processable)} processable, {len(too_long)} too long."
+        )
+        return processable, too_long
+
+    def _resize_image_for_tokens(
+        self, item: ProcessingItem, target_ratio: float = 0.7
+    ) -> ProcessingItem:
+        """Resize image to reduce token count."""
+        if not item.image:
+            return item
+
+        # Calculate new size
+        new_width = int(item.image.width * target_ratio)
+        new_height = int(item.image.height * target_ratio)
+
+        # Resize image
+        resized_image = item.image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        # Create new item with resized image
+        new_item = ProcessingItem(
+            unit_id=item.unit_id,
+            job_id=item.job_id,
+            chunk_id=item.chunk_id,
+            item_key=item.item_key,
+            item_index=item.item_index,
+            image=resized_image,
+            image_data=item.image_data,  # Keep original data for metadata
+            metadata={**item.metadata, "_resized": True, "_resize_ratio": target_ratio},
+            stage_results=item.stage_results.copy(),
+        )
+
+        return new_item
+
     def _process_batch_multi_stage(
         self, batch: List[ProcessingItem], max_attempts: int = 3
     ) -> List[Tuple[ProcessingItem, Dict]]:
-        """Process a batch through all stages sequentially."""
+        """Process a batch through all stages with token validation."""
         results = []
+
+        # Get max model length from config
+        max_model_len = self.vllm_config.get("max_model_len", 16384)
 
         # Process each stage in order
         for stage_name in self.stage_order:
@@ -729,26 +846,68 @@ class CaptionWorker(BaseWorker):
                 stage_name, stage.model
             )
 
-            # Track items for retry
-            items_to_process = [(i, item, 0) for i, item in enumerate(batch)]
+            # Validate batch before processing
+            processable_batch, too_long_items = self._validate_and_split_batch(
+                batch, stage, processor, tokenizer, sampling_params, max_model_len
+            )
 
-            while items_to_process:
-                current_batch = []
+            # Handle items that are too long
+            for item in too_long_items:
+                logger.warning(f"Item {item.item_key} exceeds token limit, attempting resize")
+
+                # Try resizing the image
+                resized_item = self._resize_image_for_tokens(item, target_ratio=0.7)
+
+                # Re-validate
+                resized_processable, still_too_long = self._validate_and_split_batch(
+                    [resized_item], stage, processor, tokenizer, sampling_params, max_model_len
+                )
+
+                if resized_processable:
+                    processable_batch.extend(resized_processable)
+                    logger.info(f"Successfully resized {item.item_key} for processing")
+                else:
+                    # Try even smaller
+                    resized_item = self._resize_image_for_tokens(item, target_ratio=0.5)
+                    resized_processable, still_too_long = self._validate_and_split_batch(
+                        [resized_item], stage, processor, tokenizer, sampling_params, max_model_len
+                    )
+
+                    if resized_processable:
+                        processable_batch.extend(resized_processable)
+                        logger.info(f"Successfully resized {item.item_key} to 50% for processing")
+                    else:
+                        logger.error(f"Item {item.item_key} still too long after resize, skipping")
+                        self.items_failed += 1
+
+                        # Send error result
+                        stage_result = StageResult(
+                            stage_name=stage_name,
+                            output_field=stage.output_field,
+                            outputs=[],
+                            error="Image too large even after resizing",
+                        )
+                        item.stage_results[stage_name] = stage_result
+
+                        self.result_queue.put(
+                            {
+                                "item": item,
+                                "outputs": {},
+                                "processing_time_ms": 0.0,
+                                "error": f"Failed stage {stage_name}: token limit exceeded",
+                            }
+                        )
+
+            # Process the validated batch
+            if processable_batch:
+                # Build requests for processable items
                 requests = []
-
-                for idx, (original_idx, item, attempt_count) in enumerate(items_to_process):
-                    current_batch.append((original_idx, item, attempt_count))
-
-                    # Prepare image from PIL frame or bytes
+                for item in processable_batch:
                     converted_img = ImageProcessor.prepare_for_inference(item)
-
-                    # Create template manager
                     template_manager = PromptTemplateManager(stage.prompts)
 
                     # Build context
                     context = item.metadata.copy()
-
-                    # Add previous stage results
                     for prev_stage_name, stage_result in item.stage_results.items():
                         for i, output in enumerate(stage_result.outputs):
                             context[f"{prev_stage_name}_output_{i}"] = output
@@ -769,14 +928,7 @@ class CaptionWorker(BaseWorker):
                 outputs = llm.generate(requests, sampling_params)
 
                 # Process outputs
-                successful_items = []
-                failed_items = []
-
-                for idx, (original_idx, item, attempt_count) in enumerate(current_batch):
-                    if self.should_stop_processing.is_set():
-                        return results
-
-                    # Extract outputs
+                for idx, item in enumerate(processable_batch):
                     base_idx = idx * len(stage.prompts)
                     stage_outputs = []
 
@@ -788,40 +940,18 @@ class CaptionWorker(BaseWorker):
                                 stage_outputs.append(cleaned_output)
 
                     if stage_outputs:
-                        # Success
                         stage_result = StageResult(
                             stage_name=stage_name,
                             output_field=stage.output_field,
                             outputs=stage_outputs,
                         )
                         item.stage_results[stage_name] = stage_result
-                        successful_items.append((original_idx, item))
                     else:
-                        # Failed - check retry
-                        if attempt_count + 1 < max_attempts:
-                            failed_items.append((original_idx, item, attempt_count + 1))
-                        else:
-                            logger.error(f"Stage {stage_name} failed for item {item.item_key}")
-                            self.items_failed += 1
-                            stage_result = StageResult(
-                                stage_name=stage_name,
-                                output_field=stage.output_field,
-                                outputs=[],
-                                error=f"Failed after {max_attempts} attempts",
-                            )
-                            item.stage_results[stage_name] = stage_result
-                            self.result_queue.put(
-                                {
-                                    "item": item,
-                                    "outputs": {},
-                                    "processing_time_ms": 0.0,
-                                    "error": f"Failed stage {stage_name} after {max_attempts} attempts",
-                                }
-                            )
+                        logger.error(f"No outputs for {item.item_key} in stage {stage_name}")
+                        self.items_failed += 1
 
-                # Update for next iteration
-                items_to_process = failed_items
-                batch = [item for _, item in successful_items]
+            # Update batch for next stage
+            batch = processable_batch
 
         # Convert to results
         for item in batch:

@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 import logging
+import os
 from pathlib import Path
 from typing import Set, Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
@@ -11,7 +12,7 @@ from .checkpoint_tracker import CheckpointTracker
 from threading import Lock
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 @dataclass
@@ -95,6 +96,7 @@ class ChunkState:
                 f"Chunk {self.chunk_id} has processed ranges {merged_ranges} covering entire chunk size {self.chunk_size}"
             )
         else:
+            logger.debug(f"Merged ranges for chunk {self.chunk_id}: {merged_ranges}")
             total_processed = sum(end - start + 1 for start, end in merged_ranges)
             total_unprocessed = sum(end - start + 1 for start, end in unprocessed)
             logger.debug(
@@ -496,6 +498,7 @@ class ChunkTracker(CheckpointTracker):
     def _process_chunk_indices(self, chunk_indices: Dict[str, Set[int]]):
         """Process a batch of chunk indices."""
         for chunk_id, abs_indices in chunk_indices.items():
+            logger.debug(f"Processing indices: {abs_indices} for chunk {chunk_id}")
             if chunk_id not in self.chunks:
                 continue
 

@@ -3,12 +3,14 @@
 import json
 import logging
 from abc import ABC, abstractmethod
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 class CheckpointTracker(ABC):
@@ -57,7 +59,9 @@ class CheckpointTracker(ABC):
             # If a save is already in progress, let it finish.
             # This prevents race conditions if save() is called rapidly.
             if hasattr(self, "_save_future") and self._save_future and not self._save_future.done():
+                logger.warning("Previous save still in progress, skipping this save")
                 return  # don't save this time,
+            logger.info("Saving chunk tracker state...")
             # Prepare data with metadata
             with self.lock:
                 data = self._serialize_state()
@@ -74,10 +78,11 @@ class CheckpointTracker(ABC):
         except Exception as e:
             logger.error(f"Failed to submit save task: {e}", exc_info=True)
 
-    def _write_to_disk(self, data: Dict[str, Any]) -> None:
+    def _write_to_disk(self, data: Dict[str, Any], checkpoint_path: Optional[str] = None) -> None:
         """Write checkpoint data to disk atomically."""
         # Create a temporary file in the same directory as the checkpoint
-        tmp_file = self.checkpoint_path.with_suffix(".tmp")
+        tmp_file = (checkpoint_path or self.checkpoint_path).with_suffix(".tmp")
+        logger.debug(f"Checkpoint {tmp_file=}")
 
         try:
             # Ensure the parent directory exists
