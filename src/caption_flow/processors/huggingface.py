@@ -422,11 +422,8 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         shard_name = Path(self.shard_info[shard_id]["filename"]).stem
 
         # Calculate RELATIVE chunk index within the shard
-        shard_start = self.shard_info[shard_id]["start_offset"]
-        relative_chunk_index = (current_index - shard_start) // self.chunk_size
-
         job_id_obj = JobId(
-            shard_id=shard_name, chunk_id=str(relative_chunk_index), sample_id=str(current_index)
+            shard_id=shard_name, chunk_id=str(chunk_index), sample_id=str(current_index)
         )
         unit_id = job_id_obj.get_chunk_str()
 
@@ -1001,6 +998,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                 # Still extract URL if available for metadata
                                 if self.url_column and self.url_column in item:
                                     image_url = item[self.url_column]
+                                logger.debug(f"Mock image URL: {image_url}")
 
                                 # Create dummy image with metadata context
                                 image = self._create_dummy_image(
@@ -1023,6 +1021,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                             f"Error downloading image from {image_url}: {e}"
                                         )
                                         continue
+                                    logger.debug(f"Downloaded image from URL: {image_url}")
 
                                 elif self.image_column and self.image_column in item:
                                     image_data = item[self.image_column]
@@ -1074,7 +1073,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                 "_processed_indices": processed_indices,
                             }
 
-                            processed_indices.append(global_idx)
+                            processed_indices.append(local_idx)
 
                         except Exception as e:
                             logger.error(f"Error processing item at index {global_idx}: {e}")
