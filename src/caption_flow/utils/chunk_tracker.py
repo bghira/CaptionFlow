@@ -169,17 +169,17 @@ class ChunkTracker(CheckpointTracker):
 
     def _deserialize_state(self, data: Dict[str, Any]) -> None:
         """Deserialize loaded data into instance state."""
-        with self.lock:
-            self.chunks = {}
-            self._completed_count = data.get("completed_count", 0)
+        self.chunks = {}
+        self._completed_count = data.get("completed_count", 0)
 
-            # Load chunk states
-            completed_chunks = 0
-            for chunk_id, chunk_data in data.get("chunks", {}).items():
-                chunk_state = ChunkState.from_dict(chunk_data)
+        # Load chunk states
+        completed_chunks = 0
+        for chunk_id, chunk_data in data.get("chunks", {}).items():
+            chunk_state = ChunkState.from_dict(chunk_data)
+            with self.lock:
                 self.chunks[chunk_id] = chunk_state
-                if chunk_state.status == "completed":
-                    completed_chunks += 1
+            if chunk_state.status == "completed":
+                completed_chunks += 1
 
         logger.info(
             f"Loaded {len(self.chunks)} chunks from checkpoint, "
@@ -554,9 +554,9 @@ class ChunkTracker(CheckpointTracker):
         # Merge overlapping ranges
         chunk_state.processed_ranges = chunk_state._merge_ranges(chunk_state.processed_ranges)
 
-        logger.debug(
-            f"Marked items {start_idx}-{end_idx} as processed in chunk {chunk_id} (relative indices: {relative_start}-{relative_end})"
-        )
+        # logger.debug(
+        #     f"Marked items {start_idx}-{end_idx} as processed in chunk {chunk_id} (relative indices: {relative_start}-{relative_end})"
+        # )
 
         # Check if chunk is now complete
         if chunk_state.get_unprocessed_ranges() == []:

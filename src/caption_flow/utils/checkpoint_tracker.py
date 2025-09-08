@@ -53,30 +53,26 @@ class CheckpointTracker(ABC):
 
     def save(self) -> None:
         """Save checkpoint to disk atomically."""
-        with self.lock:
-            try:
-                # Prepare data with metadata
+        try:
+            # If a save is already in progress, let it finish.
+            # This prevents race conditions if save() is called rapidly.
+            if hasattr(self, "_save_future") and self._save_future and not self._save_future.done():
+                return  # don't save this time,
+            # Prepare data with metadata
+            with self.lock:
                 data = self._serialize_state()
-                data["updated_at"] = datetime.utcnow().isoformat()
+            data["updated_at"] = datetime.utcnow().isoformat()
 
-                # Write atomically using temp file
-                tmp_file = self.checkpoint_path.with_suffix(".tmp")
-                # If a save is already in progress, let it finish.
-                # This prevents race conditions if save() is called rapidly.
-                if (
-                    hasattr(self, "_save_future")
-                    and self._save_future
-                    and not self._save_future.done()
-                ):
-                    self._save_future.result()  # Wait for the previous save to complete
+            # Write atomically using temp file
+            tmp_file = self.checkpoint_path.with_suffix(".tmp")
 
-                # Use an executor to run the save operation in a background thread.
-                # This makes the save call non-blocking.
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    data_to_save = data.copy()
-                    self._save_future = executor.submit(self._write_to_disk, data_to_save, tmp_file)
-            except Exception as e:
-                logger.error(f"Failed to submit save task: {e}", exc_info=True)
+            # Use an executor to run the save operation in a background thread.
+            # This makes the save call non-blocking.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                data_to_save = data.copy()
+                self._save_future = executor.submit(self._write_to_disk, data_to_save, tmp_file)
+        except Exception as e:
+            logger.error(f"Failed to submit save task: {e}", exc_info=True)
 
     def _write_to_disk(self, data: Dict[str, Any]) -> None:
         """Write checkpoint data to disk atomically."""

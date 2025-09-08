@@ -374,78 +374,91 @@ class Orchestrator:
             logger.debug(f"Heartbeat from {worker_id}: {data}")
 
     async def _handle_results_submission(self, worker_id: str, data: Dict):
-        """Process results submission from worker."""
-        # Extract user from worker_id
-        worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
+        """Process results submission from worker - fires off async task and returns immediately."""
+        # Fire and forget - process in background
+        asyncio.create_task(self._process_result_async(worker_id, data))
 
-        # Create work result
-        _job_id = data.get("job_id")
-        job_id = JobId.from_str(_job_id)
-        shard_name = job_id.shard_id
-        chunk_name = job_id.chunk_id
+    async def _process_result_async(self, worker_id: str, data: Dict):
+        """Actually process the result in background."""
+        try:
+            # Extract user from worker_id
+            worker_user = worker_id.rsplit("_", 1)[0] if "_" in worker_id else worker_id
 
-        result = WorkResult(
-            unit_id=data["unit_id"],
-            source_id=shard_name,
-            chunk_id=job_id.get_chunk_str(),
-            sample_id=data["sample_id"],
-            dataset=data["dataset"],
-            outputs=data["outputs"],
-            metadata=data.get("metadata", {}),
-            processing_time_ms=data.get("processing_time_ms", 0),
-        )
+            # Create work result
+            _job_id = data.get("job_id")
+            job_id = JobId.from_str(_job_id)
+            shard_name = job_id.shard_id
+            chunk_name = job_id.chunk_id
 
-        # Let processor handle any custom processing - this updates chunk tracker
-        # IMPORTANT: Call this BEFORE saving to storage so chunk tracker is updated
-        # regardless of whether the item is a duplicate
-        processed = self.processor.handle_result(result)
+            result = WorkResult(
+                unit_id=data["unit_id"],
+                source_id=shard_name,
+                chunk_id=job_id.get_chunk_str(),
+                sample_id=data["sample_id"],
+                dataset=data["dataset"],
+                outputs=data["outputs"],
+                metadata=data.get("metadata", {}),
+                processing_time_ms=data.get("processing_time_ms", 0),
+            )
 
-        # Create caption record for storage
-        total_outputs = sum(len(v) for v in result.outputs.values())
+            # Let processor handle any custom processing - this updates chunk tracker
+            # IMPORTANT: Call this BEFORE saving to storage so chunk tracker is updated
+            # regardless of whether the item is a duplicate
+            processed = self.processor.handle_result(result)
 
-        filename = result.metadata.pop("_filename", None)
-        url = result.metadata.pop("_url", None)
-        image_height = result.metadata.pop("image_height", None)
-        image_width = result.metadata.pop("image_width", None)
-        file_size = result.metadata.pop("file_size", None)
-        image_format = result.metadata.pop("image_format", None)
-        item_index = result.metadata.pop("item_index", None)
-        item_key = result.metadata.pop("item_key", None)
-        to_delete_metadata_keys = ["_image_format", "_job_id"]
-        for key in to_delete_metadata_keys:
-            if key in result.metadata:
-                del result.metadata[key]
+            # Create caption record for storage
+            total_outputs = sum(len(v) for v in result.outputs.values())
 
-        caption = Caption(
-            job_id=job_id,
-            dataset=result.dataset,
-            shard=processed["source_id"],
-            chunk_id=chunk_name,
-            item_key=item_key,
-            captions=result.outputs.get("captions", []),
-            outputs=result.outputs,
-            contributor_id=worker_user,
-            timestamp=datetime.utcnow(),
-            caption_count=total_outputs,
-            processing_time_ms=result.processing_time_ms,
-            metadata=result.metadata,
-            image_height=image_height,
-            image_width=image_width,
-            filename=filename,
-            url=url,
-            file_size=file_size,
-            image_format=image_format,
-        )
+            filename = result.metadata.pop("_filename", None)
+            url = result.metadata.pop("_url", None)
+            image_height = result.metadata.pop("image_height", None)
+            image_width = result.metadata.pop("image_width", None)
+            file_size = result.metadata.pop("file_size", None)
+            image_format = result.metadata.pop("image_format", None)
+            item_index = result.metadata.pop("item_index", None)
+            item_key = result.metadata.pop("item_key", None)
 
-        # Save to storage (might skip if duplicate)
-        saved = await self.storage.save_caption(caption)
+            to_delete_metadata_keys = ["_image_format", "_job_id"]
+            for key in to_delete_metadata_keys:
+                if key in result.metadata:
+                    del result.metadata[key]
 
-        # Update contributor stats only if actually saved
-        if saved:
-            contributor = await self.storage.get_contributor(worker_user)
-            if contributor:
-                contributor.total_captions += total_outputs
-                await self.storage.save_contributor(contributor)
+            caption = Caption(
+                job_id=job_id,
+                dataset=result.dataset,
+                shard=processed["source_id"],
+                chunk_id=chunk_name,
+                item_key=item_key,
+                captions=result.outputs.get("captions", []),
+                outputs=result.outputs,
+                contributor_id=worker_user,
+                timestamp=datetime.utcnow(),
+                caption_count=total_outputs,
+                processing_time_ms=result.processing_time_ms,
+                metadata=result.metadata,
+                image_height=image_height,
+                image_width=image_width,
+                filename=filename,
+                url=url,
+                file_size=file_size,
+                image_format=image_format,
+            )
+
+            # Save to storage (might skip if duplicate)
+            saved = await self.storage.save_caption(caption)
+
+            # Update contributor stats only if actually saved
+            if saved:
+                contributor = await self.storage.get_contributor(worker_user)
+                if contributor:
+                    contributor.total_captions += total_outputs
+                    await self.storage.save_contributor(contributor)
+
+        except Exception as e:
+            logger.error(
+                f"Error processing result from {worker_id} for unit {data.get('unit_id', 'unknown')}: {e}",
+                exc_info=True,
+            )
 
     async def _handle_monitor(self, websocket: WebSocketServerProtocol):
         """Handle monitor connection."""

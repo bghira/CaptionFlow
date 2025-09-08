@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 class BaseWorker(ABC):
     """Base class for all WebSocket-based workers with common connection logic."""
+
     gpu_id: Optional[int] = None
 
     def __init__(self, config: Dict[str, Any]):

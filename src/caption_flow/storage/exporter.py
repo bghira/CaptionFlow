@@ -1,51 +1,431 @@
-"""Storage exporter for converting Parquet data to various formats."""
+"""Storage exporter for Lance datasets to various formats."""
 
 import json
 import csv
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
-from dataclasses import dataclass, field
 import logging
 import pandas as pd
 import numpy as np
+from urllib.parse import urlparse
+import tempfile
+import lance
+
+from .lance_storage import LanceStorageManager
 from ..models import StorageContents, ExportError
 
 logger = logging.getLogger(__name__)
 
 
-class StorageExporter:
-    """Exports StorageContents to various formats."""
+class LanceStorageExporter:
+    """Exports Lance storage contents to various formats."""
 
-    def __init__(self, contents: StorageContents):
-        """Initialize exporter with storage contents.
+    def __init__(self, storage_manager: "LanceStorageManager"):
+        """Initialize exporter with Lance storage manager.
 
         Args:
-            contents: StorageContents instance to export
+            storage_manager: LanceStorageManager instance
         """
+        self.storage_manager = storage_manager
+
+    async def export_shard(
+        self,
+        shard_name: str,
+        format: str,
+        output_path: Union[str, Path],
+        columns: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+        **kwargs,
+    ) -> int:
+        """Export a single shard to specified format.
+
+        Args:
+            shard_name: Name of the shard to export
+            format: Export format ('jsonl', 'json', 'csv', 'parquet', 'txt')
+            output_path: Output file or directory path
+            columns: Specific columns to export
+            limit: Maximum number of rows to export
+            **kwargs: Format-specific options
+
+        Returns:
+            Number of items exported
+        """
+        contents = await self.storage_manager.get_shard_contents(
+            shard_name, limit=limit, columns=columns
+        )
+
+        if not contents.rows:
+            logger.warning(f"No data to export for shard {shard_name}")
+            return 0
+
+        exporter = StorageExporter(contents)
+
+        # Add shard suffix to output path
+        output_path = Path(output_path)
+        if format in ["jsonl", "csv", "parquet"]:
+            # Single file formats - add shard name to filename
+            if output_path.suffix:
+                output_file = (
+                    output_path.parent / f"{output_path.stem}_{shard_name}{output_path.suffix}"
+                )
+            else:
+                output_file = output_path / f"{shard_name}.{format}"
+        else:
+            # Directory-based formats
+            output_file = output_path / shard_name
+
+        # Export based on format
+        if format == "jsonl":
+            return exporter.to_jsonl(output_file)
+        elif format == "json":
+            return exporter.to_json(output_file, kwargs.get("filename_column", "filename"))
+        elif format == "csv":
+            return exporter.to_csv(output_file)
+        elif format == "parquet":
+            return await self.export_shard_to_parquet(shard_name, output_file, columns, limit)
+        elif format == "txt":
+            return exporter.to_txt(
+                output_file,
+                kwargs.get("filename_column", "filename"),
+                kwargs.get("export_column", "captions"),
+            )
+        else:
+            raise ValueError(f"Unsupported format: {format}")
+
+    async def export_all_shards(
+        self,
+        format: str,
+        output_path: Union[str, Path],
+        columns: Optional[List[str]] = None,
+        limit_per_shard: Optional[int] = None,
+        shard_filter: Optional[List[str]] = None,
+        **kwargs,
+    ) -> Dict[str, int]:
+        """Export all shards (or filtered shards) to specified format.
+
+        Args:
+            format: Export format
+            output_path: Base output path
+            columns: Columns to export
+            limit_per_shard: Max rows per shard
+            shard_filter: List of specific shards to export
+            **kwargs: Format-specific options
+
+        Returns:
+            Dictionary mapping shard names to export counts
+        """
+        results = {}
+
+        # Get shards to export
+        if shard_filter:
+            shards = [s for s in shard_filter if s in self.storage_manager.shard_datasets]
+        else:
+            shards = list(self.storage_manager.shard_datasets.keys())
+
+        logger.info(f"Exporting {len(shards)} shards to {format} format")
+
+        for shard_name in shards:
+            try:
+                count = await self.export_shard(
+                    shard_name,
+                    format,
+                    output_path,
+                    columns=columns,
+                    limit=limit_per_shard,
+                    **kwargs,
+                )
+                results[shard_name] = count
+                logger.info(f"Exported {count} items from shard {shard_name}")
+            except Exception as e:
+                logger.error(f"Failed to export shard {shard_name}: {e}")
+                results[shard_name] = 0
+
+        return results
+
+    async def export_shard_to_parquet(
+        self,
+        shard_name: str,
+        output_path: Union[str, Path],
+        columns: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> int:
+        """Export a shard directly to Parquet format.
+
+        This is efficient as Lance is already columnar.
+        """
+        if shard_name not in self.storage_manager.shard_datasets:
+            raise ValueError(f"Shard {shard_name} not found")
+
+        dataset = self.storage_manager.shard_datasets[shard_name]
+
+        # Build scanner
+        scanner = dataset.scanner(columns=columns)
+        if limit:
+            scanner = scanner.limit(limit)
+
+        # Get table and write to parquet
+        table = scanner.to_table()
+
+        import pyarrow.parquet as pq
+
+        pq.write_table(table, str(output_path), compression="snappy")
+
+        return table.num_rows
+
+    async def export_to_lance(
+        self,
+        output_path: Union[str, Path],
+        columns: Optional[List[str]] = None,
+        shard_filter: Optional[List[str]] = None,
+    ) -> int:
+        """Export to a new Lance dataset, optionally filtering shards.
+
+        Args:
+            output_path: Path for the output Lance dataset
+            columns: Specific columns to include
+            shard_filter: List of shard names to include
+
+        Returns:
+            Total number of rows exported
+        """
+        output_path = Path(output_path)
+        if output_path.exists():
+            raise ValueError(f"Output path already exists: {output_path}")
+
+        # Get shards to export
+        if shard_filter:
+            shards = [s for s in shard_filter if s in self.storage_manager.shard_datasets]
+        else:
+            shards = list(self.storage_manager.shard_datasets.keys())
+
+        if not shards:
+            raise ValueError("No shards to export")
+
+        total_rows = 0
+        first_shard = True
+
+        for shard_name in shards:
+            dataset = self.storage_manager.shard_datasets[shard_name]
+
+            # Build scanner
+            scanner = dataset.scanner(columns=columns)
+            table = scanner.to_table()
+
+            if first_shard:
+                # Create new dataset
+                lance.write_dataset(table, str(output_path), mode="create")
+                first_shard = False
+            else:
+                # Append to existing
+                lance.write_dataset(table, str(output_path), mode="append")
+
+            total_rows += table.num_rows
+            logger.info(f"Exported {table.num_rows} rows from shard {shard_name}")
+
+        logger.info(f"Created Lance dataset at {output_path} with {total_rows} rows")
+        return total_rows
+
+    async def export_to_huggingface_hub(
+        self,
+        dataset_name: str,
+        token: Optional[str] = None,
+        license: str = "apache-2.0",
+        private: bool = False,
+        nsfw: bool = False,
+        tags: Optional[List[str]] = None,
+        language: str = "en",
+        task_categories: Optional[List[str]] = None,
+        shard_filter: Optional[List[str]] = None,
+        max_shard_size_gb: float = 2.0,
+    ) -> str:
+        """Export to Hugging Face Hub with per-shard parquet files.
+
+        Args:
+            dataset_name: Name for the dataset (e.g., "username/dataset-name")
+            token: Hugging Face API token
+            license: License for the dataset
+            private: Whether to make the dataset private
+            nsfw: Whether to add not-for-all-audiences tag
+            tags: Additional tags
+            language: Language code
+            task_categories: Task categories
+            shard_filter: Specific shards to export
+            max_shard_size_gb: Max size per parquet file in GB
+
+        Returns:
+            URL of the uploaded dataset
+        """
+        try:
+            from huggingface_hub import HfApi, DatasetCard, create_repo
+            import pyarrow.parquet as pq
+        except ImportError:
+            raise ExportError(
+                "huggingface_hub is required for HF export. "
+                "Install with: pip install huggingface_hub"
+            )
+
+        api = HfApi(token=token)
+
+        # Check/create repo
+        repo_exists = False
+        try:
+            api.dataset_info(dataset_name)
+            repo_exists = True
+            logger.info(f"Dataset {dataset_name} already exists, will update it")
+        except:
+            logger.info(f"Creating new dataset: {dataset_name}")
+            create_repo(repo_id=dataset_name, repo_type="dataset", private=private, token=token)
+
+        # Get shards to export
+        if shard_filter:
+            shards = [s for s in shard_filter if s in self.storage_manager.shard_datasets]
+        else:
+            shards = sorted(self.storage_manager.shard_datasets.keys())
+
+        # Export each shard as a separate parquet file
+        total_rows = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            data_dir = tmpdir / "data"
+            data_dir.mkdir(exist_ok=True)
+
+            # Export all shards to the data directory
+            for shard_name in shards:
+                # Export shard to parquet
+                parquet_path = data_dir / f"{shard_name}.parquet"
+                rows = await self.export_shard_to_parquet(shard_name, parquet_path)
+
+                if rows > 0:
+                    # Check file size
+                    file_size_gb = parquet_path.stat().st_size / (1024**3)
+                    if file_size_gb > max_shard_size_gb:
+                        logger.warning(
+                            f"Shard {shard_name} is {file_size_gb:.2f}GB, "
+                            f"exceeds limit of {max_shard_size_gb}GB"
+                        )
+
+                    total_rows += rows
+                    logger.info(f"Prepared {shard_name}: {rows} rows, {file_size_gb:.2f}GB")
+
+            # Create dataset card
+            stats = await self.storage_manager.get_caption_stats()
+
+            # Size category
+            if total_rows < 1000:
+                size_category = "n<1K"
+            elif total_rows < 10000:
+                size_category = "1K<n<10K"
+            elif total_rows < 100000:
+                size_category = "10K<n<100K"
+            elif total_rows < 1000000:
+                size_category = "100K<n<1M"
+            elif total_rows < 1000000:
+                size_category = "1M<n<10M"
+            else:
+                size_category = "n>10M"
+
+            # Prepare tags
+            default_tags = ["lance"]
+            all_tags = default_tags + (tags or [])
+            if nsfw:
+                all_tags.append("not-for-all-audiences")
+
+            # Default task categories
+            if task_categories is None:
+                task_categories = ["text-to-image", "image-to-image"]
+
+            # Create card content
+            card_content = f"""---
+license: {license}
+language:
+- {language}
+size_categories:
+- {size_category}
+task_categories:
+{self._yaml_list(task_categories)}"""
+
+            if all_tags:
+                card_content += f"\ntags:\n{self._yaml_list(all_tags)}"
+
+            card_content += f"""
+---
+
+# Caption Dataset
+
+This dataset contains {total_rows:,} captioned items exported from CaptionFlow.
+
+## Dataset Structure
+
+"""
+
+            card_content += "\n\n### Data Fields\n\n"
+
+            # Add field descriptions
+            all_fields = set()
+            for field, _ in self.storage_manager.base_caption_fields:
+                all_fields.add(field)
+            for fields in self.storage_manager.shard_output_fields.values():
+                all_fields.update(fields)
+
+            for field in sorted(all_fields):
+                if field in stats.get("output_fields", []):
+                    card_content += f"- `{field}`: List of captions/outputs\n"
+                else:
+                    card_content += f"- `{field}`\n"
+
+            if stats.get("field_stats"):
+                card_content += "\n### Output Field Statistics\n\n"
+                for field, count in stats["field_stats"].items():
+                    card_content += f"- `{field}`: {count:,} total items\n"
+
+            # Save README.md
+            readme_path = tmpdir / "README.md"
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write(card_content)
+
+            # Upload the entire folder at once
+            logger.info(f"Uploading dataset to {dataset_name}...")
+            api.upload_large_folder(
+                repo_id=dataset_name,
+                folder_path=str(tmpdir),
+                repo_type="dataset",
+            )
+
+            dataset_url = f"https://huggingface.co/datasets/{dataset_name}"
+            logger.info(f"Successfully uploaded dataset to: {dataset_url}")
+
+            return dataset_url
+
+    def _yaml_list(self, items: List[str]) -> str:
+        """Format a list for YAML."""
+        return "\n".join(f"- {item}" for item in items)
+
+
+class StorageExporter:
+    """Legacy exporter for StorageContents objects."""
+
+    def __init__(self, contents: StorageContents):
         self.contents = contents
         self._validate_contents()
 
     def _validate_contents(self):
-        """Validate that contents are suitable for export."""
         if not self.contents.rows:
             logger.warning("No rows to export")
         if not self.contents.columns:
             raise ExportError("No columns defined for export")
 
     def _flatten_lists(self, value: Any) -> str:
-        """Convert list values to newline-separated strings."""
         if isinstance(value, list):
-            # Strip newlines from each element and join
             return "\n".join(str(item).replace("\n", " ") for item in value)
         return str(value) if value is not None else ""
 
     def _serialize_value(self, value: Any) -> Any:
-        """Convert values to JSON-serializable format."""
         if pd.api.types.is_datetime64_any_dtype(type(value)) or isinstance(value, pd.Timestamp):
             return value.isoformat()
-        elif isinstance(value, np.integer):
+        elif isinstance(value, (np.integer, np.int64)):
             return int(value)
-        elif isinstance(value, np.floating):
+        elif isinstance(value, (np.floating, np.float64)):
             return float(value)
         elif isinstance(value, np.ndarray):
             return value.tolist()
@@ -56,23 +436,13 @@ class StorageExporter:
         return value
 
     def to_jsonl(self, output_path: Union[str, Path]) -> int:
-        """Export to JSONL (JSON Lines) format.
-
-        Args:
-            output_path: Path to output JSONL file
-
-        Returns:
-            Number of rows exported
-        """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         rows_written = 0
         with open(output_path, "w", encoding="utf-8") as f:
             for row in self.contents.rows:
-                # Convert non-serializable values
                 serializable_row = {k: self._serialize_value(v) for k, v in row.items()}
-                # Write each row as a JSON object on its own line
                 json_line = json.dumps(serializable_row, ensure_ascii=False)
                 f.write(json_line + "\n")
                 rows_written += 1
@@ -81,18 +451,12 @@ class StorageExporter:
         return rows_written
 
     def _get_filename_from_row(self, row: Dict[str, Any], filename_column: str) -> Optional[str]:
-        """Extract filename from row, falling back to URL if needed."""
-        # Try the specified filename column first
         filename = row.get(filename_column)
         if filename:
             return filename
 
-        # Fall back to URL if available
         url = row.get("url")
         if url:
-            # Extract filename from URL path
-            from urllib.parse import urlparse
-
             parsed = urlparse(str(url))
             path_parts = parsed.path.rstrip("/").split("/")
             if path_parts and path_parts[-1]:
@@ -101,23 +465,11 @@ class StorageExporter:
         return None
 
     def to_json(self, output_dir: Union[str, Path], filename_column: str = "filename") -> int:
-        """Export to individual JSON files based on filename column.
-
-        Args:
-            output_dir: Directory to write JSON files
-            filename_column: Column containing the base filename
-
-        Returns:
-            Number of files created
-        """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Check if we need to fall back to URL
-        using_url_fallback = False
         if filename_column not in self.contents.columns and "url" in self.contents.columns:
             logger.warning(f"Column '{filename_column}' not found, falling back to 'url' column")
-            using_url_fallback = True
         elif filename_column not in self.contents.columns:
             raise ExportError(f"Column '{filename_column}' not found and no 'url' column available")
 
@@ -128,17 +480,13 @@ class StorageExporter:
             filename = self._get_filename_from_row(row, filename_column)
             if not filename:
                 skipped_count += 1
-                logger.warning(f"Skipping row with no extractable filename")
                 continue
 
-            # Create JSON filename from original filename
             base_name = Path(filename).stem
             json_path = output_dir / f"{base_name}.json"
 
-            # Convert non-serializable values
             serializable_row = {k: self._serialize_value(v) for k, v in row.items()}
 
-            # Write row data as JSON
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(serializable_row, f, ensure_ascii=False, indent=2)
 
@@ -151,14 +499,6 @@ class StorageExporter:
         return files_created
 
     def to_csv(self, output_path: Union[str, Path]) -> int:
-        """Export to CSV format, skipping complex columns.
-
-        Args:
-            output_path: Path to output CSV file
-
-        Returns:
-            Number of rows exported
-        """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -166,12 +506,10 @@ class StorageExporter:
         complex_columns = set()
         csv_safe_columns = []
 
-        # Check column types by sampling data
         sample_size = min(10, len(self.contents.rows))
         for row in self.contents.rows[:sample_size]:
             for col, value in row.items():
                 if col not in complex_columns and value is not None:
-                    # Skip dictionaries and non-output field lists
                     if isinstance(value, dict):
                         complex_columns.add(col)
                         logger.warning(
@@ -185,19 +523,16 @@ class StorageExporter:
                             "Consider using JSONL format for complete data export."
                         )
 
-        # Build list of CSV-safe columns
         csv_safe_columns = [col for col in self.contents.columns if col not in complex_columns]
 
         if not csv_safe_columns:
             raise ExportError("No columns suitable for CSV export. Use JSONL format instead.")
 
-        # Prepare rows for CSV export with safe columns only
         csv_rows = []
         for row in self.contents.rows:
             csv_row = {}
             for col in csv_safe_columns:
                 value = row.get(col)
-                # Handle list values (like captions) by joining with newlines
                 if isinstance(value, list):
                     csv_row[col] = self._flatten_lists(value)
                 elif pd.api.types.is_datetime64_any_dtype(type(value)) or isinstance(
@@ -208,13 +543,11 @@ class StorageExporter:
                     csv_row[col] = value
             csv_rows.append(csv_row)
 
-        # Write to CSV
         with open(output_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=csv_safe_columns)
             writer.writeheader()
             writer.writerows(csv_rows)
 
-        # Log results
         if complex_columns:
             skipped_msg = f"Skipped {len(complex_columns)} complex columns: {', '.join(sorted(complex_columns))}"
             logger.warning(skipped_msg)
@@ -232,29 +565,15 @@ class StorageExporter:
         filename_column: str = "filename",
         export_column: str = "captions",
     ) -> int:
-        """Export specific column to individual text files.
-
-        Args:
-            output_dir: Directory to write text files
-            filename_column: Column containing the base filename
-            export_column: Column to export to text files
-
-        Returns:
-            Number of files created
-        """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Check if we need to fall back to URL
-        using_url_fallback = False
         if filename_column not in self.contents.columns and "url" in self.contents.columns:
             logger.warning(f"Column '{filename_column}' not found, falling back to 'url' column")
-            using_url_fallback = True
         elif filename_column not in self.contents.columns:
             raise ExportError(f"Column '{filename_column}' not found and no 'url' column available")
 
         if export_column not in self.contents.columns:
-            # Check if it's an output field
             if export_column not in self.contents.output_fields:
                 raise ExportError(f"Column '{export_column}' not found in data")
 
@@ -266,20 +585,16 @@ class StorageExporter:
             filename = self._get_filename_from_row(row, filename_column)
             if not filename:
                 skipped_no_filename += 1
-                logger.warning(f"Skipping row with no extractable filename")
                 continue
 
             content = row.get(export_column)
             if content is None:
                 skipped_no_content += 1
-                logger.warning(f"No {export_column} for {filename}")
                 continue
 
-            # Create text filename from original filename
             base_name = Path(filename).stem
             txt_path = output_dir / f"{base_name}.txt"
 
-            # Write content
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(self._flatten_lists(content))
 
@@ -292,177 +607,6 @@ class StorageExporter:
 
         logger.info(f"Created {files_created} text files in: {output_dir}")
         return files_created
-
-    def to_huggingface_hub(
-        self,
-        dataset_name: str,
-        token: Optional[str] = None,
-        license: Optional[str] = None,
-        private: bool = False,
-        nsfw: bool = False,
-        tags: Optional[List[str]] = None,
-        language: str = "en",
-        task_categories: Optional[List[str]] = None,
-    ) -> str:
-        """Export to Hugging Face Hub as a dataset.
-
-        Args:
-            dataset_name: Name for the dataset (e.g., "username/dataset-name")
-            token: Hugging Face API token
-            license: License for the dataset (required for new repos)
-            private: Whether to make the dataset private
-            nsfw: Whether to add not-for-all-audiences tag
-            tags: Additional tags for the dataset
-            language: Language code (default: "en")
-            task_categories: Task categories (default: ["text-to-image", "image-to-image"])
-
-        Returns:
-            URL of the uploaded dataset
-        """
-        try:
-            from huggingface_hub import HfApi, DatasetCard, create_repo
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-        except ImportError:
-            raise ExportError(
-                "huggingface_hub and pyarrow are required for HF export. "
-                "Install with: pip install huggingface_hub pyarrow"
-            )
-
-        # Initialize HF API
-        api = HfApi(token=token)
-
-        # Check if repo exists
-        repo_exists = False
-        try:
-            api.dataset_info(dataset_name)
-            repo_exists = True
-            logger.info(f"Dataset {dataset_name} already exists, will update it")
-        except:
-            logger.info(f"Creating new dataset: {dataset_name}")
-            if not license:
-                raise ExportError("License is required when creating a new dataset")
-
-        # Create repo if it doesn't exist
-        if not repo_exists:
-            create_repo(repo_id=dataset_name, repo_type="dataset", private=private, token=token)
-
-        # Prepare data for parquet
-        df = pd.DataFrame(self.contents.rows)
-
-        # Convert any remaining non-serializable types
-        for col in df.columns:
-            if df[col].dtype == "object":
-                df[col] = df[col].apply(
-                    lambda x: self._serialize_value(x) if x is not None else None
-                )
-
-        # Determine size category
-        num_rows = len(df)
-        if num_rows < 1000:
-            size_category = "n<1K"
-        elif num_rows < 10000:
-            size_category = "1K<n<10K"
-        elif num_rows < 100000:
-            size_category = "10K<n<100K"
-        elif num_rows < 1000000:
-            size_category = "100K<n<1M"
-        elif num_rows < 10000000:
-            size_category = "1M<n<10M"
-        else:
-            size_category = "n>10M"
-
-        # Prepare tags
-        all_tags = tags or []
-        if nsfw:
-            all_tags.append("not-for-all-audiences")
-
-        # Default task categories
-        if task_categories is None:
-            task_categories = ["text-to-image", "image-to-image"]
-
-        # Create dataset card
-        card_content = f"""---
-license: {license or 'unknown'}
-language:
-- {language}
-size_categories:
-- {size_category}
-task_categories:
-{self._yaml_list(task_categories)}"""
-
-        if all_tags:
-            card_content += f"\ntags:\n{self._yaml_list(all_tags)}"
-
-        card_content += f"""
----
-
-# Caption Dataset
-
-This dataset contains {num_rows:,} captioned items exported from CaptionFlow.
-
-## Dataset Structure
-
-### Data Fields
-
-"""
-
-        # Add field descriptions
-        for col in df.columns:
-            dtype = str(df[col].dtype)
-            if col in self.contents.output_fields:
-                card_content += f"- `{col}`: List of captions/outputs\n"
-            else:
-                card_content += f"- `{col}`: {dtype}\n"
-
-        if self.contents.metadata:
-            card_content += "\n## Export Information\n\n"
-            if "export_timestamp" in self.contents.metadata:
-                card_content += (
-                    f"- Export timestamp: {self.contents.metadata['export_timestamp']}\n"
-                )
-            if "field_stats" in self.contents.metadata:
-                card_content += "\n### Field Statistics\n\n"
-                for field, stats in self.contents.metadata["field_stats"].items():
-                    card_content += f"- `{field}`: {stats['total_items']:,} items across {stats['rows_with_data']:,} rows\n"
-
-        # Create temporary parquet file
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp_file:
-            temp_path = Path(tmp_file.name)
-
-        try:
-            # Write parquet file
-            table = pa.Table.from_pandas(df)
-            pq.write_table(table, temp_path, compression="snappy")
-
-            # Upload parquet file
-            api.upload_file(
-                path_or_fileobj=str(temp_path),
-                path_in_repo="data.parquet",
-                repo_id=dataset_name,
-                repo_type="dataset",
-                token=token,
-            )
-
-            # Create and upload dataset card
-            card = DatasetCard(card_content)
-            card.push_to_hub(dataset_name, token=token)
-
-            dataset_url = f"https://huggingface.co/datasets/{dataset_name}"
-            logger.info(f"Successfully uploaded dataset to: {dataset_url}")
-
-            return dataset_url
-
-        finally:
-            # Clean up temp file
-            if temp_path.exists():
-                temp_path.unlink()
-
-    def _yaml_list(self, items: List[str]) -> str:
-        """Format a list for YAML."""
-        return "\n".join(f"- {item}" for item in items)
 
 
 # Addition to StorageManager class
