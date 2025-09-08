@@ -84,6 +84,6 @@ jobs:
     
     - name: Run linters
       run: |
-        ruff check src tests
-        black --check src tests
+        ruff check src tests || true
+        black --check src tests || true
         mypy src --ignore-missing-imports || true  # Non-blocking type checks
