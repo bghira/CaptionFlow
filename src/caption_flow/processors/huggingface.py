@@ -20,6 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import get_dataset_config_names, get_dataset_split_names
 from huggingface_hub import hf_hub_download, get_token
+from tqdm import tqdm
 from caption_flow.storage import StorageManager
 
 from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkUnit, WorkResult
@@ -340,6 +341,8 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         # Cache shard info
         try:
+            # make dir if it doesn't exist already
+            shard_info_cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_data = {
                 "dataset": self.dataset_name,
                 "config": self.config,
@@ -367,9 +370,21 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         raise ValueError(f"Global index {global_index} not found in any shard")
 
     def _restore_state(self, storage: StorageManager) -> None:
-        """Restore state from chunk tracker."""
-        logger.debug("Restoring state from chunk tracker")
+        """Restore state from chunk tracker and synchronize with storage."""
+        logger.debug("Restoring state from chunk tracker and synchronizing with storage")
+
+        # FIRST: Update chunk tracker from storage (like WebDataset does)
+        if storage:
+            processed_job_ids = storage.get_all_processed_job_ids()
+            if processed_job_ids:
+                logger.info(
+                    f"Synchronizing with {len(processed_job_ids)} processed items from storage"
+                )
+                self.update_from_storage(processed_job_ids)
+
+        # THEN: Restore work units from chunk tracker
         if not self.chunk_tracker:
+            logger.warning("No chunk tracker available for state restoration")
             return
 
         with self.lock:
@@ -390,9 +405,12 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             self.current_chunk_index = max_chunk_index + 1
             logger.info(f"Resuming from chunk index {self.current_chunk_index}")
 
+        # Save checkpoint after updating
+        self.chunk_tracker.save()
+
     def _create_work_unit(self, chunk_index: int) -> Optional[WorkUnit]:
         """Create a single work unit for a chunk index."""
-        current_index = chunk_index * self.chunk_size
+        current_index = 0
 
         if current_index >= self.total_items:
             return None
@@ -400,21 +418,32 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         chunk_size = min(self.chunk_size, self.total_items - current_index)
 
         # Find shard for this chunk
-        shard_id, _ = self._get_shard_for_index(current_index)
+        shard_id, local_idx = self._get_shard_for_index(current_index)
         shard_name = Path(self.shard_info[shard_id]["filename"]).stem
 
-        job_id_obj = JobId(shard_id=shard_name, chunk_id=chunk_index, sample_id=current_index)
+        # Calculate RELATIVE chunk index within the shard
+        shard_start = self.shard_info[shard_id]["start_offset"]
+        relative_chunk_index = (current_index - shard_start) // self.chunk_size
+
+        job_id_obj = JobId(
+            shard_id=shard_name, chunk_id=str(relative_chunk_index), sample_id=str(current_index)
+        )
         unit_id = job_id_obj.get_chunk_str()
 
         # Calculate unprocessed ranges based on existing chunk state
         unprocessed_ranges = [(current_index, current_index + chunk_size - 1)]
+        logger.debug(f"Default unprocessed range for {chunk_index}: {unprocessed_ranges}")
 
         if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
             chunk_state = self.chunk_tracker.chunks[unit_id]
             if chunk_state.processed_ranges:
                 # Subtract processed ranges from total range
+                range_to_subtract = (current_index, current_index + chunk_size - 1)
+                logger.debug(
+                    f"Chunk {unit_id} has processed ranges: {chunk_state.processed_ranges}"
+                )
                 unprocessed_ranges = self._subtract_ranges(
-                    [(current_index, current_index + chunk_size - 1)], chunk_state.processed_ranges
+                    [range_to_subtract], chunk_state.processed_ranges
                 )
 
         # If all ranges are processed, return None (shouldn't happen if status tracking is correct)
@@ -465,13 +494,16 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             # Create units as needed
             units_created = 0
 
+            # Progress bar
+            progress_bar = tqdm(total=units_needed, desc="Creating work units", unit="unit")
+
             while units_created < units_needed:
-                logger.debug(f"Creating work unit for chunk {self.current_chunk_index}")
+                # logger.debug(f"Creating work unit for chunk {self.current_chunk_index}")
                 if self.current_chunk_index * self.chunk_size >= self.total_items:
                     threading.Event().wait(30)
                     break
                 # Get shard info for proper unit_id
-                current_index = self.current_chunk_index * self.chunk_size
+                current_index = self.current_chunk_index
                 if current_index < self.total_items:
                     shard_id, _ = self._get_shard_for_index(current_index)
                     shard_name = Path(self.shard_info[shard_id]["filename"]).stem
@@ -496,7 +528,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     # Track in chunk tracker
                     if self.chunk_tracker:
-                        start_index = self.current_chunk_index * self.chunk_size
+                        start_index = 0
                         chunk_size = min(self.chunk_size, self.total_items - start_index)
                         self.chunk_tracker.add_chunk(
                             unit_id,
@@ -509,6 +541,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                     units_created += 1
                     self.current_chunk_index += 1
 
+                progress_bar.update(1)
             if units_created > 0:
                 logger.debug(f"Created {units_created} work unit IDs")
 
@@ -624,9 +657,86 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 self.chunk_tracker.release_worker_chunks(worker_id)
 
     def update_from_storage(self, processed_job_ids: Set[str]) -> None:
-        """Update work units based on what's been processed."""
+        """Update chunk tracker based on what's been processed in storage."""
         logger.info(f"Updating from storage with {len(processed_job_ids)} processed jobs")
-        # No need to update in-memory work units since we create on demand
+
+        if not self.chunk_tracker:
+            return
+
+        # Group by chunk
+        processed_by_chunk = defaultdict(set)
+
+        for job_id_str in processed_job_ids:
+            try:
+                # Parse job ID to get chunk and sample index
+                job_id = JobId.from_str(job_id_str)
+                chunk_id = job_id.get_chunk_str()
+                sample_idx = int(job_id.sample_id)  # This is ABSOLUTE
+                processed_by_chunk[chunk_id].add(sample_idx)
+            except ValueError as e:
+                logger.warning(f"Invalid job ID format: {job_id_str} - {e}")
+                continue
+
+        # Update chunk tracker with processed items
+        for chunk_id, indices in processed_by_chunk.items():
+            if not indices:
+                continue
+
+            # Get or create chunk state
+            chunk_state = self.chunk_tracker.chunks.get(chunk_id)
+
+            if not chunk_state:
+                # Parse chunk_id to get info
+                try:
+                    parts = chunk_id.split(":")
+                    if len(parts) >= 3:
+                        shard_name = parts[0]
+                        chunk_idx = int(parts[2])
+                        start_index = 0
+
+                        # Add chunk to tracker
+                        self.chunk_tracker.add_chunk(
+                            chunk_id,
+                            shard_name,
+                            "",  # URL not needed for HuggingFace
+                            start_index,
+                            self.chunk_size,
+                        )
+                        chunk_state = self.chunk_tracker.chunks[chunk_id]
+                        logger.info(f"Created chunk state for {chunk_id} from storage")
+                except (ValueError, IndexError) as e:
+                    logger.error(f"Failed to parse chunk_id {chunk_id}: {e}")
+                    continue
+
+            # Get chunk start index for conversion
+            chunk_start = chunk_state.start_index
+
+            # Convert absolute indices to relative indices
+            relative_indices = [idx - chunk_start for idx in indices]
+            sorted_indices = sorted(relative_indices)
+
+            # Convert to contiguous ranges
+            ranges = []
+            start_range = sorted_indices[0]
+            end_range = sorted_indices[0]
+
+            for i in range(1, len(sorted_indices)):
+                if sorted_indices[i] == end_range + 1:
+                    end_range = sorted_indices[i]
+                else:
+                    ranges.append((start_range, end_range))
+                    start_range = sorted_indices[i]
+                    end_range = sorted_indices[i]
+            ranges.append((start_range, end_range))
+
+            # Mark ranges as processed (NOW WITH RELATIVE INDICES)
+            logger.info(f"Marking {len(ranges)} ranges as processed in chunk {chunk_id}")
+            for start_idx, end_idx in ranges:
+                self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
+
+        # Save updated chunk tracker
+        self.chunk_tracker.save()
+        logger.info("Chunk tracker synchronized with storage")
 
     def get_stats(self) -> Dict[str, Any]:
         """Get processor statistics."""
@@ -683,6 +793,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         # Create a set of all processed indices
         processed_indices = set()
         for start, end in processed_ranges:
+            logger.debug(f"Processed range: {start}-{end}")
             processed_indices.update(range(start, end + 1))
 
         # Find unprocessed ranges
@@ -930,7 +1041,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                             job_id_obj = JobId(
                                 shard_id=shard_name,
                                 chunk_id=str(chunk_index),
-                                sample_id=str(global_idx),
+                                sample_id=str(local_idx),
                             )
                             job_id = job_id_obj.get_sample_str()
 

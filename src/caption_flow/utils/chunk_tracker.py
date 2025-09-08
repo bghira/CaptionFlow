@@ -95,6 +95,7 @@ class ChunkState:
                 f"Chunk {self.chunk_id} has processed ranges {merged_ranges} covering entire chunk size {self.chunk_size}"
             )
         else:
+            logger.debug(f"Merged ranges for chunk {self.chunk_id}: {merged_ranges}")
             total_processed = sum(end - start + 1 for start, end in merged_ranges)
             total_unprocessed = sum(end - start + 1 for start, end in unprocessed)
             logger.debug(
@@ -496,6 +497,7 @@ class ChunkTracker(CheckpointTracker):
     def _process_chunk_indices(self, chunk_indices: Dict[str, Set[int]]):
         """Process a batch of chunk indices."""
         for chunk_id, abs_indices in chunk_indices.items():
+            logger.debug(f"Processing indices: {abs_indices} for chunk {chunk_id}")
             if chunk_id not in self.chunks:
                 continue
 
