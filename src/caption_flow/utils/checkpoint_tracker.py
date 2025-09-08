@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
+import datetime as _datetime
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ class CheckpointTracker(ABC):
             # Prepare data with metadata
             with self.lock:
                 data = self._serialize_state()
-            data["updated_at"] = datetime.utcnow().isoformat()
+            data["updated_at"] = datetime.now(_datetime.UTC).isoformat()
 
             # Write atomically using temp file
             tmp_file = self.checkpoint_path.with_suffix(".tmp")

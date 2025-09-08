@@ -3,6 +3,7 @@
 import PIL
 from dataclasses import dataclass, field
 from datetime import datetime
+import datetime as _datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image
@@ -37,7 +38,7 @@ class Job:
 
     def __post_init__(self):
         if self.created_at is None:
-            self.created_at = datetime.utcnow()
+            self.created_at = datetime.now(_datetime.UTC)
 
 
 @dataclass

@@ -5,6 +5,7 @@ import json
 import logging
 import ssl
 import uuid
+import datetime as _datetime
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Set, Optional, Any, List
@@ -345,7 +346,7 @@ class Orchestrator:
                     assignment_id=str(uuid.uuid4()),
                     worker_id=worker_id,
                     units=units,
-                    assigned_at=datetime.utcnow(),
+                    assigned_at=datetime.now(_datetime.UTC),
                 )
 
                 await self.workers[worker_id].send(
@@ -433,7 +434,7 @@ class Orchestrator:
                 captions=result.outputs.get("captions", []),
                 outputs=result.outputs,
                 contributor_id=worker_user,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(_datetime.UTC),
                 caption_count=total_outputs,
                 processing_time_ms=result.processing_time_ms,
                 metadata=result.metadata,
@@ -903,7 +904,7 @@ class Orchestrator:
                     )
                     logger.debug("Saved chunk tracker checkpoint")
 
-                self.stats["last_checkpoint"] = datetime.utcnow().isoformat()
+                self.stats["last_checkpoint"] = datetime.now(_datetime.UTC).isoformat()
                 logger.info("Storage and chunk tracker checkpoint complete")
             except Exception as e:
                 logger.error(f"Error during checkpoint: {e}", exc_info=True)

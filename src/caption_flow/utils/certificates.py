@@ -8,6 +8,7 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from datetime import datetime, timedelta
+import datetime as _datetime
 
 
 class CertificateManager:
@@ -35,8 +36,8 @@ class CertificateManager:
             .issuer_name(issuer)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.utcnow())
-            .not_valid_after(datetime.utcnow() + timedelta(days=365))
+            .not_valid_before(datetime.now(_datetime.UTC))
+            .not_valid_after(datetime.now(_datetime.UTC) + timedelta(days=365))
             .add_extension(
                 x509.SubjectAlternativeName(
                     [
