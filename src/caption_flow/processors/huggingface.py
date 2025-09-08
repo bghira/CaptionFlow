@@ -4,6 +4,7 @@ import logging
 import threading
 import re
 import queue
+import time
 import requests
 import json
 import io
@@ -1065,7 +1066,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                                 f"Error downloading image from {image_url}: {e}"
                                             )
                                             continue
-                                        logger.debug(f"Downloaded image from URL: {image_url}")
+                                        logger.debug(f"Downloaded image from URL: {image_url}: {image}")
                                     else:
                                         logger.warning(
                                             f"URL column '{self.url_column}' not found in item at index {global_idx}"
