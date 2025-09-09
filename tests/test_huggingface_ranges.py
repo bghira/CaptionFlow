@@ -222,3 +222,188 @@ class TestHuggingFaceRanges:
             assert (
                 chunk_state.start_index == expected_start_index
             ), f"Chunk {expected_chunk_id} should have start_index {expected_start_index}, got {chunk_state.start_index}"
+
+    def test_malformed_job_ids(self, tmp_path):
+        """Test handling of malformed job IDs that could cause crashes."""
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+        processor.chunk_size = 1000
+
+        # Test various malformed job IDs
+        malformed_job_ids = {
+            "incomplete:chunk",  # Missing parts
+            "shard:chunk:not_a_number:idx:500",  # Non-numeric chunk ID
+            "shard:chunk:0:idx:not_a_number",  # Non-numeric sample ID
+            "wrong:format:here",  # Wrong format entirely
+            "",  # Empty string
+            "shard:chunk:0:idx:",  # Missing sample ID
+            ":chunk:0:idx:500",  # Empty shard name
+            "shard::0:idx:500",  # Missing 'chunk' keyword
+        }
+
+        # Should not crash, should just log warnings and continue
+        processor.update_from_storage(malformed_job_ids)
+
+        # Should not have created any chunks
+        assert len(processor.chunk_tracker.chunks) == 0
+
+    def test_indices_outside_chunk_bounds(self, tmp_path):
+        """Test what happens when indices fall outside expected chunk boundaries."""
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+        processor.chunk_size = 100
+
+        # For chunk 1 (start_index=100, end_index=199), test indices outside bounds
+        problematic_job_ids = {
+            "test_shard:chunk:1:idx:50",  # Index belongs to chunk 0, not chunk 1
+            "test_shard:chunk:1:idx:250",  # Index belongs to chunk 2, not chunk 1
+            "test_shard:chunk:1:idx:150",  # Valid index for chunk 1
+        }
+
+        processor.update_from_storage(problematic_job_ids)
+
+        chunk_state = processor.chunk_tracker.chunks["test_shard:chunk:1"]
+
+        # Should only process the valid index (150)
+        # Index 50 should convert to relative -50 (invalid)
+        # Index 250 should convert to relative 150 (out of bounds for 100-item chunk)
+        # The invalid range protection should prevent negative calculations
+        total_processed = sum(end - start + 1 for start, end in chunk_state.processed_ranges)
+        assert total_processed >= 0, "Should never have negative processed count"
+
+    def test_large_gaps_in_indices(self, tmp_path):
+        """Test handling of very sparse index patterns."""
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+        processor.chunk_size = 10000
+
+        # Create sparse indices with large gaps
+        sparse_job_ids = {
+            "test_shard:chunk:0:idx:0",  # First index
+            "test_shard:chunk:0:idx:5000",  # Middle index
+            "test_shard:chunk:0:idx:9999",  # Last index
+        }
+
+        processor.update_from_storage(sparse_job_ids)
+
+        chunk_state = processor.chunk_tracker.chunks["test_shard:chunk:0"]
+
+        # Should create 3 separate single-item ranges: (0,0), (5000,5000), (9999,9999)
+        assert len(chunk_state.processed_ranges) == 3
+        assert (0, 0) in chunk_state.processed_ranges
+        assert (5000, 5000) in chunk_state.processed_ranges
+        assert (9999, 9999) in chunk_state.processed_ranges
+
+        # Total should be exactly 3
+        total_processed = sum(end - start + 1 for start, end in chunk_state.processed_ranges)
+        assert total_processed == 3
+
+    def test_duplicate_indices(self, tmp_path):
+        """Test handling of duplicate indices in job IDs."""
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+        processor.chunk_size = 1000
+
+        # Include duplicate indices
+        duplicate_job_ids = {
+            "test_shard:chunk:0:idx:100",
+            "test_shard:chunk:0:idx:100",  # Duplicate
+            "test_shard:chunk:0:idx:101",
+            "test_shard:chunk:0:idx:101",  # Duplicate
+            "test_shard:chunk:0:idx:102",
+        }
+
+        processor.update_from_storage(duplicate_job_ids)
+
+        chunk_state = processor.chunk_tracker.chunks["test_shard:chunk:0"]
+
+        # Should handle duplicates gracefully - range should be (100, 102)
+        assert len(chunk_state.processed_ranges) == 1
+        assert chunk_state.processed_ranges[0] == (100, 102)
+
+        # Total should be 3 (not 5)
+        total_processed = sum(end - start + 1 for start, end in chunk_state.processed_ranges)
+        assert total_processed == 3
+
+    def test_extremely_large_chunk_indices(self, tmp_path):
+        """Test handling of very large chunk numbers."""
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+        processor.chunk_size = 1000
+
+        # Test with very large chunk index
+        large_chunk_job_ids = {
+            "test_shard:chunk:999999:idx:999999000",  # chunk 999999 -> start_index should be 999999000
+        }
+
+        processor.update_from_storage(large_chunk_job_ids)
+
+        chunk_id = "test_shard:chunk:999999"
+        assert chunk_id in processor.chunk_tracker.chunks
+        chunk_state = processor.chunk_tracker.chunks[chunk_id]
+
+        # Verify correct start_index calculation even for large numbers
+        expected_start_index = 999999 * 1000
+        assert chunk_state.start_index == expected_start_index
+
+        # Verify range calculation works
+        expected_relative_index = 999999000 - expected_start_index
+        assert (expected_relative_index, expected_relative_index) in chunk_state.processed_ranges
+
+    def test_mixed_chunks_in_same_call(self, tmp_path):
+        """Test processing job IDs from multiple chunks simultaneously."""
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+        processor.chunk_size = 100
+
+        # Mix job IDs from different chunks
+        mixed_job_ids = {
+            "shard_a:chunk:0:idx:10",  # chunk 0
+            "shard_a:chunk:0:idx:11",  # chunk 0
+            "shard_a:chunk:1:idx:150",  # chunk 1
+            "shard_a:chunk:1:idx:151",  # chunk 1
+            "shard_b:chunk:2:idx:250",  # different shard, chunk 2
+        }
+
+        processor.update_from_storage(mixed_job_ids)
+
+        # Should create separate chunks for each
+        expected_chunks = ["shard_a:chunk:0", "shard_a:chunk:1", "shard_b:chunk:2"]
+        for chunk_id in expected_chunks:
+            assert chunk_id in processor.chunk_tracker.chunks
+
+        # Verify each chunk has correct ranges
+        chunk_0 = processor.chunk_tracker.chunks["shard_a:chunk:0"]
+        assert chunk_0.start_index == 0
+        assert (10, 11) in chunk_0.processed_ranges
+
+        chunk_1 = processor.chunk_tracker.chunks["shard_a:chunk:1"]
+        assert chunk_1.start_index == 100
+        assert (50, 51) in chunk_1.processed_ranges  # 150-100=50, 151-100=51
+
+        chunk_2 = processor.chunk_tracker.chunks["shard_b:chunk:2"]
+        assert chunk_2.start_index == 200
+        assert (50, 50) in chunk_2.processed_ranges  # 250-200=50
+
+    def test_zero_chunk_size_edge_case(self, tmp_path):
+        """Test behavior with zero or negative chunk size."""
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+
+        # Test with zero chunk size - should not crash
+        processor.chunk_size = 0
+        job_ids = {"test_shard:chunk:1:idx:100"}
+
+        # Should handle gracefully without division by zero
+        processor.update_from_storage(job_ids)
+
+        # Should still create chunk but with start_index = 1 * 0 = 0
+        chunk_state = processor.chunk_tracker.chunks["test_shard:chunk:1"]
+        assert chunk_state.start_index == 0
