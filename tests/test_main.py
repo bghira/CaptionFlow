@@ -1,4 +1,5 @@
 import pytest
+import logging
 import asyncio
 import json
 import tempfile
@@ -751,6 +752,7 @@ class TestIntegration:
             # Verify field breakdown
             field_breakdown = stats["field_breakdown"]
             assert "captions" in field_breakdown
+            logging.info(f"Field breakdown: {field_breakdown}")
             assert field_breakdown["captions"]["total_items"] == 3
         finally:
             shutil.rmtree(temp_dir)
