@@ -139,3 +139,7 @@ class CertificateManager:
             "serial_number": cert.serial_number,
             "is_self_signed": cert.issuer == cert.subject,
         }
+
+    def inspect_certificate(self, cert_path: Path) -> dict:
+        """Inspect a certificate (alias for get_cert_info for CLI compatibility)."""
+        return self.get_cert_info(cert_path)
