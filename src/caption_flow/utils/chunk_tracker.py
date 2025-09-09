@@ -415,7 +415,6 @@ class ChunkTracker(CheckpointTracker):
             return
 
         import lance
-        import pyarrow.parquet as pq
 
         # Check if item_index column exists
         table_metadata = lance.dataset(storage_manager.captions_path).schema
@@ -425,11 +424,11 @@ class ChunkTracker(CheckpointTracker):
 
         # Process in batches to avoid loading entire table
         batch_size = 10000
-        parquet_file = pq.ParquetFile(storage_manager.captions_path)
+        lance_dataset = lance.dataset(storage_manager.captions_path)
 
         chunk_indices = defaultdict(set)
 
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        for batch in lance_dataset.to_batches(batch_size=batch_size, columns=columns):
             batch_dict = batch.to_pydict()
 
             for i in range(len(batch_dict["chunk_id"])):
