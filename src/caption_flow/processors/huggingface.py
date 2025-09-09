@@ -677,7 +677,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                     if len(parts) >= 3:
                         shard_name = parts[0]
                         chunk_idx = int(parts[2])
-                        start_index = 0
+                        start_index = chunk_idx * self.chunk_size
 
                         # Add chunk to tracker
                         self.chunk_tracker.add_chunk(

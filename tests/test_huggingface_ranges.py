@@ -184,3 +184,41 @@ class TestHuggingFaceRanges:
 
         # Should not call mark_items_processed
         mock_chunk_tracker.mark_items_processed.assert_not_called()
+
+    def test_chunk_start_index_calculation(self, tmp_path):
+        """Test that chunks are created with correct start_index based on chunk number."""
+        # Create processor with real chunk tracker
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+        processor.chunk_size = 1000
+
+        # Test different chunk indices
+        test_cases = [
+            ("test_shard:chunk:0:idx:500", "test_shard:chunk:0", 0),  # chunk 0 -> start_index 0
+            (
+                "test_shard:chunk:1:idx:1500",
+                "test_shard:chunk:1",
+                1000,
+            ),  # chunk 1 -> start_index 1000
+            (
+                "test_shard:chunk:2:idx:2500",
+                "test_shard:chunk:2",
+                2000,
+            ),  # chunk 2 -> start_index 2000
+            (
+                "test_shard:chunk:5:idx:5500",
+                "test_shard:chunk:5",
+                5000,
+            ),  # chunk 5 -> start_index 5000
+        ]
+
+        for job_id, expected_chunk_id, expected_start_index in test_cases:
+            processor.update_from_storage({job_id})
+
+            # Verify chunk was created with correct start_index
+            assert expected_chunk_id in processor.chunk_tracker.chunks
+            chunk_state = processor.chunk_tracker.chunks[expected_chunk_id]
+            assert (
+                chunk_state.start_index == expected_start_index
+            ), f"Chunk {expected_chunk_id} should have start_index {expected_start_index}, got {chunk_state.start_index}"
