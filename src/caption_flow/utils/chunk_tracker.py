@@ -381,9 +381,11 @@ class ChunkTracker(CheckpointTracker):
                     "assigned_chunks": 0,
                     "failed_chunks": 0,
                     "is_complete": True,
+                    "chunks": [],
                 }
 
             shards[shard_name]["total_chunks"] += 1
+            shards[shard_name]["chunks"].append(chunk_state)
 
             if chunk_state.status == "completed":
                 shards[shard_name]["completed_chunks"] += 1
