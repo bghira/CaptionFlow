@@ -252,6 +252,37 @@ class Orchestrator:
             self.processor.release_assignments(worker_id)
             logger.info(f"Worker {worker_id} has safely disconnected")
 
+    def _auth_configs_equal(
+        self, current_config: Dict[str, Any], new_config: Dict[str, Any]
+    ) -> bool:
+        """Compare two auth configurations for equality."""
+
+        # Helper function to normalize token lists for comparison
+        def normalize_tokens(tokens):
+            if not tokens:
+                return []
+            # Sort by token for consistent comparison
+            return sorted(
+                [{"name": t.get("name"), "token": t.get("token")} for t in tokens],
+                key=lambda x: x.get("token", ""),
+            )
+
+        # Compare each token type
+        current_workers = normalize_tokens(current_config.get("worker_tokens", []))
+        new_workers = normalize_tokens(new_config.get("worker_tokens", []))
+
+        current_admins = normalize_tokens(current_config.get("admin_tokens", []))
+        new_admins = normalize_tokens(new_config.get("admin_tokens", []))
+
+        current_monitors = normalize_tokens(current_config.get("monitor_tokens", []))
+        new_monitors = normalize_tokens(new_config.get("monitor_tokens", []))
+
+        return (
+            current_workers == new_workers
+            and current_admins == new_admins
+            and current_monitors == new_monitors
+        )
+
     async def _handle_config_reload(
         self, websocket: WebSocketServerProtocol, new_config: Dict[str, Any]
     ):
@@ -295,8 +326,16 @@ class Orchestrator:
             # Update auth configuration
             if "auth" in orchestrator_config:
                 try:
-                    self.auth = AuthManager(orchestrator_config["auth"])
-                    updated_sections.append("auth")
+                    current_auth_config = self.config.get("auth", {})
+                    new_auth_config = orchestrator_config["auth"]
+
+                    # Only recreate AuthManager if auth config has actually changed
+                    if not self._auth_configs_equal(current_auth_config, new_auth_config):
+                        self.auth = AuthManager(new_auth_config)
+                        updated_sections.append("auth")
+                        logger.info("Auth configuration updated due to changes")
+                    else:
+                        logger.info("Auth configuration unchanged, preserving existing AuthManager")
                 except Exception as e:
                     logger.error(f"Failed to update AuthManager: {e}")
                     warnings.append(f"Auth update failed: {e}")

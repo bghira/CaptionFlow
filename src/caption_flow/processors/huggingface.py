@@ -473,7 +473,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 units_needed = max(0, target_buffer - (pending_count + assigned_count))
 
             if units_needed == 0:
-                threading.Event().wait(5)
+                self.stop_creation.wait(5)
                 continue
 
             # Create units as needed
@@ -485,7 +485,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             while units_created < units_needed:
                 # logger.debug(f"Creating work unit for chunk {self.current_chunk_index}")
                 if self.current_chunk_index * self.chunk_size >= self.total_items:
-                    threading.Event().wait(30)
+                    self.stop_creation.wait(30)
                     break
                 # Get shard info for proper unit_id
                 current_index = self.current_chunk_index
