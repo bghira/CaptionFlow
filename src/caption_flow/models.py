@@ -1,12 +1,16 @@
 """Data models for CaptionFlow."""
 
-import PIL
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 import datetime as _datetime
 from enum import Enum
+import os
 from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 class JobStatus(Enum):
