@@ -137,10 +137,14 @@ class TestStorageManager:
         # Force flush to test schema handling
         await storage_manager._flush_captions()
 
-        # Verify data was written correctly
-        table = pq.read_table(storage_manager.captions_path)
-        assert "captions" in table.column_names
-        assert "descriptions" in table.column_names
+        # Verify data was written correctly using DuckDB
+        con = storage_manager.init_duckdb_connection()
+        # Use DESCRIBE to get schema information from the registered table
+        schema_info = con.execute("DESCRIBE SELECT * FROM captions").fetchall()
+        column_names = [row[0] for row in schema_info]
+
+        assert "captions" in column_names
+        assert "descriptions" in column_names
 
     @pytest.mark.asyncio
     async def test_caption_buffer_flushing(self, storage_manager):
