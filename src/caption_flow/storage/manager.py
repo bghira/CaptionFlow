@@ -4,6 +4,8 @@ import asyncio
 import gc
 import json
 import logging
+import os
+import duckdb
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,7 +22,7 @@ import pandas as pd
 from ..models import Job, Caption, Contributor, StorageContents, JobId
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 class StorageManager:
@@ -32,6 +34,7 @@ class StorageManager:
         caption_buffer_size: int = 100,
         contributor_buffer_size: int = 50,
     ):
+        self.duckdb_shard_connections = {}
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -127,6 +130,117 @@ class StorageManager:
             ]
         )
 
+    def init_duckdb_connection(
+        self, output_shard: Optional[str] = None
+    ) -> duckdb.DuckDBPyConnection:
+        """
+        Initialize or retrieve a DuckDB connection for a given output shard.
+        Currently, we just use a single output shard, but this allows for future implementation of multiple.
+
+        Args:
+            output_shard (Optional[str]): The output shard identifier. If None, uses default shard.
+        Returns:
+            duckdb.DuckDBPyConnection: The DuckDB connection for the specified shard.
+        """
+        shard_key = output_shard or "default"
+        if shard_key in self.duckdb_shard_connections:
+            return self.duckdb_shard_connections[shard_key]
+
+        conn = duckdb.connect(database=":memory:")
+
+        # For the default shard, register the captions Lance dataset if it exists
+        if shard_key == "default":
+            # Force refresh the dataset to handle cases where it was recreated due to schema evolution
+            if self.captions_path.exists():
+                try:
+                    # Always reload from disk to ensure we have the latest version
+                    logger.debug(f"Reloading Lance dataset from {self.captions_path}")
+                    self.captions_dataset = lance.dataset(str(self.captions_path))
+                    logger.debug(f"Successfully loaded Lance dataset, converting to Arrow table")
+                    # Convert Lance dataset to Arrow table for DuckDB compatibility
+                    arrow_table = self.captions_dataset.to_table()
+                    logger.debug(
+                        f"Successfully converted Lance dataset to Arrow table with {arrow_table.num_rows} rows"
+                    )
+                    # Register the Arrow table in DuckDB so it can be queried
+                    conn.register("captions", arrow_table)
+                    logger.debug(
+                        f"Registered Lance dataset {self.captions_path} as 'captions' table in DuckDB"
+                    )
+
+                    # Verify the table was registered
+                    tables = conn.execute("SHOW TABLES").fetchall()
+                    logger.debug(f"Available tables in DuckDB: {tables}")
+                except Exception as e:
+                    logger.warning(f"Failed to register Lance dataset in DuckDB: {e}")
+                    # Fall back to direct file path queries
+
+        self.duckdb_shard_connections[shard_key] = conn
+
+        return conn
+
+    def _init_lance_dataset(self) -> Optional[lance.LanceDataset]:
+        """Initialize or retrieve the captions Lance dataset."""
+        if self.captions_dataset:
+            logger.debug("Captions dataset already initialized")
+            return self.captions_dataset
+
+        if not self.captions_path.exists():
+            logger.debug("Captions dataset does not exist, creating new one")
+            # Create initial schema with just base fields
+            self.caption_schema = self._build_caption_schema(set())
+
+            # Create empty dataset on disk with proper schema
+            empty_dict = {}
+            for field_name, field_type in self.base_caption_fields:
+                if field_type == pa.string():
+                    empty_dict[field_name] = []
+                elif field_type == pa.int32():
+                    empty_dict[field_name] = []
+                elif field_type == pa.int64():
+                    empty_dict[field_name] = []
+                elif field_type == pa.float32():
+                    empty_dict[field_name] = []
+                elif field_type == pa.timestamp("us"):
+                    empty_dict[field_name] = []
+                elif field_type == pa.list_(pa.float32()):
+                    empty_dict[field_name] = []
+                else:
+                    empty_dict[field_name] = []
+
+            empty_table = pa.Table.from_pydict(empty_dict, schema=self.caption_schema)
+            self.captions_dataset = lance.write_dataset(
+                empty_table, str(self.captions_path), mode="create"
+            )
+            logger.info(f"Created empty captions storage at {self.captions_path}")
+
+            return self.captions_dataset
+
+        try:
+            logger.debug(f"Loading Lance dataset from {self.captions_path}")
+            self.captions_dataset = lance.dataset(str(self.captions_path))
+            return self.captions_dataset
+        except Exception as e:
+            logger.error(f"Failed to load Lance dataset from {self.captions_path}: {e}")
+            return None
+
+    def _update_duckdb_connections_after_schema_change(self):
+        """Update DuckDB connections after dataset schema has changed."""
+        logger.debug(
+            f"Updating {len(self.duckdb_shard_connections)} DuckDB connections after schema change"
+        )
+        for shard_key, conn in self.duckdb_shard_connections.items():
+            if shard_key == "default" and self.captions_dataset:
+                try:
+                    # Re-register the updated dataset
+                    arrow_table = self.captions_dataset.to_table()
+                    conn.register("captions", arrow_table)
+                    logger.debug(
+                        f"Updated DuckDB registration for {self.captions_path} after schema change"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to update DuckDB connection after schema change: {e}")
+
     def _build_caption_schema(self, output_fields: Set[str]) -> pa.Schema:
         """Build caption schema with dynamic output fields."""
         fields = self.base_caption_fields.copy()
@@ -161,14 +275,8 @@ class StorageManager:
         self._load_stats()
 
         # Initialize caption storage
-        if not self.captions_path.exists():
-            # Create initial schema with just base fields
-            self.caption_schema = self._build_caption_schema(set())
-            logger.debug("Will create Lance dataset on first write")
-        else:
-            # Load existing Lance dataset
-            self.captions_dataset = lance.dataset(str(self.captions_path))
-
+        if self._init_lance_dataset():
+            logger.debug(f"Initialized captions dataset from {self.captions_path}")
             # Load existing job IDs
             job_ids = (
                 self.captions_dataset.to_table(columns=["job_id"]).column("job_id").to_pylist()
@@ -190,6 +298,8 @@ class StorageManager:
             # Calculate stats if not loaded
             if self.stats["disk_rows"] == 0:
                 await self._calculate_initial_stats()
+        else:
+            logger.warning("No existing captions dataset found, starting fresh.")
 
         # Initialize contributors storage
         if not self.contributors_path.exists():
@@ -388,10 +498,43 @@ class StorageManager:
                     self.captions_dataset = None
 
             if self.captions_dataset is not None:
-                # Append to existing dataset
-                self.captions_dataset = lance.write_dataset(
-                    table, str(self.captions_path), mode="append"
-                )
+                # Check if schema has changed (new output fields added)
+                existing_schema_fields = set(self.captions_dataset.schema.names)
+                new_schema_fields = set(schema.names)
+
+                if new_schema_fields != existing_schema_fields:
+                    # Schema has changed, need to merge existing data with new schema
+                    logger.info(
+                        f"Schema evolution detected. New fields: {new_schema_fields - existing_schema_fields}"
+                    )
+
+                    # Read existing data
+                    existing_table = self.captions_dataset.to_table()
+                    existing_df = existing_table.to_pandas()
+
+                    # Add missing columns to existing data
+                    for field_name in new_schema_fields - existing_schema_fields:
+                        existing_df[field_name] = None
+
+                    # Convert back to table with new schema
+                    existing_table_updated = pa.Table.from_pandas(existing_df, schema=schema)
+
+                    # Concatenate existing and new data
+                    combined_table = pa.concat_tables([existing_table_updated, table])
+
+                    # Recreate dataset with combined data
+                    self.captions_dataset = lance.write_dataset(
+                        combined_table, str(self.captions_path), mode="overwrite"
+                    )
+
+                    # Update DuckDB connections after schema evolution
+                    logger.debug("Updating DuckDB connections after schema evolution")
+                    self._update_duckdb_connections_after_schema_change()
+                else:
+                    # Schema hasn't changed, normal append
+                    self.captions_dataset = lance.write_dataset(
+                        table, str(self.captions_path), mode="append"
+                    )
             else:
                 # Create new dataset
                 self.captions_dataset = lance.write_dataset(
@@ -585,9 +728,9 @@ class StorageManager:
             )
 
         try:
-            con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-            con.execute("INSTALL lance")
-            con.execute("LOAD lance")
+            logger.debug("Getting DuckDB connection")
+            con = self.init_duckdb_connection()
+            logger.debug("Got DuckDB connection, building query")
 
             # Build query
             column_str = "*"
@@ -595,12 +738,14 @@ class StorageManager:
                 # Quote column names to handle special characters
                 column_str = ", ".join([f'"{c}"' for c in columns])
 
-            query = f"SELECT {column_str} FROM '{str(self.captions_path)}'"
+            query = f"SELECT {column_str} FROM captions"
             if limit:
                 query += f" LIMIT {limit}"
 
+            logger.debug(f"Executing DuckDB query: {query}")
             # Execute query and fetch data
             table = con.execute(query).fetch_arrow_table()
+            logger.debug(f"Query executed successfully, got {table.num_rows} rows")
             rows = table.to_pylist()
             actual_columns = table.schema.names
 
@@ -685,6 +830,9 @@ class StorageManager:
             "total_outputs": total_outputs,
             "output_fields": sorted(list(self.known_output_fields)),
             "field_stats": field_stats,
+            # Compatibility fields for CLI
+            "shard_count": 1,
+            "shards": ["default"],
         }
 
     async def count_captions(self) -> int:
@@ -863,3 +1011,39 @@ class StorageManager:
     def _get_existing_output_columns(self) -> Set[str]:
         """Get output field columns that exist - for API compatibility."""
         return self.known_output_fields.copy()
+
+    # Compatibility methods for LanceStorageExporter
+    @property
+    def shard_datasets(self) -> Dict[str, Any]:
+        """Compatibility property for exporter - returns single default shard."""
+        if self.captions_dataset:
+            return {"default": self.captions_dataset}
+        return {}
+
+    @property
+    def shard_output_fields(self) -> Dict[str, Set[str]]:
+        """Compatibility property for exporter - returns output fields for default shard."""
+        return {"default": self.known_output_fields.copy()}
+
+    async def get_shard_contents(
+        self,
+        shard_name: str,
+        limit: Optional[int] = None,
+        columns: Optional[List[str]] = None,
+        include_metadata: bool = True,
+    ) -> StorageContents:
+        """Compatibility method for exporter - delegates to get_storage_contents for default shard."""
+        if shard_name != "default":
+            return StorageContents(
+                rows=[],
+                columns=[],
+                output_fields=list(self.known_output_fields),
+                total_rows=0,
+                metadata={
+                    "error": f"Shard '{shard_name}' not found. Only 'default' shard is supported."
+                },
+            )
+
+        return await self.get_storage_contents(
+            limit=limit, columns=columns, include_metadata=include_metadata
+        )
