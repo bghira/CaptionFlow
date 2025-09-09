@@ -547,9 +547,16 @@ class ChunkTracker(CheckpointTracker):
         relative_start = start_idx - chunk_state.start_index
         relative_end = end_idx - chunk_state.start_index
 
-        # Ensure indices are within chunk bounds
+        # Ensure indices are within chunk bounds and maintain valid range
         relative_start = max(0, relative_start)
         relative_end = min(chunk_state.chunk_size - 1, relative_end)
+
+        # Skip invalid ranges where start > end
+        if relative_start > relative_end:
+            logger.warning(
+                f"Invalid range for chunk {chunk_id}: start={relative_start}, end={relative_end}, skipping"
+            )
+            return
 
         # Add to processed ranges
         chunk_state.processed_ranges.append((relative_start, relative_end))

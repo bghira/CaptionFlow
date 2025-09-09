@@ -696,11 +696,10 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             # Get chunk start index for conversion
             chunk_start = chunk_state.start_index
 
-            # Convert absolute indices to relative indices
-            relative_indices = [idx - chunk_start for idx in indices]
-            sorted_indices = sorted(relative_indices)
+            # Sort absolute indices for range creation
+            sorted_indices = sorted(indices)
 
-            # Convert to contiguous ranges
+            # Convert to contiguous ranges using absolute indices
             ranges = []
             start_range = sorted_indices[0]
             end_range = sorted_indices[0]
@@ -714,7 +713,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                     end_range = sorted_indices[i]
             ranges.append((start_range, end_range))
 
-            # Mark ranges as processed (NOW WITH RELATIVE INDICES)
+            # Mark ranges as processed (WITH ABSOLUTE INDICES)
             logger.info(f"Marking {len(ranges)} ranges as processed in chunk {chunk_id}")
             for start_idx, end_idx in ranges:
                 self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
