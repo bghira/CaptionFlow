@@ -400,7 +400,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
     def _create_work_unit(self, chunk_index: int) -> Optional[WorkUnit]:
         """Create a single work unit for a chunk index."""
-        current_index = 0
+        current_index = chunk_index * self.chunk_size
 
         if current_index >= self.total_items:
             return None
