@@ -671,25 +671,27 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             chunk_state = self.chunk_tracker.chunks.get(chunk_id)
 
             if not chunk_state:
-                # Parse chunk_id to get info
+                # Parse chunk_id using JobId to get info (reuse existing validation)
                 try:
-                    parts = chunk_id.split(":")
-                    if len(parts) >= 3:
-                        shard_name = parts[0]
-                        chunk_idx = int(parts[2])
-                        start_index = chunk_idx * self.chunk_size
+                    # Reconstruct a valid job_id to parse chunk info
+                    sample_job_id = f"{chunk_id}:idx:0"  # Use dummy sample_id
+                    job_id = JobId.from_str(sample_job_id)
 
-                        # Add chunk to tracker
-                        self.chunk_tracker.add_chunk(
-                            chunk_id,
-                            shard_name,
-                            "",  # URL not needed for HuggingFace
-                            start_index,
-                            self.chunk_size,
-                        )
-                        chunk_state = self.chunk_tracker.chunks[chunk_id]
-                        logger.info(f"Created chunk state for {chunk_id} from storage")
-                except (ValueError, IndexError) as e:
+                    shard_name = job_id.shard_id
+                    chunk_idx = int(job_id.chunk_id)
+                    start_index = chunk_idx * self.chunk_size
+
+                    # Add chunk to tracker
+                    self.chunk_tracker.add_chunk(
+                        chunk_id,
+                        shard_name,
+                        "",  # URL not needed for HuggingFace
+                        start_index,
+                        self.chunk_size,
+                    )
+                    chunk_state = self.chunk_tracker.chunks[chunk_id]
+                    logger.info(f"Created chunk state for {chunk_id} from storage")
+                except ValueError as e:
                     logger.error(f"Failed to parse chunk_id {chunk_id}: {e}")
                     continue
 

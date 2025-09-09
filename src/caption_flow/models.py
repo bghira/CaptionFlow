@@ -74,7 +74,43 @@ class JobId:
         parts = job_id.split(":")
         if len(parts) != 5:
             raise ValueError(f"Invalid job_id format: {job_id}")
-        return JobId(shard_id=parts[0], chunk_id=parts[2], sample_id=parts[4])
+
+        shard_id = parts[0]
+        chunk_keyword = parts[1]
+        chunk_id = parts[2]
+        idx_keyword = parts[3]
+        sample_id = parts[4]
+
+        # Validate format
+        if not shard_id:
+            raise ValueError(f"Invalid job_id format: empty shard_id in {job_id}")
+        if chunk_keyword != "chunk":
+            raise ValueError(
+                f"Invalid job_id format: expected 'chunk' keyword, got '{chunk_keyword}' in {job_id}"
+            )
+        if idx_keyword != "idx":
+            raise ValueError(
+                f"Invalid job_id format: expected 'idx' keyword, got '{idx_keyword}' in {job_id}"
+            )
+
+        # Validate numeric fields
+        try:
+            int(chunk_id)
+        except ValueError:
+            raise ValueError(
+                f"Invalid job_id format: chunk_id must be numeric, got '{chunk_id}' in {job_id}"
+            )
+
+        # sample_id can be empty/None for some use cases, but if provided must be numeric
+        if sample_id:
+            try:
+                int(sample_id)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid job_id format: sample_id must be numeric if provided, got '{sample_id}' in {job_id}"
+                )
+
+        return JobId(shard_id=shard_id, chunk_id=chunk_id, sample_id=sample_id)
 
 
 @dataclass
