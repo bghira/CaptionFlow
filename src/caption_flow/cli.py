@@ -797,8 +797,8 @@ def export(
     tags: Optional[str],
 ):
     """Export caption data to various formats with per-shard support."""
-    from .storage.lance_storage import LanceStorageManager
-    from .storage.exporter import LanceStorageExporter, StorageExporter, ExportError
+    from .storage import StorageManager
+    from .storage.exporter import LanceStorageExporter, ExportError
 
     # Initialize storage manager
     storage_path = Path(data_dir)
@@ -806,7 +806,7 @@ def export(
         console.print(f"[red]Storage directory not found: {data_dir}[/red]")
         sys.exit(1)
 
-    storage = LanceStorageManager(storage_path)
+    storage = StorageManager(storage_path)
 
     async def run_export():
         await storage.initialize()
@@ -824,7 +824,7 @@ def export(
         if stats.get("field_stats"):
             console.print("\n[cyan]Field breakdown:[/cyan]")
             for field, count in stats["field_stats"].items():
-                console.print(f"  • {field}: {count:,} items")
+                console.print(f"  • {field}: {count['total_items']:,} items")
 
         if stats_only:
             return
