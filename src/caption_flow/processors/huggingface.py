@@ -471,9 +471,9 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                 # Check if all data has been processed
                 if self.current_chunk_index * self.chunk_size >= self.total_items:
-                    # All chunks processed, wait longer before checking again
-                    self.stop_creation.wait(30)
-                    continue
+                    # All chunks processed - exit the background thread
+                    logger.debug("All chunks processed, exiting background thread")
+                    break
 
                 target_buffer = max(self.min_buffer, worker_count * self.buffer_multiplier)
                 units_needed = max(0, target_buffer - (pending_count + assigned_count))
