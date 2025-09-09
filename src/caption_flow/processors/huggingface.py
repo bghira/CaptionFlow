@@ -485,7 +485,10 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             while units_created < units_needed:
                 # logger.debug(f"Creating work unit for chunk {self.current_chunk_index}")
                 if self.current_chunk_index * self.chunk_size >= self.total_items:
-                    self.stop_creation.wait(30)
+                    # No more data available - exit immediately instead of waiting
+                    logger.debug(
+                        f"All chunks processed (chunk_index={self.current_chunk_index}, total_items={self.total_items})"
+                    )
                     break
                 # Get shard info for proper unit_id
                 current_index = self.current_chunk_index
