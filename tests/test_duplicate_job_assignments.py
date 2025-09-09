@@ -170,7 +170,7 @@ class TestHuggingFaceJobIdUniqueness:
     def _verify_job_id_format(self, job_ids: Set[str]):
         """Verify all job IDs follow the expected format."""
         for job_id in job_ids:
-            # Job ID should be in format: shard_id:chunk:chunk_idx:sample:sample_idx
+            # Job ID should be in format: shard_id:chunk:chunk_idx:idx:sample_idx
             parts = job_id.split(":")
             assert len(parts) == 5, f"Invalid job ID format: {job_id}"
             assert parts[1] == "chunk", f"Invalid job ID format: {job_id}"
@@ -1276,9 +1276,9 @@ async def test_relative_absolute_index_misalignments(temp_checkpoint_dir):
     # Test job IDs with different formats
     test_job_ids = [
         # (job_id_str, expected_chunk_id, expected_sample_idx)
-        ("shard1:chunk:0:sample:5", "shard1:chunk:0", 5),
-        ("shard1:chunk:1:sample:105", "shard1:chunk:1", 105),
-        ("shard2:chunk:0:sample:0", "shard2:chunk:0", 0),
+        ("shard1:chunk:0:idx:5", "shard1:chunk:0", 5),
+        ("shard1:chunk:1:idx:105", "shard1:chunk:1", 105),
+        ("shard2:chunk:0:idx:0", "shard2:chunk:0", 0),
     ]
 
     for job_id_str, expected_chunk, expected_sample in test_job_ids:
@@ -1465,7 +1465,7 @@ async def test_job_id_calculation_consistency(temp_checkpoint_dir):
         job_id_str_1 = job_id_1.get_sample_str()
 
         # Method 2: From string parsing
-        job_id_str_2 = f"{test['shard']}:chunk:{test['chunk_idx']}:sample:{test['sample_idx']}"
+        job_id_str_2 = f"{test['shard']}:chunk:{test['chunk_idx']}:idx:{test['sample_idx']}"
         job_id_2 = JobId.from_str(job_id_str_2)
 
         # Method 3: From dict
@@ -1669,8 +1669,8 @@ async def test_workaround_for_start_index_bug(temp_checkpoint_dir):
 
         # Generate job IDs with buggy start
         for i in range(5):  # First 5 items
-            job_id_buggy = f"shard:chunk:{chunk_idx}:sample:{current_index + i}"
-            job_id_correct = f"shard:chunk:{chunk_idx}:sample:{correct_index + i}"
+            job_id_buggy = f"shard:chunk:{chunk_idx}:idx:{current_index + i}"
+            job_id_correct = f"shard:chunk:{chunk_idx}:idx:{correct_index + i}"
 
             chunk_info["job_ids_buggy"].append(job_id_buggy)
             chunk_info["job_ids_correct"].append(job_id_correct)
