@@ -400,7 +400,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
     def _create_work_unit(self, chunk_index: int) -> Optional[WorkUnit]:
         """Create a single work unit for a chunk index."""
-        current_index = 0
+        current_index = chunk_index * self.chunk_size
 
         if current_index >= self.total_items:
             return None
@@ -513,7 +513,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     # Track in chunk tracker
                     if self.chunk_tracker:
-                        start_index = 0
+                        start_index = self.current_chunk_index * self.chunk_size
                         chunk_size = min(self.chunk_size, self.total_items - start_index)
                         self.chunk_tracker.add_chunk(
                             unit_id,
@@ -671,36 +671,37 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             chunk_state = self.chunk_tracker.chunks.get(chunk_id)
 
             if not chunk_state:
-                # Parse chunk_id to get info
+                # Parse chunk_id using JobId to get info (reuse existing validation)
                 try:
-                    parts = chunk_id.split(":")
-                    if len(parts) >= 3:
-                        shard_name = parts[0]
-                        chunk_idx = int(parts[2])
-                        start_index = 0
+                    # Reconstruct a valid job_id to parse chunk info
+                    sample_job_id = f"{chunk_id}:idx:0"  # Use dummy sample_id
+                    job_id = JobId.from_str(sample_job_id)
 
-                        # Add chunk to tracker
-                        self.chunk_tracker.add_chunk(
-                            chunk_id,
-                            shard_name,
-                            "",  # URL not needed for HuggingFace
-                            start_index,
-                            self.chunk_size,
-                        )
-                        chunk_state = self.chunk_tracker.chunks[chunk_id]
-                        logger.info(f"Created chunk state for {chunk_id} from storage")
-                except (ValueError, IndexError) as e:
+                    shard_name = job_id.shard_id
+                    chunk_idx = int(job_id.chunk_id)
+                    start_index = chunk_idx * self.chunk_size
+
+                    # Add chunk to tracker
+                    self.chunk_tracker.add_chunk(
+                        chunk_id,
+                        shard_name,
+                        "",  # URL not needed for HuggingFace
+                        start_index,
+                        self.chunk_size,
+                    )
+                    chunk_state = self.chunk_tracker.chunks[chunk_id]
+                    logger.info(f"Created chunk state for {chunk_id} from storage")
+                except ValueError as e:
                     logger.error(f"Failed to parse chunk_id {chunk_id}: {e}")
                     continue
 
             # Get chunk start index for conversion
             chunk_start = chunk_state.start_index
 
-            # Convert absolute indices to relative indices
-            relative_indices = [idx - chunk_start for idx in indices]
-            sorted_indices = sorted(relative_indices)
+            # Sort absolute indices for range creation
+            sorted_indices = sorted(indices)
 
-            # Convert to contiguous ranges
+            # Convert to contiguous ranges using absolute indices
             ranges = []
             start_range = sorted_indices[0]
             end_range = sorted_indices[0]
@@ -714,7 +715,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                     end_range = sorted_indices[i]
             ranges.append((start_range, end_range))
 
-            # Mark ranges as processed (NOW WITH RELATIVE INDICES)
+            # Mark ranges as processed (WITH ABSOLUTE INDICES)
             logger.info(f"Marking {len(ranges)} ranges as processed in chunk {chunk_id}")
             for start_idx, end_idx in ranges:
                 self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)

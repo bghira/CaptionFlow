@@ -2,6 +2,7 @@
 
 import json
 import csv
+import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 import logging
@@ -11,20 +12,21 @@ from urllib.parse import urlparse
 import tempfile
 import lance
 
-from .lance_storage import LanceStorageManager
+from .manager import StorageManager
 from ..models import StorageContents, ExportError
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
 
 class LanceStorageExporter:
     """Exports Lance storage contents to various formats."""
 
-    def __init__(self, storage_manager: "LanceStorageManager"):
-        """Initialize exporter with Lance storage manager.
+    def __init__(self, storage_manager: StorageManager):
+        """Initialize exporter with storage manager.
 
         Args:
-            storage_manager: LanceStorageManager instance
+            storage_manager: StorageManager instance
         """
         self.storage_manager = storage_manager
 
@@ -50,6 +52,8 @@ class LanceStorageExporter:
         Returns:
             Number of items exported
         """
+        logger.debug(f"Getting shard contents for {shard_name}")
+        self.storage_manager.initialize()
         contents = await self.storage_manager.get_shard_contents(
             shard_name, limit=limit, columns=columns
         )
@@ -117,6 +121,7 @@ class LanceStorageExporter:
         results = {}
 
         # Get shards to export
+        await self.storage_manager.initialize()
         if shard_filter:
             shards = [s for s in shard_filter if s in self.storage_manager.shard_datasets]
         else:
@@ -421,7 +426,11 @@ class StorageExporter:
         return str(value) if value is not None else ""
 
     def _serialize_value(self, value: Any) -> Any:
+        import datetime as dt
+
         if pd.api.types.is_datetime64_any_dtype(type(value)) or isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        elif isinstance(value, (dt.datetime, dt.date)):
             return value.isoformat()
         elif isinstance(value, (np.integer, np.int64)):
             return int(value)
@@ -607,88 +616,3 @@ class StorageExporter:
 
         logger.info(f"Created {files_created} text files in: {output_dir}")
         return files_created
-
-
-# Addition to StorageManager class
-async def get_storage_contents(
-    self,
-    limit: Optional[int] = None,
-    columns: Optional[List[str]] = None,
-    include_metadata: bool = True,
-) -> StorageContents:
-    """Retrieve storage contents for export.
-
-    Args:
-        limit: Maximum number of rows to retrieve
-        columns: Specific columns to include (None for all)
-        include_metadata: Whether to include metadata in the result
-
-    Returns:
-        StorageContents instance with the requested data
-    """
-    if not self.captions_path.exists():
-        return StorageContents(
-            rows=[],
-            columns=[],
-            output_fields=list(self.known_output_fields),
-            total_rows=0,
-            metadata={"message": "No captions file found"},
-        )
-
-    # Flush buffers first to ensure all data is on disk
-    await self.checkpoint()
-
-    # Determine columns to read
-    if columns:
-        # Validate requested columns exist
-        table_metadata = pq.read_metadata(self.captions_path)
-        available_columns = set(table_metadata.schema.names)
-        invalid_columns = set(columns) - available_columns
-        if invalid_columns:
-            raise ValueError(f"Columns not found: {invalid_columns}")
-        columns_to_read = columns
-    else:
-        # Read all columns
-        columns_to_read = None
-
-    # Read the table
-    table = pq.read_table(self.captions_path, columns=columns_to_read)
-    df = table.to_pandas()
-
-    # Apply limit if specified
-    if limit:
-        df = df.head(limit)
-
-    # Convert to list of dicts
-    rows = df.to_dict("records")
-
-    # Parse metadata JSON strings back to dicts if present
-    if "metadata" in df.columns:
-        for row in rows:
-            if row.get("metadata"):
-                try:
-                    row["metadata"] = json.loads(row["metadata"])
-                except:
-                    pass  # Keep as string if parsing fails
-
-    # Prepare metadata
-    metadata = {}
-    if include_metadata:
-        stats = await self.get_caption_stats()
-        metadata.update(
-            {
-                "export_timestamp": pd.Timestamp.now().isoformat(),
-                "total_available_rows": stats.get("total_rows", 0),
-                "rows_exported": len(rows),
-                "storage_path": str(self.captions_path),
-                "field_stats": stats.get("field_stats", {}),
-            }
-        )
-
-    return StorageContents(
-        rows=rows,
-        columns=list(df.columns),
-        output_fields=list(self.known_output_fields),
-        total_rows=len(df),
-        metadata=metadata,
-    )

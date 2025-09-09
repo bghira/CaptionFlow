@@ -59,13 +59,13 @@ class TestStorageManager:
     @pytest.mark.asyncio
     async def test_save_caption_deduplication(self, storage_manager):
         """Test that duplicate captions are properly deduplicated only after being written to disk."""
-        job_id = JobId(shard_id="shard1", chunk_id="chunk1", sample_id="sample1")
+        job_id = JobId(shard_id="shard1", chunk_id="1", sample_id="1")
 
         caption = Caption(
             job_id=job_id,
             dataset="test_dataset",
             shard="shard1",
-            chunk_id="chunk1",
+            chunk_id="1",
             item_key="item1",
             caption="test caption 1",
             outputs={"captions": ["test caption 1"]},
@@ -97,15 +97,15 @@ class TestStorageManager:
     @pytest.mark.asyncio
     async def test_dynamic_output_fields(self, storage_manager):
         """Test dynamic schema evolution with new output fields."""
-        job_id1 = JobId(shard_id="shard1", chunk_id="chunk1", sample_id="sample1")
-        job_id2 = JobId(shard_id="shard1", chunk_id="chunk1", sample_id="sample2")
+        job_id1 = JobId(shard_id="shard1", chunk_id="1", sample_id="1")
+        job_id2 = JobId(shard_id="shard1", chunk_id="1", sample_id="sample2")
 
         # First caption with "captions" field
         caption1 = Caption(
             job_id=job_id1,
             dataset="test",
             shard="shard1",
-            chunk_id="chunk1",
+            chunk_id="1",
             item_key="item1",
             caption="caption 1",  # Use caption field (singular)
             outputs={"captions": ["caption 1", "caption 2"]},
@@ -119,7 +119,7 @@ class TestStorageManager:
             job_id=job_id2,
             dataset="test",
             shard="shard1",
-            chunk_id="chunk1",
+            chunk_id="1",
             item_key="item2",
             caption="caption 3",  # Use caption field (singular)
             outputs={"descriptions": ["desc 1"], "captions": ["caption 3"]},
@@ -137,22 +137,26 @@ class TestStorageManager:
         # Force flush to test schema handling
         await storage_manager._flush_captions()
 
-        # Verify data was written correctly
-        table = pq.read_table(storage_manager.captions_path)
-        assert "captions" in table.column_names
-        assert "descriptions" in table.column_names
+        # Verify data was written correctly using DuckDB
+        con = storage_manager.init_duckdb_connection()
+        # Use DESCRIBE to get schema information from the registered table
+        schema_info = con.execute("DESCRIBE SELECT * FROM captions").fetchall()
+        column_names = [row[0] for row in schema_info]
+
+        assert "captions" in column_names
+        assert "descriptions" in column_names
 
     @pytest.mark.asyncio
     async def test_caption_buffer_flushing(self, storage_manager):
         """Test automatic buffer flushing."""
         # Buffer size is 5, so 5 captions should trigger flush
         for i in range(6):
-            job_id = JobId(shard_id="shard1", chunk_id="chunk1", sample_id=f"sample{i}")
+            job_id = JobId(shard_id="shard1", chunk_id="1", sample_id=f"sample{i}")
             caption = Caption(
                 job_id=job_id,
                 dataset="test",
                 shard="shard1",
-                chunk_id="chunk1",
+                chunk_id="1",
                 item_key=f"item{i}",
                 caption=f"caption {i}",  # Use caption field (singular)
                 outputs={"captions": [f"caption {i}"]},
@@ -172,12 +176,12 @@ class TestStorageManager:
         """Test storage statistics calculation."""
         # Add some captions
         for i in range(3):
-            job_id = JobId(shard_id="shard1", chunk_id="chunk1", sample_id=f"sample{i}")
+            job_id = JobId(shard_id="shard1", chunk_id="1", sample_id=f"sample{i}")
             caption = Caption(
                 job_id=job_id,
                 dataset="test",
                 shard="shard1",
-                chunk_id="chunk1",
+                chunk_id="1",
                 item_key=f"item{i}",
                 caption=f"caption {i}",  # Use caption field (singular)
                 outputs={"captions": [f"caption {i}"], "tags": ["tag1", "tag2"]},
@@ -254,21 +258,21 @@ class TestChunkTracker:
 
     def test_add_chunk(self, chunk_tracker):
         """Test adding chunks."""
-        assert chunk_tracker.add_chunk("chunk1", "shard1", "http://example.com/shard1.tar", 0, 1000)
+        assert chunk_tracker.add_chunk(1, "shard1", "http://example.com/shard1.tar", 0, 1000)
 
-        assert "chunk1" in chunk_tracker.chunks
-        assert chunk_tracker.chunks["chunk1"].status == "pending"
-        assert chunk_tracker.chunks["chunk1"].chunk_size == 1000
+        assert 1 in chunk_tracker.chunks
+        assert chunk_tracker.chunks[1].status == "pending"
+        assert chunk_tracker.chunks[1].chunk_size == 1000
 
     def test_mark_items_processed(self, chunk_tracker):
         """Test marking items as processed."""
-        chunk_tracker.add_chunk("chunk1", "shard1", "http://example.com", 0, 100)
+        chunk_tracker.add_chunk(1, "shard1", "http://example.com", 0, 100)
 
         # Mark some items as processed - using absolute indices
-        chunk_tracker.mark_items_processed("chunk1", 10, 20)
-        chunk_tracker.mark_items_processed("chunk1", 30, 40)
+        chunk_tracker.mark_items_processed(1, 10, 20)
+        chunk_tracker.mark_items_processed(1, 30, 40)
 
-        chunk = chunk_tracker.chunks["chunk1"]
+        chunk = chunk_tracker.chunks[1]
         # Check processed ranges were added correctly
         assert len(chunk.processed_ranges) > 0
 
@@ -279,14 +283,14 @@ class TestChunkTracker:
 
     def test_range_merging(self, chunk_tracker):
         """Test that overlapping/adjacent ranges are merged correctly."""
-        chunk_tracker.add_chunk("chunk1", "shard1", "http://example.com", 0, 100)
+        chunk_tracker.add_chunk(1, "shard1", "http://example.com", 0, 100)
 
         # Add overlapping ranges
-        chunk_tracker.mark_items_processed("chunk1", 10, 20)
-        chunk_tracker.mark_items_processed("chunk1", 15, 25)
-        chunk_tracker.mark_items_processed("chunk1", 26, 30)
+        chunk_tracker.mark_items_processed(1, 10, 20)
+        chunk_tracker.mark_items_processed(1, 15, 25)
+        chunk_tracker.mark_items_processed(1, 26, 30)
 
-        chunk = chunk_tracker.chunks["chunk1"]
+        chunk = chunk_tracker.chunks[1]
         # Should be merged into one range [10, 30]
         # Check that ranges were merged correctly
         assert len(chunk.processed_ranges) == 1
@@ -294,39 +298,39 @@ class TestChunkTracker:
 
     def test_chunk_completion(self, chunk_tracker):
         """Test automatic chunk completion when all items processed."""
-        chunk_tracker.add_chunk("chunk1", "shard1", "http://example.com", 0, 10)
+        chunk_tracker.add_chunk(1, "shard1", "http://example.com", 0, 10)
 
         # Mark all items as processed
-        chunk_tracker.mark_items_processed("chunk1", 0, 9)
+        chunk_tracker.mark_items_processed(1, 0, 9)
 
-        chunk = chunk_tracker.chunks["chunk1"]
+        chunk = chunk_tracker.chunks[1]
         # The chunk should be marked as completed
         assert chunk.status == "completed"
 
     def test_worker_assignment_release(self, chunk_tracker):
         """Test chunk assignment and release."""
-        chunk_tracker.add_chunk("chunk1", "shard1", "http://example.com", 0, 100)
+        chunk_tracker.add_chunk(1, "shard1", "http://example.com", 0, 100)
         chunk_tracker.add_chunk("chunk2", "shard1", "http://example.com", 100, 100)
 
         # Assign chunks to worker
-        chunk_tracker.mark_assigned("chunk1", "worker1")
+        chunk_tracker.mark_assigned(1, "worker1")
         chunk_tracker.mark_assigned("chunk2", "worker1")
 
-        assert chunk_tracker.chunks["chunk1"].status == "assigned"
-        assert chunk_tracker.chunks["chunk1"].assigned_to == "worker1"
+        assert chunk_tracker.chunks[1].status == "assigned"
+        assert chunk_tracker.chunks[1].assigned_to == "worker1"
 
         # Release chunks
         released = chunk_tracker.release_worker_chunks("worker1")
         assert len(released) == 2
-        assert chunk_tracker.chunks["chunk1"].status == "pending"
-        assert chunk_tracker.chunks["chunk1"].assigned_to is None
+        assert chunk_tracker.chunks[1].status == "pending"
+        assert chunk_tracker.chunks[1].assigned_to is None
 
     def test_persistence(self, chunk_tracker, temp_file):
         """Test save and load functionality."""
         # Add data
-        chunk_tracker.add_chunk("chunk1", "shard1", "http://example.com", 0, 100)
-        chunk_tracker.mark_items_processed("chunk1", 10, 20)
-        chunk_tracker.mark_assigned("chunk1", "worker1")
+        chunk_tracker.add_chunk(1, "shard1", "http://example.com", 0, 100)
+        chunk_tracker.mark_items_processed(1, 10, 20)
+        chunk_tracker.mark_assigned(1, "worker1")
 
         # Save
         chunk_tracker.save()
@@ -334,8 +338,8 @@ class TestChunkTracker:
         # Create new tracker and load
         new_tracker = ChunkTracker(temp_file)
 
-        assert "chunk1" in new_tracker.chunks
-        chunk = new_tracker.chunks["chunk1"]
+        assert "1" in new_tracker.chunks
+        chunk = new_tracker.chunks["1"]
         assert chunk.status == "assigned"
         # Convert list back to tuple for comparison
         assert [(start, end) for start, end in chunk.processed_ranges] == [(10, 20)]
@@ -343,9 +347,9 @@ class TestChunkTracker:
 
     def test_get_stats(self, chunk_tracker):
         """Test statistics calculation."""
-        chunk_tracker.add_chunk("chunk1", "shard1", "http://example.com", 0, 100)
+        chunk_tracker.add_chunk(1, "shard1", "http://example.com", 0, 100)
         chunk_tracker.add_chunk("chunk2", "shard1", "http://example.com", 100, 100)
-        chunk_tracker.mark_assigned("chunk1", "worker1")
+        chunk_tracker.mark_assigned(1, "worker1")
         chunk_tracker.mark_completed("chunk2")
 
         stats = chunk_tracker.get_stats()
@@ -466,7 +470,7 @@ class TestOrchestrator:
         """Test work unit assignment to workers."""
         # Setup mock work units
         work_units = [
-            WorkUnit("unit1", "chunk1", "shard1", 0, 100, {}),
+            WorkUnit("unit1", 1, "shard1", 0, 100, {}),
             WorkUnit("unit2", "chunk2", "shard1", 100, 100, {}),
         ]
         orchestrator.processor.get_work_units.return_value = work_units
@@ -491,9 +495,9 @@ class TestOrchestrator:
         result_data = {
             "type": "submit_results",
             "unit_id": "unit1",
-            "job_id": "shard1:chunk:chunk1:idx:sample1",  # Proper format
+            "job_id": "shard1:chunk:1:idx:1",  # Proper format
             "dataset": "test_dataset",
-            "sample_id": "sample1",
+            "sample_id": 1,
             "outputs": {"captions": ["test caption"]},
             "metadata": {"image_width": 640, "image_height": 480},
             "processing_time_ms": 100,
@@ -631,7 +635,7 @@ class TestCaptionWorker:
             item = ProcessingItem(
                 unit_id="unit1",
                 job_id=f"job_{i}",
-                chunk_id="chunk1",
+                chunk_id="1",
                 item_key=f"item_{i}",
                 item_index=i,
                 image=Image.new("RGB", (100, 100)),
@@ -676,7 +680,7 @@ class TestCaptionWorker:
         caption_worker.websocket = None
 
         # Create work unit
-        unit = WorkUnit("unit1", "chunk1", "shard1", 0, 1, {})
+        unit = WorkUnit("unit1", 1, "shard1", 0, 1, {})
         unit.unit_size = 1  # Set expected size
 
         # Process unit
@@ -802,8 +806,8 @@ class TestIntegration:
             chunk2 = tracker.chunks["shard1_chunk_100"]
 
             # Debug output
-            print(f"Chunk1 processed count: {chunk1.processed_count}")
-            print(f"Chunk1 processed ranges: {chunk1.processed_ranges}")
+            print(f"1 processed count: {chunk1.processed_count}")
+            print(f"1 processed ranges: {chunk1.processed_ranges}")
             print(f"Chunk2 processed count: {chunk2.processed_count}")
             print(f"Chunk2 processed ranges: {chunk2.processed_ranges}")
 

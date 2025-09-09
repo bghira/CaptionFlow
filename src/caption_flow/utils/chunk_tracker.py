@@ -381,9 +381,11 @@ class ChunkTracker(CheckpointTracker):
                     "assigned_chunks": 0,
                     "failed_chunks": 0,
                     "is_complete": True,
+                    "chunks": [],
                 }
 
             shards[shard_name]["total_chunks"] += 1
+            shards[shard_name]["chunks"].append(chunk_state)
 
             if chunk_state.status == "completed":
                 shards[shard_name]["completed_chunks"] += 1
@@ -414,22 +416,21 @@ class ChunkTracker(CheckpointTracker):
         if not storage_manager.captions_path.exists():
             return
 
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        import lance
 
         # Check if item_index column exists
-        table_metadata = pq.read_metadata(storage_manager.captions_path)
+        table_metadata = lance.dataset(storage_manager.captions_path).schema
         columns = ["job_id", "chunk_id", "item_key"]
-        if "item_index" in table_metadata.schema.names:
+        if "item_index" in table_metadata.names:
             columns.append("item_index")
 
         # Process in batches to avoid loading entire table
         batch_size = 10000
-        parquet_file = pq.ParquetFile(storage_manager.captions_path)
+        lance_dataset = lance.dataset(storage_manager.captions_path)
 
         chunk_indices = defaultdict(set)
 
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        for batch in lance_dataset.to_batches(batch_size=batch_size, columns=columns):
             batch_dict = batch.to_pydict()
 
             for i in range(len(batch_dict["chunk_id"])):
@@ -548,9 +549,16 @@ class ChunkTracker(CheckpointTracker):
         relative_start = start_idx - chunk_state.start_index
         relative_end = end_idx - chunk_state.start_index
 
-        # Ensure indices are within chunk bounds
+        # Ensure indices are within chunk bounds and maintain valid range
         relative_start = max(0, relative_start)
         relative_end = min(chunk_state.chunk_size - 1, relative_end)
+
+        # Skip invalid ranges where start > end
+        if relative_start > relative_end:
+            logger.warning(
+                f"Invalid range for chunk {chunk_id}: start={relative_start}, end={relative_end}, skipping"
+            )
+            return
 
         # Add to processed ranges
         chunk_state.processed_ranges.append((relative_start, relative_end))

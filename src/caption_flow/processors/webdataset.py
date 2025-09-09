@@ -240,8 +240,8 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 self.current_chunk_index = current_file_idx // self.chunk_size
                 job_id_obj = JobId(
                     shard_id=shard_name,
-                    chunk_id=self.current_chunk_index,
-                    sample_id=current_file_idx,
+                    chunk_id=str(self.current_chunk_index),
+                    sample_id=str(current_file_idx),
                 )
                 chunk_id = job_id_obj.get_chunk_str()
 
