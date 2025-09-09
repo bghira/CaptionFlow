@@ -217,7 +217,7 @@ class TestCaptionWorker:
             item = ProcessingItem(
                 unit_id="unit1",
                 job_id=f"shard:chunk:0:idx:{i}",
-                chunk_id="chunk1",
+                chunk_id="1",
                 item_key=f"item_{i}",
                 item_index=i,
                 image=Image.new("RGB", (100, 100)),
@@ -275,7 +275,7 @@ class TestCaptionWorker:
         item = ProcessingItem(
             unit_id="unit1",
             job_id="shard:chunk:0:idx:42",
-            chunk_id="chunk1",
+            chunk_id="1",
             item_key="test_item",
             item_index=42,
             image=Image.new("RGB", (200, 200)),
@@ -318,7 +318,7 @@ class TestCaptionWorker:
         # Create work unit
         unit = WorkUnit(
             unit_id="unit1",
-            chunk_id="chunk1",
+            chunk_id="1",
             source_id="shard1",
             unit_size=1,
             data={},
@@ -344,7 +344,7 @@ class TestCaptionWorker:
             item = ProcessingItem(
                 unit_id="unit1",
                 job_id=f"job_{i}",
-                chunk_id="chunk1",
+                chunk_id="1",
                 item_key=f"item_{i}",
                 item_index=i,
                 image=Image.new("RGB", (100, 100)),
@@ -375,7 +375,7 @@ class TestCaptionWorker:
         item = ProcessingItem(
             unit_id="unit1",
             job_id="job1",
-            chunk_id="chunk1",
+            chunk_id="1",
             item_key="test",
             item_index=0,
             image=Image.new("RGB", (1000, 1000)),
@@ -437,7 +437,7 @@ class TestCaptionWorker:
         test_item = ProcessingItem(
             unit_id="unit1",
             job_id="shard:chunk:0:idx:42",
-            chunk_id="chunk1",
+            chunk_id="1",
             item_key="test_item",
             item_index=42,
             image=Image.new("RGB", (200, 100)),
@@ -481,7 +481,7 @@ class TestCaptionWorker:
             assignment_id="assign1",
             worker_id="test_worker",
             units=[
-                WorkUnit("unit1", "chunk1", "source1", 100, {}, {}),
+                WorkUnit("unit1", "1", "source1", 100, {}, {}),
                 WorkUnit("unit2", "chunk2", "source1", 100, {}, {}),
             ],
             assigned_at=datetime.now(_datetime.UTC),
@@ -587,7 +587,7 @@ class TestCaptionWorker:
             ProcessingItem(
                 unit_id="unit1",
                 job_id="job1",
-                chunk_id="chunk1",
+                chunk_id="1",
                 item_key="test",
                 item_index=0,
                 image=Image.new("RGB", (100, 100)),

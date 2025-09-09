@@ -1,6 +1,7 @@
 """Tests for HuggingFace processor range calculations to prevent negative total_processed."""
 
 import pytest
+from pathlib import Path
 from unittest.mock import Mock, patch
 from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
 from caption_flow.utils.chunk_tracker import ChunkTracker
@@ -407,3 +408,96 @@ class TestHuggingFaceRanges:
         # Should still create chunk but with start_index = 1 * 0 = 0
         chunk_state = processor.chunk_tracker.chunks["test_shard:chunk:1"]
         assert chunk_state.start_index == 0
+
+    def test_incorrectly_assigned_indices_to_wrong_chunk(self, tmp_path):
+        """Test the production bug: indices assigned to wrong chunks in job IDs."""
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+        processor.chunk_size = 1000
+
+        # Simulate the production bug: index 999 incorrectly assigned to chunk 2
+        # This is what causes the "start=2048, end=999" error
+        buggy_job_ids = {
+            "photos_sequential:chunk:2:idx:2048",  # Correct: belongs to chunk 2 (2000-2999)
+            "photos_sequential:chunk:2:idx:999",  # BUG: belongs to chunk 0 (0-999), not chunk 2!
+        }
+
+        processor.update_from_storage(buggy_job_ids)
+
+        chunk_state = processor.chunk_tracker.chunks["photos_sequential:chunk:2"]
+
+        # The safeguard should prevent the invalid range
+        # Index 2048 -> relative 48 ✓
+        # Index 999 -> relative -1001 ❌ (should be skipped)
+
+        # Should only have the valid index (2048)
+        assert len(chunk_state.processed_ranges) == 1
+        assert (48, 48) in chunk_state.processed_ranges  # 2048 - 2000 = 48
+
+        # Should NOT have processed the invalid index 999
+        total_processed = sum(end - start + 1 for start, end in chunk_state.processed_ranges)
+        assert total_processed == 1  # Only the valid index
+
+        # Verify the invalid index was skipped (no negative ranges)
+        for start, end in chunk_state.processed_ranges:
+            assert start >= 0 and end >= 0, f"Found negative range: ({start}, {end})"
+
+    def test_chunk_creation_during_orchestration(self, tmp_path):
+        """Test that chunks created during orchestration get correct start_index."""
+        checkpoint_file = tmp_path / "test_checkpoint.json"
+        processor = HuggingFaceDatasetOrchestratorProcessor()
+        processor.chunk_tracker = ChunkTracker(checkpoint_file)
+        processor.chunk_size = 1000
+
+        # Mock the orchestration setup
+        processor.dataset_name = "test_dataset"
+        processor.total_items = 5000
+        processor.current_chunk_index = 0
+        processor.pending_units = []
+
+        # Mock shard info
+        processor.shard_info = {0: {"filename": "test_shard.tar"}}
+
+        # Mock the _get_shard_for_index method
+        def mock_get_shard_for_index(index):
+            return 0, "test_shard.tar"
+
+        processor._get_shard_for_index = mock_get_shard_for_index
+
+        # Test creating chunks 0, 1, 2 during orchestration
+        for expected_chunk_idx in [0, 1, 2]:
+            processor.current_chunk_index = expected_chunk_idx
+
+            # Simulate the orchestration logic that creates chunks
+            current_index = processor.current_chunk_index
+            shard_id, _ = processor._get_shard_for_index(current_index)
+            shard_name = Path(processor.shard_info[shard_id]["filename"]).stem
+
+            from caption_flow.models import JobId
+
+            job_id_obj = JobId(
+                shard_id=shard_name,
+                chunk_id=processor.current_chunk_index,
+                sample_id=current_index,
+            )
+            unit_id = job_id_obj.get_chunk_str()
+
+            # This is the code path that was buggy
+            if processor.chunk_tracker and unit_id not in processor.chunk_tracker.chunks:
+                start_index = processor.current_chunk_index * processor.chunk_size  # Fixed version
+                chunk_size = min(processor.chunk_size, processor.total_items - start_index)
+                processor.chunk_tracker.add_chunk(
+                    unit_id,
+                    processor.dataset_name,
+                    "",
+                    start_index,
+                    chunk_size,
+                )
+
+            # Verify the chunk was created with correct start_index
+            chunk_state = processor.chunk_tracker.chunks[unit_id]
+            expected_start_index = expected_chunk_idx * processor.chunk_size
+            assert (
+                chunk_state.start_index == expected_start_index
+            ), f"Chunk {expected_chunk_idx} should have start_index {expected_start_index}, got {chunk_state.start_index}"

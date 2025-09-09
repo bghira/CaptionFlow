@@ -513,7 +513,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     # Track in chunk tracker
                     if self.chunk_tracker:
-                        start_index = 0
+                        start_index = self.current_chunk_index * self.chunk_size
                         chunk_size = min(self.chunk_size, self.total_items - start_index)
                         self.chunk_tracker.add_chunk(
                             unit_id,
