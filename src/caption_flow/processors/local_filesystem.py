@@ -221,19 +221,15 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
 
         with self.lock:
             for chunk_id, chunk_state in self.chunk_tracker.chunks.items():
-                # Calculate actual unprocessed ranges
-                chunk_range = (
-                    chunk_state.start_index,
-                    chunk_state.start_index + chunk_state.chunk_size - 1,
-                )
+                # Get unprocessed ranges (relative coordinates from ChunkTracker)
+                relative_unprocessed_ranges = chunk_state.get_unprocessed_ranges()
 
-                # Get processed indices for this chunk
-                processed_ranges = self.chunk_tracker.get_processed_indices_for_chunk(
-                    chunk_id, all_processed_jobs
-                )
-
-                # Calculate unprocessed ranges
-                unprocessed_ranges = self._subtract_ranges([chunk_range], processed_ranges)
+                # Convert relative ranges to absolute ranges
+                unprocessed_ranges = []
+                for start, end in relative_unprocessed_ranges:
+                    abs_start = chunk_state.start_index + start
+                    abs_end = chunk_state.start_index + end
+                    unprocessed_ranges.append((abs_start, abs_end))
 
                 if unprocessed_ranges:
                     # Create work unit for unprocessed items

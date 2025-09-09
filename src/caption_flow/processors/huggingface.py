@@ -422,13 +422,18 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
             chunk_state = self.chunk_tracker.chunks[unit_id]
             if chunk_state.processed_ranges:
+                # Convert relative processed ranges to absolute ranges
+                absolute_processed_ranges = [
+                    (start + current_index, end + current_index)
+                    for start, end in chunk_state.processed_ranges
+                ]
                 # Subtract processed ranges from total range
                 range_to_subtract = (current_index, current_index + chunk_size - 1)
                 logger.debug(
-                    f"Chunk {unit_id} has processed ranges: {chunk_state.processed_ranges}"
+                    f"Chunk {unit_id} has processed ranges: {chunk_state.processed_ranges} (relative), {absolute_processed_ranges} (absolute)"
                 )
                 unprocessed_ranges = self._subtract_ranges(
-                    [range_to_subtract], chunk_state.processed_ranges
+                    [range_to_subtract], absolute_processed_ranges
                 )
 
         # If all ranges are processed, return None (shouldn't happen if status tracking is correct)
@@ -704,8 +709,8 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                     logger.error(f"Failed to parse chunk_id {chunk_id}: {e}")
                     continue
 
-            # Get chunk start index for conversion
-            chunk_start = chunk_state.start_index
+            # Get chunk start index for conversion (not used in this implementation but kept for clarity)
+            # chunk_start = chunk_state.start_index
 
             # Sort absolute indices for range creation
             sorted_indices = sorted(indices)
