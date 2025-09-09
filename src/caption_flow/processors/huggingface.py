@@ -469,6 +469,12 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 assigned_count = sum(len(units) for units in self.assigned_units.values())
                 worker_count = max(1, len(self.assigned_units))
 
+                # Check if all data has been processed
+                if self.current_chunk_index * self.chunk_size >= self.total_items:
+                    # All chunks processed, wait longer before checking again
+                    self.stop_creation.wait(30)
+                    continue
+
                 target_buffer = max(self.min_buffer, worker_count * self.buffer_multiplier)
                 units_needed = max(0, target_buffer - (pending_count + assigned_count))
 
