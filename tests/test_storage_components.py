@@ -16,6 +16,13 @@ from caption_flow.storage import StorageManager
 from caption_flow.utils import ChunkTracker
 
 
+@pytest.fixture
+def temp_checkpoint_dir():
+    """Create a temporary directory for checkpoints."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir)
+
+
 class TestHuggingFaceWithRealStorage:
     """Test with real StorageManager to uncover duplicate issues."""
 

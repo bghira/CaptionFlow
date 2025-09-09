@@ -13,6 +13,7 @@ import time
 import numpy as np
 
 import lance
+import duckdb
 import pyarrow as pa
 import pandas as pd
 
@@ -35,7 +36,7 @@ class StorageManager:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         # File paths
-        self.captions_lance_path = self.data_dir / "captions.lance"
+        self.captions_path = self.data_dir / "captions.lance"
         self.jobs_path = self.data_dir / "jobs.lance"
         self.contributors_path = self.data_dir / "contributors.lance"
         self.stats_path = self.data_dir / "storage_stats.json"
@@ -160,13 +161,13 @@ class StorageManager:
         self._load_stats()
 
         # Initialize caption storage
-        if not self.captions_lance_path.exists():
+        if not self.captions_path.exists():
             # Create initial schema with just base fields
             self.caption_schema = self._build_caption_schema(set())
             logger.debug("Will create Lance dataset on first write")
         else:
             # Load existing Lance dataset
-            self.captions_dataset = lance.dataset(str(self.captions_lance_path))
+            self.captions_dataset = lance.dataset(str(self.captions_path))
 
             # Load existing job IDs
             job_ids = (
@@ -379,9 +380,9 @@ class StorageManager:
             table = pa.Table.from_pylist(prepared_buffer, schema=schema)
 
             # Write to Lance
-            if self.captions_dataset is None and self.captions_lance_path.exists():
+            if self.captions_dataset is None and self.captions_path.exists():
                 try:
-                    self.captions_dataset = lance.dataset(str(self.captions_lance_path))
+                    self.captions_dataset = lance.dataset(str(self.captions_path))
                 except Exception:
                     # Dataset might be corrupted or incomplete
                     self.captions_dataset = None
@@ -389,12 +390,12 @@ class StorageManager:
             if self.captions_dataset is not None:
                 # Append to existing dataset
                 self.captions_dataset = lance.write_dataset(
-                    table, str(self.captions_lance_path), mode="append"
+                    table, str(self.captions_path), mode="append"
                 )
             else:
                 # Create new dataset
                 self.captions_dataset = lance.write_dataset(
-                    table, str(self.captions_lance_path), mode="create"
+                    table, str(self.captions_path), mode="create"
                 )
 
             # Update tracking
@@ -570,11 +571,11 @@ class StorageManager:
         columns: Optional[List[str]] = None,
         include_metadata: bool = True,
     ) -> StorageContents:
-        """Get storage contents for export."""
+        """Get storage contents for export using DuckDB."""
         # Flush buffers first
         await self.checkpoint()
 
-        if not self.captions_dataset:
+        if not self.captions_path.exists() or not self.captions_dataset:
             return StorageContents(
                 rows=[],
                 columns=[],
@@ -583,44 +584,61 @@ class StorageManager:
                 metadata={"message": "No data available"},
             )
 
-        # Build scanner
-        scanner = self.captions_dataset.scanner(columns=columns)
-        if limit:
-            scanner = scanner.limit(limit)
+        try:
+            con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+            con.execute("INSTALL lance")
+            con.execute("LOAD lance")
 
-        # Get data
-        table = scanner.to_table()
-        df = table.to_pandas()
+            # Build query
+            column_str = "*"
+            if columns:
+                # Quote column names to handle special characters
+                column_str = ", ".join([f'"{c}"' for c in columns])
 
-        # Convert to records
-        rows = df.to_dict("records")
+            query = f"SELECT {column_str} FROM '{str(self.captions_path)}'"
+            if limit:
+                query += f" LIMIT {limit}"
 
-        # Parse metadata
-        if "metadata" in df.columns:
-            for row in rows:
-                if row.get("metadata"):
-                    try:
-                        row["metadata"] = json.loads(row["metadata"])
-                    except:
-                        pass
+            # Execute query and fetch data
+            table = con.execute(query).fetch_arrow_table()
+            rows = table.to_pylist()
+            actual_columns = table.schema.names
 
-        metadata = {}
-        if include_metadata:
-            metadata = {
-                "export_timestamp": pd.Timestamp.now().isoformat(),
-                "total_available_rows": self.stats["disk_rows"],
-                "rows_exported": len(rows),
-                "storage_path": str(self.captions_lance_path),
-                "field_stats": self.stats["field_counts"],
-            }
+            # Parse metadata
+            if "metadata" in actual_columns:
+                for row in rows:
+                    if row.get("metadata"):
+                        try:
+                            row["metadata"] = json.loads(row["metadata"])
+                        except (json.JSONDecodeError, TypeError):
+                            pass  # Keep as string if not valid JSON
 
-        return StorageContents(
-            rows=rows,
-            columns=list(df.columns),
-            output_fields=list(self.known_output_fields),
-            total_rows=len(df),
-            metadata=metadata,
-        )
+            metadata = {}
+            if include_metadata:
+                metadata = {
+                    "export_timestamp": datetime.now().isoformat(),
+                    "total_available_rows": self.stats["disk_rows"],
+                    "rows_exported": len(rows),
+                    "storage_path": str(self.captions_path),
+                    "field_stats": self.stats["field_counts"],
+                }
+
+            return StorageContents(
+                rows=rows,
+                columns=actual_columns,
+                output_fields=list(self.known_output_fields),
+                total_rows=len(rows),
+                metadata=metadata,
+            )
+        except Exception as e:
+            logger.error(f"Failed to get storage contents with DuckDB: {e}", exc_info=True)
+            return StorageContents(
+                rows=[],
+                columns=[],
+                output_fields=list(self.known_output_fields),
+                total_rows=0,
+                metadata={"error": str(e)},
+            )
 
     async def get_processed_jobs_for_chunk(self, chunk_id: str) -> Set[str]:
         """Get all processed job_ids for a given chunk."""

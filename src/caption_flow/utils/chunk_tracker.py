@@ -414,13 +414,13 @@ class ChunkTracker(CheckpointTracker):
         if not storage_manager.captions_path.exists():
             return
 
-        import pyarrow as pa
+        import lance
         import pyarrow.parquet as pq
 
         # Check if item_index column exists
-        table_metadata = pq.read_metadata(storage_manager.captions_path)
+        table_metadata = lance.dataset(storage_manager.captions_path).schema
         columns = ["job_id", "chunk_id", "item_key"]
-        if "item_index" in table_metadata.schema.names:
+        if "item_index" in table_metadata.names:
             columns.append("item_index")
 
         # Process in batches to avoid loading entire table
