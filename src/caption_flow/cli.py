@@ -566,6 +566,322 @@ async def _send_reload_command(websocket, new_cfg):
         return False
 
 
+def _add_token_to_config(config_data: Dict[str, Any], role: str, name: str, token: str) -> bool:
+    """Add a new token to the config data."""
+    # Ensure the auth section exists
+    if "orchestrator" not in config_data:
+        config_data["orchestrator"] = {}
+    if "auth" not in config_data["orchestrator"]:
+        config_data["orchestrator"]["auth"] = {}
+
+    auth_config = config_data["orchestrator"]["auth"]
+    token_key = f"{role}_tokens"
+
+    # Initialize token list if it doesn't exist
+    if token_key not in auth_config:
+        auth_config[token_key] = []
+
+    # Check if token already exists
+    for existing_token in auth_config[token_key]:
+        if existing_token.get("token") == token:
+            console.print(f"[yellow]Token already exists for {role}: {name}[/yellow]")
+            return False
+        if existing_token.get("name") == name:
+            console.print(f"[yellow]Name already exists for {role}: {name}[/yellow]")
+            return False
+
+    # Add the new token
+    auth_config[token_key].append({"name": name, "token": token})
+    console.print(f"[green]✓ Added {role} token for {name}[/green]")
+    return True
+
+
+def _remove_token_from_config(config_data: Dict[str, Any], role: str, identifier: str) -> bool:
+    """Remove a token from the config data by name or token."""
+    auth_config = config_data.get("orchestrator", {}).get("auth", {})
+    token_key = f"{role}_tokens"
+
+    if token_key not in auth_config:
+        console.print(f"[red]No {role} tokens found in config[/red]")
+        return False
+
+    tokens = auth_config[token_key]
+    removed = False
+
+    for i, token_entry in enumerate(tokens):
+        if token_entry.get("name") == identifier or token_entry.get("token") == identifier:
+            removed_entry = tokens.pop(i)
+            console.print(f"[green]✓ Removed {role} token: {removed_entry['name']}[/green]")
+            removed = True
+            break
+
+    if not removed:
+        console.print(f"[red]Token not found for {role}: {identifier}[/red]")
+
+    return removed
+
+
+def _list_tokens_in_config(config_data: Dict[str, Any], role: Optional[str] = None):
+    """List tokens in the config data."""
+    auth_config = config_data.get("orchestrator", {}).get("auth", {})
+
+    if not auth_config:
+        console.print("[yellow]No auth configuration found[/yellow]")
+        return
+
+    roles_to_show = [role] if role else ["worker", "admin", "monitor"]
+
+    for token_role in roles_to_show:
+        token_key = f"{token_role}_tokens"
+        tokens = auth_config.get(token_key, [])
+
+        if tokens:
+            console.print(f"\n[cyan]{token_role.title()} tokens:[/cyan]")
+            for token_entry in tokens:
+                name = token_entry.get("name", "Unknown")
+                token = token_entry.get("token", "")
+                masked_token = f"***{token[-4:]}" if len(token) > 4 else "***"
+                console.print(f"  • {name}: {masked_token}")
+        else:
+            console.print(f"\n[dim]No {token_role} tokens configured[/dim]")
+
+
+def _save_config_file(config_data: Dict[str, Any], config_path: Path) -> bool:
+    """Save the config data to a file."""
+    try:
+        with open(config_path, "w") as f:
+            yaml.safe_dump(config_data, f, default_flow_style=False, sort_keys=False)
+        console.print(f"[green]✓ Configuration saved to {config_path}[/green]")
+        return True
+    except Exception as e:
+        console.print(f"[red]Error saving config: {e}[/red]")
+        return False
+
+
+async def _reload_orchestrator_config(
+    server: str, token: str, config_data: Dict[str, Any], no_verify_ssl: bool
+) -> bool:
+    """Reload the orchestrator configuration."""
+    import websockets
+
+    ssl_context = _setup_ssl_context(server, no_verify_ssl)
+
+    try:
+        async with websockets.connect(
+            server, ssl=ssl_context, ping_interval=20, ping_timeout=60, close_timeout=10
+        ) as websocket:
+            if not await _authenticate_admin(websocket, token):
+                return False
+
+            return await _send_reload_command(websocket, config_data)
+    except Exception as e:
+        console.print(f"[red]Error connecting to orchestrator: {e}[/red]")
+        return False
+
+
+@main.group()
+@click.option("--config", type=click.Path(exists=True), help="Configuration file")
+@click.option("--server", help="Orchestrator WebSocket URL")
+@click.option("--token", help="Admin authentication token")
+@click.option("--no-verify-ssl", is_flag=True, help="Skip SSL verification")
+@click.pass_context
+def auth(
+    ctx, config: Optional[str], server: Optional[str], token: Optional[str], no_verify_ssl: bool
+):
+    """Manage authentication tokens for the orchestrator."""
+    ctx.ensure_object(dict)
+    ctx.obj.update(
+        {"config": config, "server": server, "token": token, "no_verify_ssl": no_verify_ssl}
+    )
+
+
+@auth.command()
+@click.argument("role", type=click.Choice(["worker", "admin", "monitor"]))
+@click.argument("name")
+@click.argument("token_value")
+@click.option(
+    "--no-reload", is_flag=True, help="Don't reload orchestrator config after adding token"
+)
+@click.pass_context
+def add(ctx, role: str, name: str, token_value: str, no_reload: bool):
+    """Add a new authentication token.
+
+    ROLE: Type of token (worker, admin, monitor)
+    NAME: Display name for the token
+    TOKEN_VALUE: The actual token string
+    """
+    config_file = ctx.obj.get("config")
+    server = ctx.obj.get("server")
+    admin_token = ctx.obj.get("token")
+    no_verify_ssl = ctx.obj.get("no_verify_ssl", False)
+
+    # Load config
+    config_data = ConfigManager.find_config("orchestrator", config_file)
+    if not config_data:
+        console.print("[red]No orchestrator config found[/red]")
+        console.print("[dim]Use --config to specify config file path[/dim]")
+        sys.exit(1)
+
+    # Find config file path for saving
+    config_path = None
+    if config_file:
+        config_path = Path(config_file)
+    else:
+        # Try to find the config file that was loaded
+        for search_path in [
+            Path.cwd() / "orchestrator.yaml",
+            Path.cwd() / "config" / "orchestrator.yaml",
+            Path.home() / ".caption-flow" / "orchestrator.yaml",
+            ConfigManager.get_xdg_config_home() / "caption-flow" / "orchestrator.yaml",
+        ]:
+            if search_path.exists():
+                config_path = search_path
+                break
+
+    if not config_path:
+        console.print("[red]Could not determine config file to save to[/red]")
+        console.print("[dim]Use --config to specify config file path[/dim]")
+        sys.exit(1)
+
+    # Add token to config
+    if not _add_token_to_config(config_data, role, name, token_value):
+        sys.exit(1)
+
+    # Save config file
+    if not _save_config_file(config_data, config_path):
+        sys.exit(1)
+
+    # Reload orchestrator if requested
+    if not no_reload:
+        server, admin_token = _load_admin_credentials(config_file, server, admin_token)
+
+        if not server:
+            console.print("[yellow]No server specified, skipping orchestrator reload[/yellow]")
+            console.print("[dim]Use --server to reload orchestrator config[/dim]")
+        elif not admin_token:
+            console.print("[yellow]No admin token specified, skipping orchestrator reload[/yellow]")
+            console.print("[dim]Use --token to reload orchestrator config[/dim]")
+        else:
+            console.print(f"[cyan]Reloading orchestrator config...[/cyan]")
+            success = asyncio.run(
+                _reload_orchestrator_config(server, admin_token, config_data, no_verify_ssl)
+            )
+            if not success:
+                console.print("[yellow]Config file updated but orchestrator reload failed[/yellow]")
+                console.print("[dim]You may need to restart the orchestrator manually[/dim]")
+
+
+@auth.command()
+@click.argument("role", type=click.Choice(["worker", "admin", "monitor"]))
+@click.argument("identifier")
+@click.option(
+    "--no-reload", is_flag=True, help="Don't reload orchestrator config after removing token"
+)
+@click.pass_context
+def remove(ctx, role: str, identifier: str, no_reload: bool):
+    """Remove an authentication token.
+
+    ROLE: Type of token (worker, admin, monitor)
+    IDENTIFIER: Name or token value to remove
+    """
+    config_file = ctx.obj.get("config")
+    server = ctx.obj.get("server")
+    admin_token = ctx.obj.get("token")
+    no_verify_ssl = ctx.obj.get("no_verify_ssl", False)
+
+    # Load config
+    config_data = ConfigManager.find_config("orchestrator", config_file)
+    if not config_data:
+        console.print("[red]No orchestrator config found[/red]")
+        sys.exit(1)
+
+    # Find config file path for saving
+    config_path = None
+    if config_file:
+        config_path = Path(config_file)
+    else:
+        # Try to find the config file that was loaded
+        for search_path in [
+            Path.cwd() / "orchestrator.yaml",
+            Path.cwd() / "config" / "orchestrator.yaml",
+            Path.home() / ".caption-flow" / "orchestrator.yaml",
+            ConfigManager.get_xdg_config_home() / "caption-flow" / "orchestrator.yaml",
+        ]:
+            if search_path.exists():
+                config_path = search_path
+                break
+
+    if not config_path:
+        console.print("[red]Could not determine config file to save to[/red]")
+        sys.exit(1)
+
+    # Remove token from config
+    if not _remove_token_from_config(config_data, role, identifier):
+        sys.exit(1)
+
+    # Save config file
+    if not _save_config_file(config_data, config_path):
+        sys.exit(1)
+
+    # Reload orchestrator if requested
+    if not no_reload:
+        server, admin_token = _load_admin_credentials(config_file, server, admin_token)
+
+        if not server:
+            console.print("[yellow]No server specified, skipping orchestrator reload[/yellow]")
+        elif not admin_token:
+            console.print("[yellow]No admin token specified, skipping orchestrator reload[/yellow]")
+        else:
+            console.print(f"[cyan]Reloading orchestrator config...[/cyan]")
+            success = asyncio.run(
+                _reload_orchestrator_config(server, admin_token, config_data, no_verify_ssl)
+            )
+            if not success:
+                console.print("[yellow]Config file updated but orchestrator reload failed[/yellow]")
+
+
+@auth.command()
+@click.argument("role", type=click.Choice(["worker", "admin", "monitor", "all"]), required=False)
+@click.pass_context
+def list(ctx, role: Optional[str]):
+    """List authentication tokens.
+
+    ROLE: Type of tokens to list (worker, admin, monitor, all). Default: all
+    """
+    config_file = ctx.obj.get("config")
+
+    # Load config
+    config_data = ConfigManager.find_config("orchestrator", config_file)
+    if not config_data:
+        console.print("[red]No orchestrator config found[/red]")
+        sys.exit(1)
+
+    # Show tokens
+    if role == "all" or role is None:
+        _list_tokens_in_config(config_data)
+    else:
+        _list_tokens_in_config(config_data, role)
+
+
+@auth.command()
+@click.option("--length", default=32, help="Token length (default: 32)")
+@click.option("--count", default=1, help="Number of tokens to generate (default: 1)")
+def generate(length: int, count: int):
+    """Generate random authentication tokens."""
+    import secrets
+    import string
+
+    alphabet = string.ascii_letters + string.digits + "-_"
+
+    console.print(
+        f"[cyan]Generated {count} token{'s' if count > 1 else ''} ({length} characters each):[/cyan]\n"
+    )
+
+    for i in range(count):
+        token = "".join(secrets.choice(alphabet) for _ in range(length))
+        console.print(f"  {i + 1}: {token}")
+
+
 @main.command()
 @click.option("--config", type=click.Path(exists=True), help="Configuration file")
 @click.option("--server", help="Orchestrator WebSocket URL")
@@ -652,7 +968,7 @@ def _display_abandoned_chunks(abandoned_chunks, fix, tracker):
 
     console.print(f"[red]Found {len(abandoned_chunks)} abandoned chunks:[/red]")
     for chunk_id, chunk_state, age in abandoned_chunks[:10]:
-        age_str = f"{age/3600:.1f} hours" if age > 3600 else f"{age/60:.1f} minutes"
+        age_str = f"{age / 3600:.1f} hours" if age > 3600 else f"{age / 60:.1f} minutes"
         console.print(f"  • {chunk_id} (assigned to {chunk_state.assigned_to} {age_str} ago)")
 
     if len(abandoned_chunks) > 10:
