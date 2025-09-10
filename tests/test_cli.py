@@ -1,29 +1,20 @@
 """Comprehensive tests for the CLI module."""
 
-import pytest
-import tempfile
-import shutil
 import os
-import yaml
-import json
+import shutil
+import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock, AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+import yaml
 from click.testing import CliRunner
 
 from caption_flow.cli import (
     ConfigManager,
-    setup_logging,
     apply_cli_overrides,
     main,
-    orchestrator,
-    worker,
-    monitor,
-    view,
-    reload_config,
-    scan_chunks,
-    export,
-    generate_cert,
-    inspect_cert,
+    setup_logging,
 )
 
 
@@ -244,7 +235,7 @@ class TestOrchestratorCommand:
         mock_orchestrator = Mock()
         mock_orchestrator_class.return_value = mock_orchestrator
 
-        result = runner.invoke(main, ["orchestrator", "--config", str(config_file)])
+        runner.invoke(main, ["orchestrator", "--config", str(config_file)])
 
         # Should attempt to find config and create orchestrator
         mock_find_config.assert_called()
@@ -273,7 +264,7 @@ class TestWorkerCommand:
 
         mock_find_config.return_value = worker_config
 
-        result = runner.invoke(main, ["worker", "--config", str(config_file)])
+        runner.invoke(main, ["worker", "--config", str(config_file)])
 
         # Should attempt to find config
         mock_find_config.assert_called()
@@ -310,7 +301,7 @@ class TestMonitorCommand:
         mock_monitor = Mock()
         mock_monitor_class.return_value = mock_monitor
 
-        result = runner.invoke(main, ["monitor", "--config", str(config_file)])
+        runner.invoke(main, ["monitor", "--config", str(config_file)])
 
         # Should attempt to find config and create monitor
         mock_find_config.assert_called()
@@ -339,7 +330,7 @@ class TestViewCommand:
         mock_viewer.run = AsyncMock()
         mock_viewer_class.return_value = mock_viewer
 
-        result = runner.invoke(main, ["view", "--data-dir", str(data_dir)])
+        runner.invoke(main, ["view", "--data-dir", str(data_dir)])
 
         # Should create and run viewer
         mock_viewer_class.assert_called()
@@ -453,7 +444,7 @@ class TestCertificateCommands:
         mock_manager = Mock()
         mock_cert_manager_class.return_value = mock_manager
 
-        result = runner.invoke(main, ["generate-cert", "--self-signed", "--output-dir", "./certs"])
+        runner.invoke(main, ["generate-cert", "--self-signed", "--output-dir", "./certs"])
 
         # Should create certificate manager
         mock_cert_manager_class.assert_called_once()
@@ -511,7 +502,7 @@ class TestReloadConfigCommand:
 
         mock_load_yaml.return_value = {"test": "config"}
 
-        result = runner.invoke(
+        runner.invoke(
             main,
             [
                 "reload-config",

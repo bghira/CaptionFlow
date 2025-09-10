@@ -1,22 +1,22 @@
 """Command-line interface for CaptionFlow with smart configuration handling."""
 
 import asyncio
+import datetime as _datetime
 import json
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
 
 import click
 import yaml
 from rich.console import Console
 from rich.logging import RichHandler
-from datetime import datetime
-import datetime as _datetime
 
-from .orchestrator import Orchestrator
 from .monitor import Monitor
+from .orchestrator import Orchestrator
 from .utils.certificates import CertificateManager
 
 console = Console()
@@ -49,8 +49,7 @@ class ConfigManager:
     def find_config(
         cls, component: str, explicit_path: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
-        """
-        Find and load configuration for a component.
+        """Find and load configuration for a component.
 
         Search order:
         1. Explicit path if provided
@@ -173,7 +172,8 @@ def setup_logging(verbose: bool = False):
                 show_time=True,
             )
         ]
-        log_msg = f"[yellow]Warning: Could not write to log file {log_dir / 'caption_flow.log'}: {e}[/yellow]"
+        log_file = log_dir / 'caption_flow.log'
+        log_msg = f"[yellow]Warning: Could not write to log file {log_file}: {e}[/yellow]"
 
     logging.basicConfig(
         level=level,
@@ -243,9 +243,11 @@ def orchestrator(ctx, config: Optional[str], **kwargs):
             config_data["ssl"]["cert"] = kwargs["cert"]
             config_data["ssl"]["key"] = kwargs["key"]
         elif not config_data.get("ssl"):
-            console.print(
-                "[yellow]Warning: Running without SSL. Use --cert and --key for production.[/yellow]"
+            warning_msg = (
+                "[yellow]Warning: Running without SSL. "
+                "Use --cert and --key for production.[/yellow]"
             )
+            console.print(warning_msg)
 
     if kwargs.get("vllm") and "vllm" not in config_data:
         raise ValueError("Must provide vLLM config.")
@@ -329,7 +331,6 @@ def monitor(
     debug: bool,
 ):
     """Start the monitoring TUI."""
-
     # Enable debug logging if requested
     if debug:
         setup_logging(verbose=True)
@@ -460,7 +461,7 @@ def view(ctx, data_dir: str, refresh_rate: int, no_images: bool):
             viewer.disable_images = True
         viewer.refresh_rate = refresh_rate
 
-        console.print(f"[cyan]Starting dataset viewer...[/cyan]")
+        console.print("[cyan]Starting dataset viewer...[/cyan]")
         console.print(f"[dim]Data directory: {data_path}[/dim]")
 
         asyncio.run(viewer.run())
@@ -494,8 +495,9 @@ def reload_config(
     no_verify_ssl: bool,
 ):
     """Reload orchestrator configuration via admin connection."""
-    import websockets
     import ssl
+
+    import websockets
 
     # Load base config to get server/token if not provided via CLI
     if not server or not token:
@@ -603,9 +605,10 @@ def reload_config(
 @click.option("--verbose", is_flag=True, help="Show detailed information")
 def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
     """Scan for sparse or abandoned chunks and optionally fix them."""
-    from .utils.chunk_tracker import ChunkTracker
-    from .storage import StorageManager
     import pyarrow.parquet as pq
+
+    from .storage import StorageManager
+    from .utils.chunk_tracker import ChunkTracker
 
     console.print("[bold cyan]Scanning for sparse/abandoned chunks...[/bold cyan]\n")
 
@@ -798,7 +801,7 @@ def export(
 ):
     """Export caption data to various formats with per-shard support."""
     from .storage import StorageManager
-    from .storage.exporter import LanceStorageExporter, ExportError
+    from .storage.exporter import ExportError, LanceStorageExporter
 
     # Initialize storage manager
     storage_path = Path(data_dir)
@@ -877,7 +880,7 @@ def export(
                         console.print(f"[yellow]Skipping {export_format}: {e}[/yellow]")
                         results[export_format] = 0
 
-                console.print(f"\n[green]✓ Export complete![/green]")
+                console.print("\n[green]✓ Export complete![/green]")
                 for fmt, count in results.items():
                     if count > 0:
                         console.print(f"  • {fmt.upper()}: {count:,} items")
@@ -927,7 +930,7 @@ def export(
 
             else:
                 # Single format export
-                output_path = output or f"export"
+                output_path = output or "export"
 
                 if shard_filter and len(shard_filter) == 1:
                     # Export single shard
@@ -1001,7 +1004,7 @@ def generate_cert(
         cert_path, key_path = cert_manager.generate_self_signed(Path(output_dir), cert_domain)
         console.print(f"[green]✓[/green] Certificate: {cert_path}")
         console.print(f"[green]✓[/green] Key: {key_path}")
-        console.print(f"\n[cyan]Use these paths in your config or CLI:[/cyan]")
+        console.print("\n[cyan]Use these paths in your config or CLI:[/cyan]")
         console.print(f"  --cert {cert_path}")
         console.print(f"  --key {key_path}")
     elif domain and email:
@@ -1018,7 +1021,7 @@ def generate_cert(
             )
             console.print(f"[green]✓[/green] Certificate: {cert_path}")
             console.print(f"[green]✓[/green] Key: {key_path}")
-            console.print(f"\n[cyan]Use these paths in your config or CLI:[/cyan]")
+            console.print("\n[cyan]Use these paths in your config or CLI:[/cyan]")
             console.print(f"  --cert {cert_path}")
             console.print(f"  --key {key_path}")
 

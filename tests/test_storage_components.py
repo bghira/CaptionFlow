@@ -1,17 +1,15 @@
-import pytest
 import asyncio
-import tempfile
-from pathlib import Path
-from collections import defaultdict
-import threading
-import time
-from typing import Set, List, Dict
 import datetime as _datetime
+import tempfile
+from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
+import pytest
+
+from caption_flow.models import Caption, JobId
 from caption_flow.processors import ProcessorConfig
 from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
-from caption_flow.models import JobId, Caption, Contributor
 from caption_flow.storage import StorageManager
 from caption_flow.utils import ChunkTracker
 
@@ -29,7 +27,6 @@ class TestHuggingFaceWithRealStorage:
     @pytest.mark.asyncio
     async def test_concurrent_workers_same_token_real_storage(self, temp_checkpoint_dir):
         """Test multiple workers with same token using real storage components."""
-
         # Create real storage manager
         storage_dir = temp_checkpoint_dir / "storage"
         storage = StorageManager(
@@ -188,7 +185,7 @@ class TestHuggingFaceWithRealStorage:
         # Find duplicates
         duplicate_job_ids = {jid: count for jid, count in job_id_counts.items() if count > 1}
 
-        print(f"\nDuplicate analysis:")
+        print("\nDuplicate analysis:")
         print(f"  Unique job IDs in storage: {len(job_id_counts)}")
         print(f"  Job IDs with duplicates: {len(duplicate_job_ids)}")
 
@@ -215,7 +212,6 @@ class TestHuggingFaceWithRealStorage:
     @pytest.mark.asyncio
     async def test_storage_chunk_tracker_sync_issues(self, temp_checkpoint_dir):
         """Test synchronization issues between storage and chunk tracker."""
-
         # Create storage
         storage_dir = temp_checkpoint_dir / "storage"
         storage = StorageManager(data_dir=storage_dir, caption_buffer_size=5)  # Very small buffer
@@ -285,7 +281,7 @@ class TestHuggingFaceWithRealStorage:
             task = update_storage_and_tracker(f"worker_{i+3}", "shard1:chunk:1", i * 20, 20)
             tasks.append(task)
 
-        all_results = await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
 
         # Force checkpoint
         await storage.checkpoint()

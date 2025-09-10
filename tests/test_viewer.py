@@ -1,13 +1,14 @@
 """Tests for the DatasetViewer module."""
 
-import pytest
-import tempfile
 import shutil
-import pandas as pd
+import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock
 
-from caption_flow.viewer import SelectableListItem, DatasetViewer
+import pandas as pd
+import pytest
+
+from caption_flow.viewer import DatasetViewer, SelectableListItem
 
 
 @pytest.fixture
@@ -75,7 +76,7 @@ class TestSelectableListItem:
 
         assert item.content == content
         assert item.on_select == on_select
-        assert item.selectable() == True
+        assert item.selectable()
 
     def test_keypress_enter(self):
         """Test keypress handling for enter key."""
@@ -134,7 +135,7 @@ class TestDatasetViewerInit:
         assert viewer.current_shard_idx == 0
         assert viewer.current_item_idx == 0
         assert viewer.current_shard_items == []
-        assert viewer.disable_images == False
+        assert not viewer.disable_images
 
     def test_init_no_captions_file(self):
         """Test initialization when captions file doesn't exist."""
@@ -301,11 +302,11 @@ class TestDatasetViewerUtilityMethods:
         viewer = DatasetViewer(temp_data_dir)
 
         # Should default to False
-        assert viewer.disable_images == False
+        assert not viewer.disable_images
 
         # Can be set to True
         viewer.disable_images = True
-        assert viewer.disable_images == True
+        assert viewer.disable_images
 
 
 class TestDatasetViewerIntegration:
@@ -326,7 +327,7 @@ class TestDatasetViewerIntegration:
 
         # Should be able to switch shards
         if len(viewer.shards) > 1:
-            original_items = viewer.current_shard_items.copy()
+            viewer.current_shard_items.copy()
             viewer._load_shard(1)
             # Items should be different (unless shards have identical data)
             assert viewer.current_shard_idx == 1

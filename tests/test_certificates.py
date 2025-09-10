@@ -1,18 +1,17 @@
 """Tests for the certificates utility module."""
 
-import pytest
-import tempfile
-import shutil
-import subprocess
-from pathlib import Path
-from unittest.mock import Mock, patch, mock_open
-from datetime import datetime, timedelta
 import datetime as _datetime
+import shutil
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
 
+import pytest
 from cryptography import x509
-from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from caption_flow.utils.certificates import CertificateManager
 
@@ -283,7 +282,7 @@ class TestGetCertInfo:
         assert "is_self_signed" in info
 
         # For self-signed cert, subject should equal issuer
-        assert info["is_self_signed"] == True
+        assert info["is_self_signed"]
         assert "test.example.com" in info["subject"]
 
     def test_get_cert_info_real_certificate(self, cert_manager, temp_output_dir):
@@ -295,7 +294,7 @@ class TestGetCertInfo:
         assert isinstance(info["not_before"], datetime)
         assert isinstance(info["not_after"], datetime)
         assert isinstance(info["serial_number"], int)
-        assert info["is_self_signed"] == True
+        assert info["is_self_signed"]
         assert "mytest.com" in info["subject"]
 
     def test_get_cert_info_file_not_found(self, cert_manager, temp_output_dir):
@@ -330,7 +329,7 @@ class TestCertificateManagerIntegration:
 
         # Verify information is consistent
         assert domain in info["subject"]
-        assert info["is_self_signed"] == True
+        assert info["is_self_signed"]
         assert info["not_before"] < info["not_after"]
 
         # Verify certificate is currently valid (handle timezone awareness)

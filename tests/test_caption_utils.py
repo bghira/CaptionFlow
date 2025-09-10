@@ -1,6 +1,7 @@
 """Tests for the caption_utils module."""
 
 import pytest
+
 from caption_flow.utils.caption_utils import CaptionUtils
 
 
@@ -193,7 +194,7 @@ class TestCaptionUtilsCombine:
         ]
 
         result = CaptionUtils.combine(descriptions)
-        lines = result.split("\n")
+        result.split("\n")
 
         # Should not repeat very similar information
         full_text = result.lower()
@@ -261,19 +262,19 @@ class TestCaptionUtilsValidateCaption:
 
     def test_validate_empty_caption(self):
         """Test validation of empty caption."""
-        assert CaptionUtils.validate_caption("") == False
-        assert CaptionUtils.validate_caption(None) == False
+        assert not CaptionUtils.validate_caption("")
+        assert not CaptionUtils.validate_caption(None)
 
     def test_validate_too_short(self):
         """Test validation of too short captions."""
-        assert CaptionUtils.validate_caption("short") == False
-        assert CaptionUtils.validate_caption("a cat", min_length=10) == False
+        assert not CaptionUtils.validate_caption("short")
+        assert not CaptionUtils.validate_caption("a cat", min_length=10)
 
     def test_validate_minimum_length(self):
         """Test validation with custom minimum length."""
         caption = "a beautiful sunset scene"
-        assert CaptionUtils.validate_caption(caption, min_length=30) == False
-        assert CaptionUtils.validate_caption(caption, min_length=20) == True
+        assert not CaptionUtils.validate_caption(caption, min_length=30)
+        assert CaptionUtils.validate_caption(caption, min_length=20)
 
     def test_validate_refusal_patterns(self):
         """Test rejection of captions with refusal patterns."""
@@ -287,19 +288,19 @@ class TestCaptionUtilsValidateCaption:
         ]
 
         for caption in refusal_captions:
-            assert CaptionUtils.validate_caption(caption) == False
+            assert not CaptionUtils.validate_caption(caption)
 
     def test_validate_refusal_patterns_case_insensitive(self):
         """Test that refusal pattern detection is case insensitive."""
-        assert CaptionUtils.validate_caption("I'M SORRY, I CANNOT HELP WITH THIS IMAGE") == False
-        assert CaptionUtils.validate_caption("i'm sorry, i cannot describe this") == False
+        assert not CaptionUtils.validate_caption("I'M SORRY, I CANNOT HELP WITH THIS IMAGE")
+        assert not CaptionUtils.validate_caption("i'm sorry, i cannot describe this")
 
     def test_validate_too_generic(self):
         """Test rejection of overly generic captions."""
         generic_captions = ["image", "picture", "photo", "illustration"]
 
         for caption in generic_captions:
-            assert CaptionUtils.validate_caption(caption) == False
+            assert not CaptionUtils.validate_caption(caption)
 
     def test_validate_good_captions(self):
         """Test acceptance of good quality captions."""
@@ -311,7 +312,7 @@ class TestCaptionUtilsValidateCaption:
         ]
 
         for caption in good_captions:
-            assert CaptionUtils.validate_caption(caption) == True
+            assert CaptionUtils.validate_caption(caption)
 
     def test_validate_borderline_cases(self):
         """Test validation of borderline cases."""
@@ -320,7 +321,6 @@ class TestCaptionUtilsValidateCaption:
             CaptionUtils.validate_caption(
                 "the warrior refuses to surrender in this epic battle scene"
             )
-            == True
         )
 
         # Should pass - contains generic word but in longer context
@@ -328,11 +328,10 @@ class TestCaptionUtilsValidateCaption:
             CaptionUtils.validate_caption(
                 "this beautiful picture shows a magnificent sunset over mountains"
             )
-            == True
         )
 
         # Should fail - too short even though contains valid words
-        assert CaptionUtils.validate_caption("great image!") == False
+        assert not CaptionUtils.validate_caption("great image!")
 
 
 class TestCaptionUtilsIntegration:
@@ -346,7 +345,7 @@ class TestCaptionUtilsIntegration:
         is_valid = CaptionUtils.validate_caption(cleaned)
 
         assert cleaned == "Magnificent sunset over the ocean."
-        assert is_valid == True
+        assert is_valid
 
     def test_combine_then_validate(self):
         """Test combining descriptions then validating the result."""
@@ -359,7 +358,7 @@ class TestCaptionUtilsIntegration:
         combined = CaptionUtils.combine(descriptions)
         is_valid = CaptionUtils.validate_caption(combined)
 
-        assert is_valid == True
+        assert is_valid
         assert len(combined.split("\n")) >= 2
 
     def test_full_pipeline(self):
@@ -374,7 +373,7 @@ class TestCaptionUtilsIntegration:
         result = CaptionUtils.combine(raw_descriptions)
         is_valid = CaptionUtils.validate_caption(result)
 
-        assert is_valid == True
+        assert is_valid
         # Should preserve some meaningful content
         result_lower = result.lower()
         assert any(

@@ -1,25 +1,24 @@
 """WebDataset processor implementation using webshart TarDataLoader."""
 
-import logging
-import threading
 import gc
-import os
-from typing import Dict, Any, List, Optional, Iterator, Set, Deque, Tuple
-from collections import deque, defaultdict
-from pathlib import Path
-import json
-from datetime import datetime
-from PIL import Image
 import io
+import logging
+import os
+import threading
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Any, Deque, Dict, Iterator, List, Optional, Set
+
+import cv2
+import numpy as np
+import webshart
+from PIL import Image
 
 from caption_flow.models import JobId
 from caption_flow.storage import StorageManager
-from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkUnit, WorkResult
-from ..utils import ChunkTracker
 
-import webshart
-import cv2
-import numpy as np
+from ..utils import ChunkTracker
+from .base import OrchestratorProcessor, ProcessorConfig, WorkerProcessor, WorkResult, WorkUnit
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())

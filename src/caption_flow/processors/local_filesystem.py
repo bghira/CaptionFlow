@@ -1,27 +1,27 @@
 """Local filesystem datasets processor implementation."""
 
-import logging
-import threading
-import os
-from typing import Dict, Any, List, Optional, Iterator, Set, Deque, Tuple
-from collections import deque, defaultdict
-from pathlib import Path
-import json
-import io
-import mimetypes
-from datetime import datetime
-from PIL import Image
-import aiofiles
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import StreamingResponse
-import uvicorn
 import asyncio
+import io
+import logging
+import mimetypes
+import os
+import threading
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Any, Deque, Dict, Iterator, List, Optional, Set, Tuple
+
+import aiofiles
 import requests
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from PIL import Image
 
 from caption_flow.storage import StorageManager
-from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkUnit, WorkResult
-from ..utils import ChunkTracker
+
 from ..models import JobId
+from ..utils import ChunkTracker
+from .base import OrchestratorProcessor, ProcessorConfig, WorkerProcessor, WorkResult, WorkUnit
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -217,7 +217,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         if not self.chunk_tracker:
             return
 
-        all_processed_jobs = storage.get_all_processed_job_ids()
+        storage.get_all_processed_job_ids()
 
         with self.lock:
             for chunk_id, chunk_state in self.chunk_tracker.chunks.items():
@@ -584,7 +584,7 @@ class LocalFilesystemWorkerProcessor(WorkerProcessor):
         processed_indices = []
 
         # Get orchestrator info if we need HTTP
-        orchestrator = context.get("orchestrator")
+        context.get("orchestrator")
 
         for idx in sorted(indices_to_process):
             try:

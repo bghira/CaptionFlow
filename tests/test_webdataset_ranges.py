@@ -1,23 +1,21 @@
 """Comprehensive tests for WebDataset processor with focus on range calculations and edge cases."""
 
-import pytest
-import tempfile
 import shutil
-import json
+import tempfile
 import threading
-import time
-from pathlib import Path
-from unittest.mock import Mock, MagicMock, patch, call
 from collections import defaultdict, deque
-from PIL import Image
-import io
+from pathlib import Path
+from unittest.mock import Mock, call, patch
 
-from caption_flow.models import JobId, ShardChunk, ProcessedResult
+import pytest
+from PIL import Image
+
+from caption_flow.models import JobId
+from caption_flow.processors.base import ProcessorConfig, WorkResult, WorkUnit
 from caption_flow.processors.webdataset import (
     WebDatasetOrchestratorProcessor,
     WebDatasetWorkerProcessor,
 )
-from caption_flow.processors.base import WorkUnit, WorkResult, ProcessorConfig
 from caption_flow.storage import StorageManager
 from caption_flow.utils.chunk_tracker import ChunkTracker
 
@@ -891,7 +889,7 @@ class TestWebDatasetIntegration:
         created_chunks = []
 
         # Create 4 chunks manually (simulating background thread logic)
-        for chunk_num in range(4):
+        for _chunk_num in range(4):
             shard_info = processor._get_shard_info_cached(current_shard_idx)
             shard_name = shard_info["name"]
             chunk_size = min(processor.chunk_size, shard_info["num_files"] - current_file_idx)

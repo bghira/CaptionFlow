@@ -1,10 +1,10 @@
 """Comprehensive tests for vLLM configuration management."""
 
-import pytest
 from unittest.mock import Mock, patch
-from typing import Dict, Any
 
-from caption_flow.utils.vllm_config import VLLMConfigManager, VLLMConfigChange
+import pytest
+
+from caption_flow.utils.vllm_config import VLLMConfigChange, VLLMConfigManager
 
 
 class TestVLLMConfigChange:

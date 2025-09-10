@@ -1,15 +1,13 @@
 """Comprehensive tests for the Monitor module."""
 
-import pytest
-import asyncio
-import json
 import ssl
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from datetime import datetime
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
 
 # Import pytest-asyncio
 pytest_plugins = ("pytest_asyncio",)
-import pytest_asyncio
 
 from caption_flow.monitor import Monitor
 
@@ -82,7 +80,7 @@ class TestMonitorInit:
         assert monitor.stats == {}
         assert monitor.leaderboard == []
         assert monitor.recent_activity == []
-        assert monitor.running == False
+        assert not monitor.running
         assert monitor.ssl_context is not None
 
     def test_init_ssl_verification_disabled(self, monitor_config_no_ssl):
@@ -90,7 +88,7 @@ class TestMonitorInit:
         monitor = Monitor(monitor_config_no_ssl)
 
         assert monitor.ssl_context is not None
-        assert monitor.ssl_context.check_hostname == False
+        assert not monitor.ssl_context.check_hostname
         assert monitor.ssl_context.verify_mode == ssl.CERT_NONE
 
     @patch("ssl.create_default_context")
@@ -99,11 +97,11 @@ class TestMonitorInit:
         mock_context = Mock()
         mock_ssl_context.return_value = mock_context
 
-        monitor = Monitor(monitor_config)
+        Monitor(monitor_config)
 
         mock_ssl_context.assert_called_once()
         # Should not modify context when verification is enabled
-        assert not hasattr(mock_context, "check_hostname") or mock_context.check_hostname != False
+        assert not hasattr(mock_context, "check_hostname") or mock_context.check_hostname
 
     @patch("ssl.create_default_context")
     def test_setup_ssl_without_verification(self, mock_ssl_context, monitor_config_no_ssl):
@@ -111,10 +109,10 @@ class TestMonitorInit:
         mock_context = Mock()
         mock_ssl_context.return_value = mock_context
 
-        monitor = Monitor(monitor_config_no_ssl)
+        Monitor(monitor_config_no_ssl)
 
         mock_ssl_context.assert_called_once()
-        assert mock_context.check_hostname == False
+        assert not mock_context.check_hostname
         assert mock_context.verify_mode == ssl.CERT_NONE
 
 
@@ -201,7 +199,7 @@ class TestMonitorConnection:
             raise ConnectionError("Connection failed")
 
         with patch("websockets.connect", side_effect=connect_side_effect):
-            with patch("asyncio.sleep") as mock_sleep:
+            with patch("asyncio.sleep"):
                 try:
                     await monitor._connect_to_orchestrator()
                 except ConnectionError:
@@ -288,14 +286,14 @@ class TestMonitorStart:
         """Test that start sets the running flag."""
         monitor = Monitor(monitor_config)
 
-        with patch.object(monitor, "_connect_to_orchestrator") as mock_connect:
+        with patch.object(monitor, "_connect_to_orchestrator"):
             with patch.object(monitor, "_display_loop") as mock_display:
                 with patch("asyncio.create_task") as mock_create_task:
                     mock_display.return_value = AsyncMock()
 
                     await monitor.start()
 
-                    assert monitor.running == True
+                    assert monitor.running
                     mock_create_task.assert_called_once()  # Connection task created
                     mock_display.assert_called_once()
 
@@ -304,7 +302,7 @@ class TestMonitorStart:
         """Test that start creates connection task."""
         monitor = Monitor(monitor_config)
 
-        with patch.object(monitor, "_connect_to_orchestrator") as mock_connect:
+        with patch.object(monitor, "_connect_to_orchestrator"):
             with patch.object(monitor, "_display_loop") as mock_display:
                 with patch("asyncio.create_task") as mock_create_task:
                     mock_display.return_value = AsyncMock()
@@ -325,9 +323,9 @@ class TestMonitorDisplayLoop:
 
         # Mock Rich components
         with patch("caption_flow.monitor.Live") as mock_live_class:
-            with patch("caption_flow.monitor.Layout") as mock_layout_class:
+            with patch("caption_flow.monitor.Layout"):
                 with patch.object(monitor, "_create_layout") as mock_create_layout:
-                    with patch.object(monitor, "_update_layout") as mock_update_layout:
+                    with patch.object(monitor, "_update_layout"):
                         mock_live = Mock()
                         mock_live.__enter__ = Mock(return_value=mock_live)
                         mock_live.__exit__ = Mock(return_value=None)

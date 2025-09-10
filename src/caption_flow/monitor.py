@@ -4,9 +4,8 @@ import asyncio
 import json
 import logging
 import ssl
-import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, Optional
 
 import websockets
 from rich.console import Console
@@ -110,7 +109,7 @@ class Monitor:
         """Main display update loop."""
         layout = self._create_layout()
 
-        with Live(layout, console=self.console, refresh_per_second=1, screen=True) as live:
+        with Live(layout, console=self.console, refresh_per_second=1, screen=True):
             while self.running:
                 self._update_layout(layout)
                 await asyncio.sleep(0.25)

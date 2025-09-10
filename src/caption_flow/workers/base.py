@@ -4,10 +4,9 @@ import asyncio
 import json
 import logging
 import ssl
-import time
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
 from threading import Event
+from typing import Any, Dict, Optional
 
 import websockets
 from websockets.asyncio.client import ClientConnection

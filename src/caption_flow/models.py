@@ -1,12 +1,13 @@
 """Data models for CaptionFlow."""
 
+import datetime as _datetime
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
-import datetime as _datetime
 from enum import Enum
-import os
 from typing import Any, Dict, List, Optional, Tuple
+
 from PIL import Image
 
 logger = logging.getLogger(__name__)

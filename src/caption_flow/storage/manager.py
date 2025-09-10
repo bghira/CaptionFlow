@@ -1,25 +1,22 @@
 """Storage management with Lance backend using a single dataset."""
 
-import asyncio
 import gc
 import json
 import logging
 import os
-import duckdb
-from dataclasses import asdict
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import List, Optional, Set, Dict, Any, Tuple
-from collections import defaultdict, deque
 import time
-import numpy as np
+from collections import defaultdict, deque
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 
-import lance
 import duckdb
-import pyarrow as pa
+import lance
 import pandas as pd
+import pyarrow as pa
 
-from ..models import Job, Caption, Contributor, StorageContents, JobId
+from ..models import Caption, Contributor, JobId, StorageContents
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -133,14 +130,15 @@ class StorageManager:
     def init_duckdb_connection(
         self, output_shard: Optional[str] = None
     ) -> duckdb.DuckDBPyConnection:
-        """
-        Initialize or retrieve a DuckDB connection for a given output shard.
+        """Initialize or retrieve a DuckDB connection for a given output shard.
         Currently, we just use a single output shard, but this allows for future implementation of multiple.
 
         Args:
             output_shard (Optional[str]): The output shard identifier. If None, uses default shard.
+
         Returns:
             duckdb.DuckDBPyConnection: The DuckDB connection for the specified shard.
+
         """
         shard_key = output_shard or "default"
         if shard_key in self.duckdb_shard_connections:
@@ -156,7 +154,7 @@ class StorageManager:
                     # Always reload from disk to ensure we have the latest version
                     logger.debug(f"Reloading Lance dataset from {self.captions_path}")
                     self.captions_dataset = lance.dataset(str(self.captions_path))
-                    logger.debug(f"Successfully loaded Lance dataset, converting to Arrow table")
+                    logger.debug("Successfully loaded Lance dataset, converting to Arrow table")
                     # Convert Lance dataset to Arrow table for DuckDB compatibility
                     arrow_table = self.captions_dataset.to_table()
                     logger.debug(
@@ -417,10 +415,8 @@ class StorageManager:
             return
 
         # Try to find existing buffered row
-        found_row = False
-        for idx, row in enumerate(self.caption_buffer):
+        for _idx, row in enumerate(self.caption_buffer):
             if row.get("job_id") == job_id:
-                found_row = True
                 # Merge outputs
                 for field_name, field_values in outputs.items():
                     if field_name not in self.known_output_fields:
@@ -474,7 +470,7 @@ class StorageManager:
                     new_job_ids.append(job_id)
 
                 # Ensure all base fields are present
-                for field_name, field_type in self.base_caption_fields:
+                for field_name, _field_type in self.base_caption_fields:
                     if field_name not in prepared_row:
                         prepared_row[field_name] = None
 

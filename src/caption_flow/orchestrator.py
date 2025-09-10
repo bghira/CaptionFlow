@@ -1,33 +1,31 @@
-import os
-import time
 import asyncio
+import datetime as _datetime
 import json
 import logging
+import os
 import ssl
+import time
 import uuid
-import datetime as _datetime
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Set, Optional, Any, List
-from collections import defaultdict
-import threading
+from typing import Any, Dict, Optional, Set
 
 import websockets
 from websockets.asyncio.server import ServerConnection
 
-from .storage import StorageManager
 from .models import Caption, Contributor, JobId
-from .utils.auth import AuthManager
-from .utils.json_utils import safe_json_dumps
 from .processors import (
-    ProcessorConfig,
-    WorkAssignment,
-    WorkResult,
-    WorkUnit,
-    WebDatasetOrchestratorProcessor,
     HuggingFaceDatasetOrchestratorProcessor,
     LocalFilesystemOrchestratorProcessor,
+    ProcessorConfig,
+    WebDatasetOrchestratorProcessor,
+    WorkAssignment,
+    WorkResult,
 )
+from .storage import StorageManager
+from .utils.auth import AuthManager
+from .utils.json_utils import safe_json_dumps
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -454,7 +452,7 @@ class Orchestrator:
             image_width = result.metadata.pop("image_width", None)
             file_size = result.metadata.pop("file_size", None)
             image_format = result.metadata.pop("image_format", None)
-            item_index = result.metadata.pop("item_index", None)
+            result.metadata.pop("item_index", None)
             item_key = result.metadata.pop("item_key", None)
 
             to_delete_metadata_keys = ["_image_format", "_job_id"]
@@ -512,7 +510,7 @@ class Orchestrator:
             await self._send_monitor_stats(websocket)
 
             # Keep connection alive
-            async for message in websocket:
+            async for _message in websocket:
                 pass
 
         except websockets.exceptions.ConnectionClosed:
@@ -845,7 +843,7 @@ class Orchestrator:
             # Remove disconnected
             disconnected = {
                 m
-                for m, r in zip(monitors_copy, results)
+                for m, r in zip(monitors_copy, results, strict=False)
                 if r is not None and not isinstance(r, Exception)
             }
             self.monitors -= disconnected

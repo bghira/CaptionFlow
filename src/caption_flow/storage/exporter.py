@@ -1,19 +1,20 @@
 """Storage exporter for Lance datasets to various formats."""
 
-import json
 import csv
-import os
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+import json
 import logging
-import pandas as pd
-import numpy as np
-from urllib.parse import urlparse
+import os
 import tempfile
-import lance
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
 
+import lance
+import numpy as np
+import pandas as pd
+
+from ..models import ExportError, StorageContents
 from .manager import StorageManager
-from ..models import StorageContents, ExportError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -27,6 +28,7 @@ class LanceStorageExporter:
 
         Args:
             storage_manager: StorageManager instance
+
         """
         self.storage_manager = storage_manager
 
@@ -51,6 +53,7 @@ class LanceStorageExporter:
 
         Returns:
             Number of items exported
+
         """
         logger.debug(f"Getting shard contents for {shard_name}")
         await self.storage_manager.initialize()
@@ -117,6 +120,7 @@ class LanceStorageExporter:
 
         Returns:
             Dictionary mapping shard names to export counts
+
         """
         results = {}
 
@@ -192,6 +196,7 @@ class LanceStorageExporter:
 
         Returns:
             Total number of rows exported
+
         """
         output_path = Path(output_path)
         if output_path.exists():
@@ -259,10 +264,11 @@ class LanceStorageExporter:
 
         Returns:
             URL of the uploaded dataset
+
         """
         try:
-            from huggingface_hub import HfApi, DatasetCard, create_repo
             import pyarrow.parquet as pq
+            from huggingface_hub import DatasetCard, HfApi, create_repo
         except ImportError:
             raise ExportError(
                 "huggingface_hub is required for HF export. "
@@ -272,10 +278,8 @@ class LanceStorageExporter:
         api = HfApi(token=token)
 
         # Check/create repo
-        repo_exists = False
         try:
             api.dataset_info(dataset_name)
-            repo_exists = True
             logger.info(f"Dataset {dataset_name} already exists, will update it")
         except:
             logger.info(f"Creating new dataset: {dataset_name}")

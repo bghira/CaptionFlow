@@ -1,16 +1,16 @@
 """Chunk tracking using CheckpointTracker base class with memory optimization."""
 
-from collections import defaultdict
+import datetime as _datetime
 import logging
 import os
-from pathlib import Path
-from typing import Set, Dict, List, Optional, Any, Tuple
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
-import datetime as _datetime
-from dataclasses import dataclass, asdict, field
+from pathlib import Path
+from threading import Lock
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .checkpoint_tracker import CheckpointTracker
-from threading import Lock
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -371,7 +371,7 @@ class ChunkTracker(CheckpointTracker):
         """Get summary of all shards and their chunk status."""
         shards = {}
 
-        for chunk_id, chunk_state in self.chunks.items():
+        for _chunk_id, chunk_state in self.chunks.items():
             shard_name = chunk_state.shard_name
             if shard_name not in shards:
                 shards[shard_name] = {
@@ -404,7 +404,7 @@ class ChunkTracker(CheckpointTracker):
     def get_incomplete_shards(self) -> Set[str]:
         """Get set of shard names that have incomplete chunks."""
         incomplete = set()
-        for chunk_id, chunk_state in self.chunks.items():
+        for _chunk_id, chunk_state in self.chunks.items():
             if chunk_state.status != "completed":
                 incomplete.add(chunk_state.shard_name)
         return incomplete

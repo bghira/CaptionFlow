@@ -1,21 +1,20 @@
 """Tests for storage exporter functionality."""
 
+import csv
+import json
+import logging
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+import lance
+import pandas as pd
 import pytest
 import pytest_asyncio
-import asyncio
-import json
-import csv
-import tempfile
-import logging
-from pathlib import Path
-from datetime import datetime
-import pandas as pd
-import pyarrow as pa
-import lance
 
+from caption_flow.models import Caption, StorageContents
 from caption_flow.storage import StorageManager
 from caption_flow.storage.exporter import LanceStorageExporter, StorageExporter
-from caption_flow.models import StorageContents, Caption
 
 # Set up logging to avoid logger not defined errors
 logging.basicConfig(level=logging.INFO)

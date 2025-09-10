@@ -7,31 +7,31 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 import asyncio
 import json
 import logging
-import websockets
 import time
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, List, Tuple, Union
-from queue import Queue, Empty
-from threading import Thread, Event, Lock
 from collections import defaultdict, deque
+from dataclasses import dataclass
+from queue import Empty, Queue
+from threading import Event, Lock, Thread
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from PIL import Image
+import websockets
 from huggingface_hub import get_token
+from PIL import Image
 
-from .base import BaseWorker
+from ..models import ProcessingStage, StageResult
 from ..processors import (
-    ProcessorConfig,
-    WorkAssignment,
-    WorkUnit,
-    WorkResult,
-    WebDatasetWorkerProcessor,
     HuggingFaceDatasetWorkerProcessor,
     LocalFilesystemWorkerProcessor,
+    ProcessorConfig,
+    WebDatasetWorkerProcessor,
+    WorkAssignment,
+    WorkResult,
+    WorkUnit,
 )
-from ..utils.vllm_config import VLLMConfigManager
 from ..utils.image_processor import ImageProcessor
 from ..utils.prompt_template import PromptTemplateManager
-from ..models import ProcessingStage, StageResult
+from ..utils.vllm_config import VLLMConfigManager
+from .base import BaseWorker
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -72,8 +72,8 @@ class MultiStageVLLMManager:
             logger.info(f"Model {model_name} already loaded, reusing instance")
             return
 
-        from vllm import LLM, SamplingParams
-        from transformers import AutoTokenizer, AutoProcessor
+        from transformers import AutoProcessor, AutoTokenizer
+        from vllm import LLM
 
         logger.info(f"Loading model {model_name} for stage {stage.name}")
 
@@ -463,7 +463,7 @@ class CaptionWorker(BaseWorker):
         # Check if stages changed significantly
         stages_changed = len(new_stages) != len(self.stages)
         if not stages_changed:
-            for old, new in zip(self.stages, new_stages):
+            for old, new in zip(self.stages, new_stages, strict=False):
                 if (
                     old.name != new.name
                     or old.model != new.model
@@ -687,7 +687,7 @@ class CaptionWorker(BaseWorker):
 
                 # Create mock outputs based on stage prompts
                 stage_outputs = []
-                for i, prompt in enumerate(stage.prompts):
+                for i, _prompt in enumerate(stage.prompts):
                     mock_output = (
                         f"Mock {stage_name} output {i+1} for job {item.job_id} - {item.item_key}"
                     )

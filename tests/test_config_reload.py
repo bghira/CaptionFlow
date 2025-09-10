@@ -1,7 +1,7 @@
-import pytest
 import json
-import asyncio
 from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
 from websockets.asyncio.server import ServerConnection
 
 # Import pytest-asyncio
@@ -9,8 +9,6 @@ pytest_plugins = ("pytest_asyncio",)
 import pytest_asyncio
 
 from caption_flow.orchestrator import Orchestrator
-from caption_flow.utils.auth import AuthManager
-from caption_flow.processors import ProcessorConfig
 
 
 class TestConfigReload:

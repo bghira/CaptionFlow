@@ -1,32 +1,33 @@
 """HuggingFace Datasets processor implementation - Memory Optimized Version."""
 
-import logging
-import threading
-import re
-import queue
-import time
-import requests
-import json
-import io
-import os
 import gc
-import psutil
-from concurrent.futures import ThreadPoolExecutor, Future
-from typing import Dict, Any, List, Optional, Iterator, Set, Deque, Tuple
-from collections import deque, defaultdict
-from pathlib import Path
+import io
+import json
+import logging
+import os
+import queue
+import re
+import threading
+import time
+from collections import defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
-from PIL import Image
-import pyarrow as pa
+from pathlib import Path
+from typing import Any, Deque, Dict, Iterator, List, Optional, Set, Tuple
+
+import psutil
 import pyarrow.parquet as pq
+import requests
 from datasets import get_dataset_config_names, get_dataset_split_names
-from huggingface_hub import hf_hub_download, get_token
+from huggingface_hub import get_token, hf_hub_download
+from PIL import Image
 from tqdm import tqdm
+
 from caption_flow.storage import StorageManager
 
-from .base import OrchestratorProcessor, WorkerProcessor, ProcessorConfig, WorkUnit, WorkResult
-from ..utils import ChunkTracker
 from ..models import JobId
+from ..utils import ChunkTracker
+from .base import OrchestratorProcessor, ProcessorConfig, WorkerProcessor, WorkResult, WorkUnit
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -547,8 +548,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         logger.info("Thread for creating units has completed. Exiting thread.")
 
     def process_responses_non_blocking(self, response_queue: queue.Queue) -> Optional[WorkResult]:
-        """
-        Non-blocking method to process responses from workers.
+        """Non-blocking method to process responses from workers.
         Returns a WorkResult if one is available, None otherwise.
         """
         # Check for response without blocking
@@ -587,7 +587,6 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
     def get_work_units(self, count: int, worker_id: str) -> List[WorkUnit]:
         """Get available work units for a worker."""
-
         logger.debug(
             "get_work_units called: count=%d worker_id=%s, pending: %d",
             count,
@@ -871,7 +870,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
         return url.split("/")[-1]
 
     def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image.Image:
-        """Create a dummy image"""
+        """Create a dummy image."""
         color = (0, 0, 0)
         width, height = 128, 128
         image = Image.new("RGB", (width, height), color=color)

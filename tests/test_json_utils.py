@@ -1,21 +1,21 @@
 """Comprehensive tests for JSON utilities module."""
 
 import json
-import pytest
-from datetime import datetime, date
+from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal
-from pathlib import Path
-from dataclasses import dataclass, asdict
 from enum import Enum
-from typing import Dict, Any
+from pathlib import Path
+
+import pytest
 
 from caption_flow.utils.json_utils import (
-    safe_json_dumps,
-    safe_dict,
-    sanitize_dict,
-    sanitize_value,
     json_serializer,
     parse_datetime,
+    safe_dict,
+    safe_json_dumps,
+    sanitize_dict,
+    sanitize_value,
     to_json_dict,
     to_json_string,
 )
@@ -144,7 +144,7 @@ class TestSafeDict:
         """Test that primitive types pass through unchanged."""
         assert safe_dict("string") == "string"
         assert safe_dict(42) == 42
-        assert safe_dict(None) == None
+        assert safe_dict(None) is None
 
 
 class TestSanitizeDict:

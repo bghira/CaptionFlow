@@ -1,16 +1,16 @@
-import pytest
 import asyncio
-import json
-import tempfile
-from pathlib import Path
-from collections import defaultdict
-from typing import Set, List, Dict
-from datetime import datetime
 import datetime as _datetime
+import tempfile
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Set
 
+import pytest
+
+from caption_flow.models import JobId
 from caption_flow.processors import ProcessorConfig
 from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
-from caption_flow.models import JobId
 from caption_flow.storage import StorageManager
 
 
@@ -56,7 +56,6 @@ class TestHuggingFaceJobIdUniqueness:
         self, orchestrator_config, temp_checkpoint_dir
     ):
         """Test that no duplicate job IDs are assigned when processing all shards."""
-
         # Initialize processor
         processor = HuggingFaceDatasetOrchestratorProcessor()
         processor_config = ProcessorConfig(
@@ -144,14 +143,14 @@ class TestHuggingFaceJobIdUniqueness:
         processor.stop_creation.set()
 
         # Print statistics
-        print(f"\nJob ID Assignment Statistics:")
+        print("\nJob ID Assignment Statistics:")
         print(f"Total unique job IDs: {len(all_job_ids)}")
         print(f"Total shards processed: {len(job_ids_by_shard)}")
         print(f"Total chunks processed: {len(job_ids_by_chunk)}")
         print(f"Total units processed: {total_units_processed}")
 
         # Print shard statistics
-        print(f"\nJob IDs per shard:")
+        print("\nJob IDs per shard:")
         for shard, ids in sorted(job_ids_by_shard.items()):
             print(f"  {shard}: {len(ids)} job IDs")
 
@@ -208,7 +207,6 @@ async def test_job_id_uniqueness_with_worker_disconnections(
     orchestrator_config, temp_checkpoint_dir
 ):
     """Test that job IDs remain unique when workers disconnect and work is reassigned."""
-
     # Initialize processor
     processor = HuggingFaceDatasetOrchestratorProcessor()
     processor_config = ProcessorConfig(
@@ -338,13 +336,13 @@ async def test_job_id_uniqueness_with_worker_disconnections(
                 processor.mark_completed(unit.unit_id, worker_id)
 
     # Phase 4: Verify results
-    print(f"\nPhase 4: Verification")
+    print("\nPhase 4: Verification")
     print(f"  Total unique job IDs: {len(all_job_ids)}")
     print(f"  Reassigned job IDs: {len(reassigned_job_ids)}")
     print(f"  Duplicate/problematic job IDs: {len(duplicate_job_ids)}")
 
     # Show assignment history for some reassigned job IDs
-    print(f"\nSample assignment histories:")
+    print("\nSample assignment histories:")
     sample_reassigned = list(reassigned_job_ids)[:5]
     for job_id in sample_reassigned:
         history = job_id_assignment_history[job_id]
@@ -352,7 +350,7 @@ async def test_job_id_uniqueness_with_worker_disconnections(
 
     # Verify no problematic job IDs
     if duplicate_job_ids:
-        print(f"\nProblematic job IDs found:")
+        print("\nProblematic job IDs found:")
         for dup in duplicate_job_ids[:10]:
             print(f"  {dup}")
 
@@ -400,7 +398,6 @@ async def _verify_chunk_state_consistency(processor, released_unit_ids):
 @pytest.mark.asyncio
 async def test_rapid_worker_churning(orchestrator_config, temp_checkpoint_dir):
     """Test job ID uniqueness under rapid worker connect/disconnect cycles."""
-
     # Initialize processor
     processor = HuggingFaceDatasetOrchestratorProcessor()
     processor_config = ProcessorConfig(
@@ -455,7 +452,7 @@ async def test_rapid_worker_churning(orchestrator_config, temp_checkpoint_dir):
         await asyncio.sleep(0.1)  # Small delay between cycles
 
     # Check results
-    print(f"\nResults:")
+    print("\nResults:")
     print(f"  Total unique job IDs seen: {len(all_job_ids)}")
     print(f"  Total job ID observations: {sum(job_id_counts.values())}")
 
@@ -482,7 +479,6 @@ async def test_duplicate_job_ids_with_same_token_multiple_workers(
     orchestrator_config, temp_checkpoint_dir
 ):
     """Test for duplicate job IDs when multiple workers use the same auth token."""
-
     # Initialize processor
     processor = HuggingFaceDatasetOrchestratorProcessor()
     processor_config = ProcessorConfig(
@@ -534,7 +530,7 @@ async def test_duplicate_job_ids_with_same_token_multiple_workers(
     worker_ids = []
 
     # Create multiple worker IDs that would come from the same auth token
-    for i in range(5):
+    for _i in range(5):
         # Simulate what orchestrator does
         import uuid
 
@@ -631,7 +627,7 @@ async def test_duplicate_job_ids_with_same_token_multiple_workers(
         task = submit_worker_results(worker_id, units)
         tasks.append(task)
 
-    all_results = await asyncio.gather(*tasks)
+    await asyncio.gather(*tasks)
 
     # Phase 3: Analyze results
     print("\nPhase 3: Analyzing results")
@@ -644,13 +640,13 @@ async def test_duplicate_job_ids_with_same_token_multiple_workers(
     # Find job IDs that were saved multiple times
     duplicate_saves = {job_id: count for job_id, count in job_id_save_counts.items() if count > 1}
 
-    print(f"\nResults:")
+    print("\nResults:")
     print(f"  Total save attempts: {len(storage.save_attempts)}")
     print(f"  Unique job IDs saved: {len(storage.processed_job_ids)}")
     print(f"  Duplicate save attempts: {len(duplicate_saves)}")
 
     if duplicate_saves:
-        print(f"\nJob IDs with multiple save attempts:")
+        print("\nJob IDs with multiple save attempts:")
         for job_id, count in list(duplicate_saves.items())[:10]:
             print(f"  {job_id}: saved {count} times")
             # Show which workers tried to save this
@@ -660,7 +656,7 @@ async def test_duplicate_job_ids_with_same_token_multiple_workers(
             print(f"    Contributors: {contributors}")
 
     # Check for race conditions
-    print(f"\nRace condition analysis:")
+    print("\nRace condition analysis:")
     print(f"  Concurrent save attempts: {len(storage.concurrent_saves)}")
     if storage.concurrent_saves:
         for job_id, contributors in list(storage.concurrent_saves.items())[:5]:
@@ -680,7 +676,6 @@ async def test_duplicate_job_ids_with_same_token_multiple_workers(
 @pytest.mark.asyncio
 async def test_chunk_boundary_job_id_assignment(orchestrator_config, temp_checkpoint_dir):
     """Test job ID uniqueness at chunk boundaries where off-by-one errors might occur."""
-
     # Use small chunk size to create more boundaries
     orchestrator_config["chunk_size"] = 10  # Very small chunks
 
@@ -768,7 +763,7 @@ async def test_chunk_boundary_job_id_assignment(orchestrator_config, temp_checkp
                             )
 
     # Report findings
-    print(f"\nBoundary test results:")
+    print("\nBoundary test results:")
     print(f"  Total chunks processed: {len(chunk_job_ids)}")
     print(f"  Total unique job IDs: {len(job_id_to_chunk)}")
     print(f"  Boundary issues found: {len(boundary_issues)}")
@@ -815,7 +810,6 @@ async def test_chunk_boundary_job_id_assignment(orchestrator_config, temp_checkp
 @pytest.mark.asyncio
 async def test_job_id_persistence_across_restarts(orchestrator_config, temp_checkpoint_dir):
     """Test that job IDs remain unique even after processor restarts."""
-
     # First run - process some units
     processor1 = HuggingFaceDatasetOrchestratorProcessor()
     processor_config = ProcessorConfig(
@@ -876,7 +870,7 @@ async def test_job_id_persistence_across_restarts(orchestrator_config, temp_chec
     # Check for overlaps
     overlapping_ids = first_run_job_ids.intersection(second_run_job_ids)
 
-    print(f"\nPersistence Test Results:")
+    print("\nPersistence Test Results:")
     print(f"First run job IDs: {len(first_run_job_ids)}")
     print(f"Second run job IDs: {len(second_run_job_ids)}")
     print(f"Overlapping IDs: {len(overlapping_ids)}")
@@ -886,21 +880,13 @@ async def test_job_id_persistence_across_restarts(orchestrator_config, temp_chec
     ), f"Found {len(overlapping_ids)} duplicate job IDs across restarts"
 
 
-import pytest
-import asyncio
-import tempfile
-from pathlib import Path
-from collections import defaultdict
 import threading
 import time
-from typing import Set, List, Dict
-import datetime as _datetime
-from datetime import datetime
+from typing import Dict, Set
 
-from caption_flow.processors import ProcessorConfig
-from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
-from caption_flow.models import JobId, Caption, Contributor
-from caption_flow.storage import StorageManager
+import pytest
+
+from caption_flow.models import Caption
 from caption_flow.utils import ChunkTracker
 
 
@@ -910,7 +896,6 @@ class TestHuggingFaceWithRealStorage:
     @pytest.mark.asyncio
     async def test_concurrent_workers_same_token_real_storage(self, temp_checkpoint_dir):
         """Test multiple workers with same token using real storage components."""
-
         # Create real storage manager
         storage_dir = temp_checkpoint_dir / "storage"
         storage = StorageManager(
@@ -1087,7 +1072,7 @@ class TestHuggingFaceWithRealStorage:
             # Find duplicates
             duplicate_job_ids = {jid: count for jid, count in job_id_counts.items() if count > 1}
 
-        print(f"\nDuplicate analysis:")
+        print("\nDuplicate analysis:")
         print(f"  Unique job IDs in storage: {len(stored_job_ids)}")
         print(f"  Job IDs with duplicates: {len(duplicate_job_ids)}")
 
@@ -1113,7 +1098,6 @@ class TestHuggingFaceWithRealStorage:
     @pytest.mark.asyncio
     async def test_chunk_tracker_race_conditions(self, temp_checkpoint_dir):
         """Test race conditions in chunk tracker updates."""
-
         # Create chunk tracker
         checkpoint_path = temp_checkpoint_dir / "checkpoints" / "chunks.json"
         chunk_tracker = ChunkTracker(checkpoint_path)
@@ -1157,7 +1141,7 @@ class TestHuggingFaceWithRealStorage:
 
         # Check chunk state
         chunk_state = chunk_tracker.chunks["shard1:chunk:0"]
-        print(f"\nChunk state after concurrent updates:")
+        print("\nChunk state after concurrent updates:")
         print(f"  Status: {chunk_state.status}")
         print(f"  Processed count: {chunk_state.processed_count}")
         print(f"  Processed ranges: {chunk_state.processed_ranges}")
@@ -1196,7 +1180,6 @@ class TestHuggingFaceWithRealStorage:
 @pytest.mark.asyncio
 async def test_relative_absolute_index_misalignments(temp_checkpoint_dir):
     """Test for misalignments between relative and absolute indices."""
-
     # Create storage and chunk tracker
     storage_dir = temp_checkpoint_dir / "storage"
     storage = StorageManager(data_dir=storage_dir, caption_buffer_size=5)
@@ -1428,7 +1411,6 @@ async def test_relative_absolute_index_misalignments(temp_checkpoint_dir):
 @pytest.mark.asyncio
 async def test_job_id_calculation_consistency(temp_checkpoint_dir):
     """Test that job ID calculations are consistent across different paths."""
-
     print("\nTesting job ID calculation consistency")
 
     # Test data
@@ -1500,7 +1482,6 @@ async def test_job_id_calculation_consistency(temp_checkpoint_dir):
 @pytest.mark.asyncio
 async def test_huggingface_chunk_start_index_bug(temp_checkpoint_dir):
     """Test that exposes the chunk start index bug in HuggingFace processor."""
-
     print("\n" + "=" * 80)
     print("TESTING FOR CHUNK START INDEX BUG")
     print("=" * 80)
@@ -1646,7 +1627,6 @@ async def test_huggingface_chunk_start_index_bug(temp_checkpoint_dir):
 @pytest.mark.asyncio
 async def test_workaround_for_start_index_bug(temp_checkpoint_dir):
     """Test that shows how the bug manifests in practice."""
-
     print("\nDemonstrating how the start_index bug causes duplicates")
 
     # Simulate what happens with the bug
@@ -1708,7 +1688,7 @@ async def test_workaround_for_start_index_bug(temp_checkpoint_dir):
     buggy_counts = Counter(all_buggy_ids)
     duplicated_ids = [jid for jid, count in buggy_counts.items() if count > 1]
 
-    print(f"\nDuplicated job IDs with the bug:")
+    print("\nDuplicated job IDs with the bug:")
     for jid in duplicated_ids:
         print(f"  {jid} appears {buggy_counts[jid]} times")
 
