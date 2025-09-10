@@ -1,5 +1,9 @@
 # CaptionFlow
 
+[![Tests](https://github.com/bghira/CaptionFlow/workflows/tests/badge.svg)](https://github.com/bghira/CaptionFlow/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/bghira/CaptionFlow/branch/main/graph/badge.svg)](https://codecov.io/gh/bghira/CaptionFlow)
+[![PyPI version](https://badge.fury.io/py/caption-flow.svg)](https://badge.fury.io/py/caption-flow)
+
 scalable, fault-tolerant **vLLM-powered image captioning**.
 
 a fast websocket-based orchestrator paired with lightweight gpu workers achieves exceptional performance for batched requests through vLLM.

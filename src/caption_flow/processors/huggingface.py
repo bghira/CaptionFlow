@@ -1195,7 +1195,18 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
 
                                 # Still extract URL if available for metadata
                                 if self.url_column and self.url_column in item:
-                                    image_url = item[self.url_column]
+                                    url_value = item[self.url_column]
+                                    if (
+                                        url_value
+                                        and str(url_value).strip()
+                                        and str(url_value).strip().lower() != "none"
+                                    ):
+                                        image_url = str(url_value).strip()
+                                    else:
+                                        logger.debug(
+                                            f"Invalid or None URL for item {global_idx}: {url_value}"
+                                        )
+                                        image_url = None
 
                                 # Create dummy image with metadata context
                                 image = self._create_dummy_image(
@@ -1209,7 +1220,19 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                 # Normal processing - load real images
                                 if self.url_column:
                                     if self.url_column in item:
-                                        image_url = item[self.url_column]
+                                        url_value = item[self.url_column]
+                                        if (
+                                            url_value
+                                            and str(url_value).strip()
+                                            and str(url_value).strip().lower() != "none"
+                                        ):
+                                            image_url = str(url_value).strip()
+                                        else:
+                                            logger.debug(
+                                                f"Skipping invalid or None URL for item {global_idx}: {url_value}"
+                                            )
+                                            continue  # Skip this item entirely
+
                                         try:
                                             max_retries = 3
                                             backoff_factor = 2
