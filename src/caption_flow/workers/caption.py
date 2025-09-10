@@ -611,34 +611,64 @@ class CaptionWorker(BaseWorker):
         if batch and not self.should_stop_processing.is_set():
             self._process_batch(batch)
 
-        # Notify orchestrator that unit is complete
+        # Notify orchestrator about unit completion or failure
         # Check if the number of processed items matches the expected count for the unit.
         # The context dictionary holds the count of items yielded by the processor.
         total_items_in_unit = unit.unit_size
 
-        if (
-            not self.should_stop_processing.is_set()
-            and self.connected.is_set()
-            and self.items_failed == 0
-            and self.items_processed >= total_items_in_unit
-        ):
-            if self.websocket:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        self.websocket.send(
-                            json.dumps({"type": "work_complete", "unit_id": unit.unit_id})
-                        ),
-                        self.main_loop,
-                    ).result(timeout=5)
-                    logger.info(
-                        f"Unit {unit.unit_id} fully processed ({self.items_processed}/{total_items_in_unit}) and marked complete."
+        if not self.should_stop_processing.is_set() and self.connected.is_set():
+            if self.items_failed == 0 and self.items_processed >= total_items_in_unit:
+                # Unit completed successfully
+                if self.websocket:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self.websocket.send(
+                                json.dumps({"type": "work_complete", "unit_id": unit.unit_id})
+                            ),
+                            self.main_loop,
+                        ).result(timeout=5)
+                        logger.info(
+                            f"Unit {unit.unit_id} fully processed "
+                            f"({self.items_processed}/{total_items_in_unit}) and marked complete."
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not notify work complete for unit {unit.unit_id}: {e}"
+                        )
+            else:
+                # Unit failed or was incomplete
+                if self.items_failed > 0:
+                    error_msg = (
+                        f"Processing failed for {self.items_failed} out of "
+                        f"{total_items_in_unit} items"
                     )
-                except Exception as e:
-                    logger.warning(f"Could not notify work complete for unit {unit.unit_id}: {e}")
+                    logger.error(f"Unit {unit.unit_id} failed: {error_msg}")
+                else:
+                    error_msg = (
+                        f"Processing incomplete: {self.items_processed}/"
+                        f"{total_items_in_unit} items processed"
+                    )
+                    logger.warning(f"Unit {unit.unit_id} incomplete: {error_msg}")
+
+                if self.websocket:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self.websocket.send(
+                                json.dumps(
+                                    {
+                                        "type": "work_failed",
+                                        "unit_id": unit.unit_id,
+                                        "error": error_msg,
+                                    }
+                                )
+                            ),
+                            self.main_loop,
+                        ).result(timeout=5)
+                        logger.info(f"Unit {unit.unit_id} failure reported to orchestrator")
+                    except Exception as e:
+                        logger.warning(f"Could not notify work failed for unit {unit.unit_id}: {e}")
         else:
-            logger.warning(
-                f"Processing of unit {unit.unit_id} was incomplete ({self.items_processed}/{total_items_in_unit}). Not marking as complete."
-            )
+            logger.info(f"Unit {unit.unit_id} processing stopped due to disconnect or shutdown")
 
     def _process_batch(self, batch: List[ProcessingItem]):
         """Process a batch of items through all stages."""
@@ -673,6 +703,20 @@ class CaptionWorker(BaseWorker):
         except Exception as e:
             logger.error(f"Batch processing error: {e}", exc_info=True)
 
+            # Mark all items in batch as failed
+            self.items_failed += len(batch)
+
+            # Send error results for each item in the batch
+            for item in batch:
+                self.result_queue.put(
+                    {
+                        "item": item,
+                        "outputs": {},
+                        "processing_time_ms": 0.0,
+                        "error": f"Batch processing failed: {str(e)}",
+                    }
+                )
+
     def _process_batch_mock(self, batch: List[ProcessingItem]) -> List[Tuple[ProcessingItem, Dict]]:
         """Process a batch in mock mode - return dummy captions."""
         results = []
@@ -689,7 +733,7 @@ class CaptionWorker(BaseWorker):
                 stage_outputs = []
                 for i, _prompt in enumerate(stage.prompts):
                     mock_output = (
-                        f"Mock {stage_name} output {i+1} for job {item.job_id} - {item.item_key}"
+                        f"Mock {stage_name} output {i + 1} for job {item.job_id} - {item.item_key}"
                     )
                     stage_outputs.append(mock_output)
 
@@ -725,7 +769,8 @@ class CaptionWorker(BaseWorker):
     ) -> Tuple[List[ProcessingItem], List[ProcessingItem]]:
         """Validate batch items and split into processable and too-long items."""
         logger.debug(
-            f"Validating batch of size {len(batch)} for stage '{stage.name}' with max_length {max_length}"
+            f"Validating batch of size {len(batch)} for stage '{stage.name}' "
+            f"with max_length {max_length}"
         )
         processable = []
         too_long = []

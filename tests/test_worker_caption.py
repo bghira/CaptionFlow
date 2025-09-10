@@ -595,6 +595,226 @@ class TestCaptionWorker:
         # Check error was logged (would need to check logs in real test)
         assert True  # Placeholder - in real test would check logging
 
+    def test_batch_error_handling_with_failure_reporting(self, caption_worker, mock_vllm_config):
+        """Test that batch processing errors are properly reported to orchestrator."""
+        # Setup worker
+        caption_worker.vllm_config = mock_vllm_config
+        caption_worker.mock_mode = False
+        caption_worker.stages = caption_worker._parse_stages_config(mock_vllm_config)
+        caption_worker.stage_order = caption_worker._topological_sort_stages(caption_worker.stages)
+
+        # Mock websocket and connection
+        caption_worker.websocket = Mock()
+        caption_worker.websocket.send = AsyncMock()
+        caption_worker.connected = Mock()
+        caption_worker.connected.is_set = Mock(return_value=True)
+        caption_worker.should_stop_processing = Mock()
+        caption_worker.should_stop_processing.is_set = Mock(return_value=False)
+        caption_worker.main_loop = asyncio.get_event_loop()
+
+        # Mock model manager to raise error
+        caption_worker.model_manager = Mock()
+        caption_worker.model_manager.get_model_for_stage = Mock(
+            side_effect=Exception(
+                "The decoder prompt (length 16409) is longer than the maximum model length of 16384"
+            )
+        )
+
+        # Create test batch
+        batch = [
+            ProcessingItem(
+                unit_id="unit1",
+                job_id="job1",
+                chunk_id="1",
+                item_key="test_item",
+                item_index=0,
+                image=Image.new("RGB", (100, 100)),
+                image_data=b"data",
+                metadata={},
+            )
+        ]
+
+        # Process batch - this should fail
+        initial_failed_count = caption_worker.items_failed
+        caption_worker._process_batch(batch)
+
+        # Check that items_failed was incremented
+        assert caption_worker.items_failed == initial_failed_count + len(batch)
+
+        # Check that error results were queued
+        assert not caption_worker.result_queue.empty()
+        result_data = caption_worker.result_queue.get()
+
+        assert result_data["item"] == batch[0]
+        assert result_data["outputs"] == {}
+        assert "error" in result_data
+        assert "Batch processing failed" in result_data["error"]
+
+    def test_unit_failure_reporting_to_orchestrator(self, caption_worker, mock_vllm_config):
+        """Test that unit failures are properly reported to orchestrator."""
+        # Setup worker
+        caption_worker.vllm_config = mock_vllm_config
+        caption_worker.mock_mode = True  # Use mock mode to avoid complex setup
+        caption_worker.stages = caption_worker._parse_stages_config(mock_vllm_config)
+        caption_worker.stage_order = caption_worker._topological_sort_stages(caption_worker.stages)
+
+        # Mock websocket and connection
+        caption_worker.websocket = Mock()
+        caption_worker.websocket.send = AsyncMock()
+        caption_worker.connected = Mock()
+        caption_worker.connected.is_set = Mock(return_value=True)
+        caption_worker.should_stop_processing = Mock()
+        caption_worker.should_stop_processing.is_set = Mock(return_value=False)
+        caption_worker.main_loop = asyncio.get_event_loop()
+
+        # Mock processor that will simulate batch failures
+        mock_processor = Mock()
+        # Create items that look like they will succeed
+        mock_items = [
+            {
+                "job_id": "job1",
+                "item_key": "item_1",
+                "item_index": 0,
+                "image": Image.new("RGB", (100, 100)),
+                "image_data": b"data",
+                "metadata": {},
+            },
+            {
+                "job_id": "job2",
+                "item_key": "item_2",
+                "item_index": 1,
+                "image": Image.new("RGB", (100, 100)),
+                "image_data": b"data",
+                "metadata": {},
+            },
+            {
+                "job_id": "job3",
+                "item_key": "item_3",
+                "item_index": 2,
+                "image": Image.new("RGB", (100, 100)),
+                "image_data": b"data",
+                "metadata": {},
+            },
+        ]
+        mock_processor.process_unit = Mock(return_value=iter(mock_items))
+        caption_worker.processor = mock_processor
+
+        # Create work unit expecting 3 items
+        unit = WorkUnit(
+            unit_id="unit1",
+            chunk_id="1",
+            source_id="shard1",
+            unit_size=3,
+            data={},
+            metadata={},
+        )
+
+        # Mock _process_batch to simulate batch failures
+        original_process_batch = caption_worker._process_batch
+
+        def mock_process_batch(batch):
+            # Simulate batch processing failure
+            caption_worker.items_failed += len(batch)
+            # Don't increment items_processed to simulate failures
+            for item in batch:
+                caption_worker.result_queue.put(
+                    {
+                        "item": item,
+                        "outputs": {},
+                        "processing_time_ms": 0.0,
+                        "error": "Simulated batch failure",
+                    }
+                )
+
+        caption_worker._process_batch = mock_process_batch
+
+        # Process unit - this will trigger failures
+        caption_worker._process_work_unit(unit)
+
+        # Check that work_failed was sent to orchestrator (failures > 0, processed == 0)
+        caption_worker.websocket.send.assert_called()
+
+        # Find the work_failed message
+        calls = caption_worker.websocket.send.call_args_list
+        work_failed_call = None
+        for call in calls:
+            sent_data = json.loads(call[0][0])
+            if sent_data.get("type") == "work_failed":
+                work_failed_call = sent_data
+                break
+
+        assert work_failed_call is not None, "work_failed message should have been sent"
+        assert work_failed_call["unit_id"] == "unit1"
+        assert "Processing failed for" in work_failed_call["error"]
+        assert "3 out of 3 items" in work_failed_call["error"]
+
+        # Restore original method
+        caption_worker._process_batch = original_process_batch
+
+    def test_unit_incomplete_reporting_to_orchestrator(self, caption_worker, mock_vllm_config):
+        """Test that incomplete units (not failed, but not fully processed) are reported."""
+        # Setup worker
+        caption_worker.vllm_config = mock_vllm_config
+        caption_worker.mock_mode = True  # Use mock mode to avoid complex setup
+        caption_worker.stages = caption_worker._parse_stages_config(mock_vllm_config)
+        caption_worker.stage_order = caption_worker._topological_sort_stages(caption_worker.stages)
+
+        # Mock websocket and connection
+        caption_worker.websocket = Mock()
+        caption_worker.websocket.send = AsyncMock()
+        caption_worker.connected = Mock()
+        caption_worker.connected.is_set = Mock(return_value=True)
+        caption_worker.should_stop_processing = Mock()
+        caption_worker.should_stop_processing.is_set = Mock(return_value=False)
+        caption_worker.main_loop = asyncio.get_event_loop()
+
+        # Mock processor that yields fewer items than expected
+        mock_processor = Mock()
+        mock_items = [
+            {
+                "job_id": "job1",
+                "item_key": "item_1",
+                "item_index": 0,
+                "image": Image.new("RGB", (100, 100)),
+                "image_data": b"data",
+                "metadata": {},
+            }
+        ]
+        mock_processor.process_unit = Mock(return_value=iter(mock_items))
+        caption_worker.processor = mock_processor
+
+        # Create work unit expecting 3 items but only 1 will be processed
+        unit = WorkUnit(
+            unit_id="unit1",
+            chunk_id="1",
+            source_id="shard1",
+            unit_size=3,  # Expecting 3 items, but only 1 will be processed
+            data={},
+            metadata={},
+        )
+
+        # Process unit (no failures, just incomplete)
+        caption_worker._process_work_unit(unit)
+
+        # Check that work_failed was sent to orchestrator
+        caption_worker.websocket.send.assert_called()
+
+        # Find the work_failed message
+        calls = caption_worker.websocket.send.call_args_list
+        work_failed_call = None
+        for call in calls:
+            sent_data = json.loads(call[0][0])
+            if sent_data.get("type") == "work_failed":
+                work_failed_call = sent_data
+                break
+
+        assert work_failed_call is not None, (
+            "work_failed message should have been sent for incomplete unit"
+        )
+        assert work_failed_call["unit_id"] == "unit1"
+        assert "Processing incomplete" in work_failed_call["error"]
+        assert "1/3 items processed" in work_failed_call["error"]
+
 
 class TestCaptionWorkerProcessors:
     """Test CaptionWorker with different processor types."""
