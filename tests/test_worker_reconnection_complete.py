@@ -556,9 +556,9 @@ async def test_proposed_solution_smarter_chunk_assignment(orchestrator_config, t
     processor.stop_creation.set()
 
     # The green test should demonstrate no conflicts
-    assert len(overlap_with_active) == 0, (
-        f"Smart assignment should avoid conflicts, but found {overlap_with_active}"
-    )
+    assert (
+        len(overlap_with_active) == 0
+    ), f"Smart assignment should avoid conflicts, but found {overlap_with_active}"
 
     print("\n  🎯 SOLUTION VALIDATION:")
     print("    ✅ Smarter chunk assignment prevents duplicate work")

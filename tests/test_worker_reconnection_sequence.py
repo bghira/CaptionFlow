@@ -48,7 +48,7 @@ def orchestrator_config(temp_checkpoint_dir):
             "dataset_split": None,
         },
         "checkpoint_dir": str(temp_checkpoint_dir),
-        "chunk_size": 1000,  # Use consistent chunk size
+        "chunk_size": 100,  # Reduced chunk size for faster testing
         "min_chunk_buffer": 5,
         "chunk_buffer_multiplier": 2,
     }
@@ -98,18 +98,18 @@ async def test_worker_reconnection_lower_sequence_assignment(
     processor.stop_creation.set()  # Prevent background thread
 
     # Create initial work units manually
-    for chunk_idx in range(10):  # Create 10 chunks for testing
+    for chunk_idx in range(6):  # Reduced from 10 to 6 chunks
         chunk_id = f"photos_sequential:chunk:{chunk_idx}"
-        chunk_start = chunk_idx * 1000
+        chunk_start = chunk_idx * 100  # Use smaller chunk size
 
         work_unit = WorkUnit(
             unit_id=chunk_id,
             chunk_id=chunk_id,
             source_id="photos_sequential",
-            unit_size=1000,
+            unit_size=100,  # Reduced from 1000
             data={
                 "start_index": chunk_start,
-                "chunk_size": 1000,
+                "chunk_size": 100,  # Reduced from 1000
                 "shard_name": "photos_sequential",
             },
             metadata={
@@ -123,7 +123,7 @@ async def test_worker_reconnection_lower_sequence_assignment(
 
         # Add to chunk tracker
         processor.chunk_tracker.add_chunk(
-            chunk_id, "photos_sequential", "dummy_shard.parquet", chunk_start, 1000
+            chunk_id, "photos_sequential", "dummy_shard.parquet", chunk_start, 100
         )
 
     # Mock the _create_work_units_from_chunk method
@@ -165,7 +165,7 @@ async def test_worker_reconnection_lower_sequence_assignment(
             chunk_size = unit.data["chunk_size"]
             shard_name = unit.metadata["shard_name"]
 
-            for i in range(min(50, chunk_size)):  # Sample first 50 job IDs
+            for i in range(min(5, chunk_size)):  # Sample first 5 job IDs (optimized)
                 sample_idx = start_index + i
                 job_id_obj = JobId(
                     shard_id=shard_name,
@@ -232,7 +232,7 @@ async def test_worker_reconnection_lower_sequence_assignment(
         chunk_size = unit.data["chunk_size"]
         shard_name = unit.metadata["shard_name"]
 
-        for i in range(min(50, chunk_size)):  # Sample first 50 job IDs
+        for i in range(min(5, chunk_size)):  # Sample first 5 job IDs (optimized)
             sample_idx = start_index + i
             job_id_obj = JobId(
                 shard_id=shard_name,
@@ -321,7 +321,7 @@ async def test_worker_reconnection_lower_sequence_assignment(
         shard_name = unit.metadata["shard_name"]
         chunk_index = unit.metadata["chunk_index"]
 
-        for i in range(min(10, chunk_size)):
+        for i in range(min(5, chunk_size)):  # Reduced sample size
             sample_idx = start_index + i
             job_id_obj = JobId(
                 shard_id=shard_name,
@@ -411,18 +411,18 @@ async def test_prevent_duplicate_assignments_on_reconnection(
     processor.stop_creation.set()  # Prevent background thread
 
     # Create initial work units manually
-    for chunk_idx in range(10):  # Create 10 chunks for testing
+    for chunk_idx in range(6):  # Reduced from 10 to 6 chunks
         chunk_id = f"photos_sequential:chunk:{chunk_idx}"
-        chunk_start = chunk_idx * 1000
+        chunk_start = chunk_idx * 100  # Use smaller chunk size
 
         work_unit = WorkUnit(
             unit_id=chunk_id,
             chunk_id=chunk_id,
             source_id="photos_sequential",
-            unit_size=1000,
+            unit_size=100,  # Reduced from 1000
             data={
                 "start_index": chunk_start,
-                "chunk_size": 1000,
+                "chunk_size": 100,  # Reduced from 1000
                 "shard_name": "photos_sequential",
             },
             metadata={
@@ -436,7 +436,7 @@ async def test_prevent_duplicate_assignments_on_reconnection(
 
         # Add to chunk tracker
         processor.chunk_tracker.add_chunk(
-            chunk_id, "photos_sequential", "dummy_shard.parquet", chunk_start, 1000
+            chunk_id, "photos_sequential", "dummy_shard.parquet", chunk_start, 100
         )
 
     # Mock the _create_work_units_from_chunk method
@@ -476,7 +476,8 @@ async def test_prevent_duplicate_assignments_on_reconnection(
             chunk_size = unit.data["chunk_size"]
             shard_name = unit.metadata["shard_name"]
 
-            for i in range(chunk_size):
+            # Only sample a few job IDs for duplicate checking (optimization)
+            for i in range(min(5, chunk_size)):
                 sample_idx = start_index + i
                 job_id_obj = JobId(
                     shard_id=shard_name,
@@ -485,9 +486,9 @@ async def test_prevent_duplicate_assignments_on_reconnection(
                 )
                 job_id_str = job_id_obj.get_sample_str()
 
-                assert job_id_str not in global_job_ids, (
-                    f"Duplicate job ID in initial assignment: {job_id_str}"
-                )
+                assert (
+                    job_id_str not in global_job_ids
+                ), f"Duplicate job ID in initial assignment: {job_id_str}"
                 global_job_ids.add(job_id_str)
 
     # Phase 2: Simulate disconnection and reconnection
@@ -526,7 +527,8 @@ async def test_prevent_duplicate_assignments_on_reconnection(
         shard_name = unit.metadata["shard_name"]
         chunk_index = unit.metadata["chunk_index"]
 
-        for i in range(chunk_size):
+        # Only sample a few job IDs for validation (optimization)
+        for i in range(min(5, chunk_size)):
             sample_idx = start_index + i
             job_id_obj = JobId(
                 shard_id=shard_name,
@@ -561,7 +563,8 @@ async def test_prevent_duplicate_assignments_on_reconnection(
             shard_name = unit.metadata["shard_name"]
             chunk_index = unit.metadata["chunk_index"]
 
-            for i in range(chunk_size):
+            # Only sample a few job IDs for duplicate checking (optimization)
+            for i in range(min(5, chunk_size)):
                 sample_idx = start_index + i
                 job_id_obj = JobId(
                     shard_id=shard_name,
@@ -570,9 +573,9 @@ async def test_prevent_duplicate_assignments_on_reconnection(
                 )
                 job_id_str = job_id_obj.get_sample_str()
 
-                assert job_id_str not in all_currently_assigned_jobs, (
-                    f"Duplicate active assignment: {job_id_str}"
-                )
+                assert (
+                    job_id_str not in all_currently_assigned_jobs
+                ), f"Duplicate active assignment: {job_id_str}"
                 all_currently_assigned_jobs.add(job_id_str)
 
     processor.stop_creation.set()

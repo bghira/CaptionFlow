@@ -144,9 +144,9 @@ class TestWebDatasetOrchestratorProcessor:
         chunk_state = orchestrator_processor.chunk_tracker.chunks[chunk_id]
         unprocessed_ranges = chunk_state.get_unprocessed_ranges()
         expected_unprocessed = [(10, 20), (50, 99)]
-        assert unprocessed_ranges == expected_unprocessed, (
-            f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
-        )
+        assert (
+            unprocessed_ranges == expected_unprocessed
+        ), f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
 
         orchestrator_processor._restore_state(mock_storage)
 
@@ -976,9 +976,9 @@ class TestWebDatasetIntegration:
         for i, expected in enumerate(expected_chunks):
             actual = created_chunks[i]
             assert actual["chunk_id"] == expected["chunk_id"]
-            assert actual["start_index"] == expected["start_index"], (
-                f"Chunk {i} start_index mismatch"
-            )
+            assert (
+                actual["start_index"] == expected["start_index"]
+            ), f"Chunk {i} start_index mismatch"
             assert actual["chunk_size"] == expected["chunk_size"]
             assert actual["expected_chunk_index"] == expected["expected_chunk_index"]
 
@@ -1052,9 +1052,9 @@ class TestWebDatasetIntegration:
         chunk_state = chunk_tracker.chunks[chunk_id]
         unprocessed_ranges = chunk_state.get_unprocessed_ranges()
         expected_unprocessed = [(5, 9), (13, 19)]  # The gaps
-        assert unprocessed_ranges == expected_unprocessed, (
-            f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
-        )
+        assert (
+            unprocessed_ranges == expected_unprocessed
+        ), f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
 
         # Create work unit simulating orchestrator assignment
         unit = WorkUnit(
