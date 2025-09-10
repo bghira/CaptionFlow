@@ -1,24 +1,16 @@
 """TUI viewer for browsing CaptionFlow datasets with image preview using Urwid."""
 
-import asyncio
-import io
-import json
 import logging
 import os
-import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
-from urllib.parse import urlparse
 import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
 
-import aiohttp
 import pandas as pd
-import pyarrow.parquet as pq
 import urwid
 
 try:
-    from term_image.image import from_file, from_url, BaseImage
+    from term_image.image import BaseImage, from_file, from_url
     from term_image.widget import UrwidImage, UrwidImageScreen
 
     TERM_IMAGE_AVAILABLE = True
@@ -232,7 +224,7 @@ class DatasetViewer:
                 filename = filename[:17] + "..."
 
             # Count captions
-            caption_count = self._count_captions(item)
+            self._count_captions(item)
 
             text = f"{idx:3d}. {filename}"
             if idx == self.current_item_idx:
@@ -411,8 +403,8 @@ class DatasetViewer:
 
         try:
             # Download image
-            import urllib.request
             import urllib.error
+            import urllib.request
 
             # Create request with user agent to avoid 403 errors
             request = urllib.request.Request(

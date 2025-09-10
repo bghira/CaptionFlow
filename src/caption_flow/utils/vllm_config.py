@@ -1,8 +1,8 @@
 """vLLM configuration management utilities."""
 
 import logging
-from typing import Dict, Any, Optional, Tuple, List
 from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -140,11 +140,12 @@ class VLLMConfigManager:
     def update_runtime_config(
         self, vllm_instance, old_config: Dict[str, Any], new_config: Dict[str, Any]
     ) -> Tuple[bool, Optional[Any]]:
-        """
-        Update vLLM configuration at runtime without reload.
+        """Update vLLM configuration at runtime without reload.
 
-        Returns:
+        Returns
+        -------
             Tuple of (success, new_sampling_params)
+
         """
         change = self.analyze_config_change(old_config, new_config)
 

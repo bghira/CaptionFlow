@@ -1,33 +1,26 @@
 """Comprehensive tests for CaptionWorker with multi-stage processing."""
 
-import pytest
 import asyncio
-import json
-import tempfile
-import shutil
-from pathlib import Path
-from datetime import datetime
 import datetime as _datetime
-from unittest.mock import Mock, AsyncMock, patch, MagicMock, call
-from typing import Dict, Any, List
-import websockets
+import json
+from datetime import datetime
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
 from PIL import Image
-import io
-from queue import Queue, Empty
 
 # Import pytest-asyncio
 pytest_plugins = ("pytest_asyncio",)
 import pytest_asyncio
+from caption_flow.models import Caption, JobId, ProcessingStage
+from caption_flow.processors import WorkAssignment, WorkUnit
+from caption_flow.storage import StorageManager
 
 # Import the modules to test
 from caption_flow.workers.caption import (
     CaptionWorker,
     ProcessingItem,
-    MultiStageVLLMManager,
 )
-from caption_flow.models import ProcessingStage, StageResult, Caption, JobId
-from caption_flow.processors import WorkUnit, WorkAssignment
-from caption_flow.storage import StorageManager
 
 
 class TestCaptionWorker:
@@ -487,7 +480,7 @@ class TestCaptionWorker:
             assigned_at=datetime.now(_datetime.UTC),
         )
 
-        data = {
+        {
             "type": "work_assignment",
             "assignment": assignment.to_dict(),
         }
@@ -650,7 +643,17 @@ class TestCaptionWorkerProcessors:
             },
         }
 
-        await worker._handle_welcome(welcome_data)
+        # Mock the heavy initialization operations to speed up CI
+        with patch(
+            "caption_flow.processors.local_filesystem.LocalFilesystemWorkerProcessor.initialize"
+        ) as mock_init:
+            # Just set the required attributes without full initialization
+            def mock_initialize(config):
+                worker.processor.dataset_path = "/tmp/images"
+
+            mock_init.side_effect = mock_initialize
+
+            await worker._handle_welcome(welcome_data)
 
         assert worker.processor_type == "local_filesystem"
         assert worker.processor is not None

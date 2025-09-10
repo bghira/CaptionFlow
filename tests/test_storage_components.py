@@ -1,17 +1,14 @@
-import pytest
 import asyncio
-import tempfile
-from pathlib import Path
-from collections import defaultdict
-import threading
-import time
-from typing import Set, List, Dict
 import datetime as _datetime
+import tempfile
+from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
+import pytest
+from caption_flow.models import Caption, JobId
 from caption_flow.processors import ProcessorConfig
 from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
-from caption_flow.models import JobId, Caption, Contributor
 from caption_flow.storage import StorageManager
 from caption_flow.utils import ChunkTracker
 
@@ -27,17 +24,12 @@ class TestHuggingFaceWithRealStorage:
     """Test with real StorageManager to uncover duplicate issues."""
 
     @pytest.mark.asyncio
-    async def test_concurrent_workers_same_token_real_storage(self, temp_checkpoint_dir):
-        """Test multiple workers with same token using real storage components."""
-
-        # Create real storage manager
+    async def _setup_storage_and_processor(self, temp_checkpoint_dir):
+        """Setup storage manager and processor for testing."""
         storage_dir = temp_checkpoint_dir / "storage"
-        storage = StorageManager(
-            data_dir=storage_dir, caption_buffer_size=10  # Small buffer to force frequent flushes
-        )
+        storage = StorageManager(data_dir=storage_dir, caption_buffer_size=10)
         await storage.initialize()
 
-        # Orchestrator config
         config = {
             "dataset": {
                 "processor_type": "huggingface_datasets",
@@ -46,25 +38,24 @@ class TestHuggingFaceWithRealStorage:
                 "dataset_split": None,
             },
             "checkpoint_dir": str(temp_checkpoint_dir / "checkpoints"),
-            "chunk_size": 100,  # Small chunks
+            "chunk_size": 100,
             "min_chunk_buffer": 10,
             "chunk_buffer_multiplier": 2,
         }
 
-        # Initialize processor
         processor = HuggingFaceDatasetOrchestratorProcessor()
         processor_config = ProcessorConfig(processor_type="huggingface_datasets", config=config)
         processor.initialize(processor_config, storage)
 
-        # Wait for initial units
-        await asyncio.sleep(2)
+        await asyncio.sleep(2)  # Wait for initial units
+        return storage, processor, config
 
-        # Create multiple worker IDs with same base name
-        base_name = "shared_worker"
+    def _create_worker_ids(self, base_name="shared_worker", count=3):
+        """Create multiple worker IDs with same base name."""
+        import uuid
+
         worker_ids = []
-        for i in range(3):
-            import uuid
-
+        for _ in range(count):
             worker_id = f"{base_name}_{str(uuid.uuid4())[:8]}"
             worker_ids.append(worker_id)
 
@@ -72,7 +63,10 @@ class TestHuggingFaceWithRealStorage:
         for wid in worker_ids:
             print(f"  {wid}")
 
-        # Phase 1: Assign work to all workers
+        return worker_ids
+
+    def _assign_work_to_workers(self, processor, worker_ids):
+        """Assign work units to all workers."""
         print("\nPhase 1: Assigning work")
         worker_units = {}
         all_expected_job_ids = set()
@@ -82,7 +76,6 @@ class TestHuggingFaceWithRealStorage:
             worker_units[worker_id] = units
             print(f"  {worker_id}: {len(units)} units")
 
-            # Track expected job IDs
             for unit in units:
                 for i in range(unit.data["chunk_size"]):
                     job_id_obj = JobId(
@@ -93,18 +86,18 @@ class TestHuggingFaceWithRealStorage:
                     all_expected_job_ids.add(job_id_obj.get_sample_str())
 
         print(f"Total expected job IDs: {len(all_expected_job_ids)}")
+        return worker_units, all_expected_job_ids
 
-        # Phase 2: Simulate concurrent result submission
+    async def _simulate_concurrent_submission(self, storage, processor, worker_units, config):
+        """Simulate concurrent result submission from multiple workers."""
         print("\nPhase 2: Concurrent result submission")
 
         async def worker_submit_results(worker_id, units):
-            """Simulate a worker processing and submitting results."""
             submitted = 0
-            contributor_id = worker_id.rsplit("_", 1)[0]  # Extract base name
+            contributor_id = worker_id.rsplit("_", 1)[0]
 
             for unit in units:
-                # Process items in the unit
-                items_to_process = min(20, unit.data["chunk_size"])  # Process first 20
+                items_to_process = min(20, unit.data["chunk_size"])
 
                 for i in range(items_to_process):
                     try:
@@ -115,7 +108,6 @@ class TestHuggingFaceWithRealStorage:
                             sample_id=str(sample_idx),
                         )
 
-                        # Create caption
                         caption = Caption(
                             job_id=job_id_obj,
                             dataset=config["dataset"]["dataset_path"],
@@ -124,23 +116,19 @@ class TestHuggingFaceWithRealStorage:
                             item_key=str(sample_idx),
                             captions=[f"Caption by {worker_id}"],
                             outputs={"captions": [f"Caption by {worker_id}"]},
-                            contributor_id=contributor_id,  # Same for all workers!
+                            contributor_id=contributor_id,
                             timestamp=datetime.now(_datetime.UTC),
                             caption_count=1,
                             processing_time_ms=100.0,
                             metadata={"worker_id": worker_id},
                         )
 
-                        # Submit to storage
                         await storage.save_caption(caption)
                         submitted += 1
 
-                        # Update chunk tracker
                         if processor.chunk_tracker:
-                            # This simulates what handle_result does
                             processor.chunk_tracker.mark_items_processed(unit.chunk_id, i, i)
 
-                        # Small delay to increase chance of race conditions
                         await asyncio.sleep(0.001)
 
                     except Exception as e:
@@ -148,30 +136,26 @@ class TestHuggingFaceWithRealStorage:
 
             return submitted
 
-        # Submit concurrently
-        submit_tasks = []
-        for worker_id, units in worker_units.items():
-            task = worker_submit_results(worker_id, units)
-            submit_tasks.append(task)
+        submit_tasks = [
+            worker_submit_results(worker_id, units) for worker_id, units in worker_units.items()
+        ]
 
         submit_results = await asyncio.gather(*submit_tasks)
         total_submitted = sum(submit_results)
         print(f"Total items submitted: {total_submitted}")
 
-        # Force storage checkpoint to flush buffers
         await storage.checkpoint()
+        return total_submitted
 
-        # Phase 3: Check for duplicates in storage
+    async def _check_for_duplicates(self, storage, processor):
+        """Check storage for duplicate job IDs."""
         print("\nPhase 3: Checking for duplicates")
 
-        # Get all processed job IDs from storage
         stored_job_ids = storage.get_all_processed_job_ids()
         print(f"Job IDs in storage: {len(stored_job_ids)}")
 
-        # Check storage contents in detail
         contents = await storage.get_storage_contents(limit=1000)
 
-        # Count job IDs
         job_id_counts = defaultdict(int)
         job_id_to_contributors = defaultdict(set)
 
@@ -185,10 +169,9 @@ class TestHuggingFaceWithRealStorage:
             job_id_counts[job_id_str] += 1
             job_id_to_contributors[job_id_str].add(row.get("contributor_id"))
 
-        # Find duplicates
         duplicate_job_ids = {jid: count for jid, count in job_id_counts.items() if count > 1}
 
-        print(f"\nDuplicate analysis:")
+        print("\nDuplicate analysis:")
         print(f"  Unique job IDs in storage: {len(job_id_counts)}")
         print(f"  Job IDs with duplicates: {len(duplicate_job_ids)}")
 
@@ -198,16 +181,26 @@ class TestHuggingFaceWithRealStorage:
                 print(f"  {job_id}: {count} times")
                 print(f"    Contributors: {job_id_to_contributors[job_id]}")
 
-        # Check chunk tracker state
         if processor.chunk_tracker:
             tracker_stats = processor.chunk_tracker.get_stats()
             print(f"\nChunk tracker stats: {tracker_stats}")
 
-        # Cleanup
+        return duplicate_job_ids
+
+    @pytest.mark.asyncio
+    async def test_concurrent_workers_same_token_real_storage(self, temp_checkpoint_dir):
+        """Test multiple workers with same token using real storage components."""
+        storage, processor, config = await self._setup_storage_and_processor(temp_checkpoint_dir)
+
+        worker_ids = self._create_worker_ids()
+        worker_units, all_expected_job_ids = self._assign_work_to_workers(processor, worker_ids)
+
+        await self._simulate_concurrent_submission(storage, processor, worker_units, config)
+        duplicate_job_ids = await self._check_for_duplicates(storage, processor)
+
         processor.stop_creation.set()
         await storage.close()
 
-        # Assertions
         assert (
             len(duplicate_job_ids) == 0
         ), f"Found {len(duplicate_job_ids)} duplicate job IDs in storage"
@@ -215,7 +208,6 @@ class TestHuggingFaceWithRealStorage:
     @pytest.mark.asyncio
     async def test_storage_chunk_tracker_sync_issues(self, temp_checkpoint_dir):
         """Test synchronization issues between storage and chunk tracker."""
-
         # Create storage
         storage_dir = temp_checkpoint_dir / "storage"
         storage = StorageManager(data_dir=storage_dir, caption_buffer_size=5)  # Very small buffer
@@ -276,7 +268,10 @@ class TestHuggingFaceWithRealStorage:
         # Multiple workers updating same chunk
         for i in range(3):
             task = update_storage_and_tracker(
-                f"worker_{i}", "shard1:chunk:0", i * 10, 10  # Different ranges
+                f"worker_{i}",
+                "shard1:chunk:0",
+                i * 10,
+                10,  # Different ranges
             )
             tasks.append(task)
 
@@ -285,7 +280,7 @@ class TestHuggingFaceWithRealStorage:
             task = update_storage_and_tracker(f"worker_{i+3}", "shard1:chunk:1", i * 20, 20)
             tasks.append(task)
 
-        all_results = await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
 
         # Force checkpoint
         await storage.checkpoint()

@@ -1,14 +1,15 @@
 """SSL certificate management."""
 
+import datetime as _datetime
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
 from cryptography import x509
-from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from datetime import datetime, timedelta
-import datetime as _datetime
+from cryptography.x509.oid import NameOID
 
 
 class CertificateManager:
@@ -72,14 +73,15 @@ class CertificateManager:
     def generate_letsencrypt(
         self, domain: str, email: str, output_dir: Optional[Path] = None, staging: bool = False
     ) -> tuple[Path, Path]:
-        """
-        Generate Let's Encrypt certificate.
+        """Generate Let's Encrypt certificate.
 
         Args:
+        ----
             domain: Domain name for certificate
             email: Email for Let's Encrypt account
             output_dir: Custom output directory (uses /etc/letsencrypt by default)
             staging: Use Let's Encrypt staging server for testing
+
         """
         cmd = [
             "certbot",
@@ -134,8 +136,12 @@ class CertificateManager:
         return {
             "subject": cert.subject.rfc4514_string(),
             "issuer": cert.issuer.rfc4514_string(),
-            "not_before": cert.not_valid_before,
-            "not_after": cert.not_valid_after,
+            "not_before": cert.not_valid_before_utc,
+            "not_after": cert.not_valid_after_utc,
             "serial_number": cert.serial_number,
             "is_self_signed": cert.issuer == cert.subject,
         }
+
+    def inspect_certificate(self, cert_path: Path) -> dict:
+        """Inspect a certificate (alias for get_cert_info for CLI compatibility)."""
+        return self.get_cert_info(cert_path)

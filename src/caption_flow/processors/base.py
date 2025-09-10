@@ -2,9 +2,8 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional, Iterator, Tuple
 from datetime import datetime
-from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional
 
 
 @dataclass
@@ -98,9 +97,7 @@ class WorkResult:
         return self.error is None and bool(self.outputs)
 
     def to_repr(self, filter_outputs: bool = True):
-        """
-        Print the WorkResult, optionally without captions to save on screen wall-of-text dumpage.
-        """
+        """Print the WorkResult, optionally without captions to save on screen wall-of-text dumpage."""
         if filter_outputs:
             outputs = "...filtered from logs..."
         else:
@@ -181,18 +178,20 @@ class WorkerProcessor(ABC):
 
     @abstractmethod
     def process_unit(self, unit: WorkUnit, context: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
-        """
-        Process a single work unit, yielding items to be captioned.
+        """Process a single work unit, yielding items to be captioned.
 
         Args:
+        ----
             unit: The work unit to process
             context: Runtime context (e.g., models, sampling params)
 
         Yields:
+        ------
             Dict containing:
                 - image: PIL Image
                 - metadata: Dict of metadata
                 - item_key: Unique identifier for this item
+
         """
         pass
 

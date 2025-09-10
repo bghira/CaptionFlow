@@ -1,19 +1,20 @@
 """Storage exporter for Lance datasets to various formats."""
 
-import json
 import csv
-import os
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+import json
 import logging
-import pandas as pd
-import numpy as np
-from urllib.parse import urlparse
+import os
 import tempfile
-import lance
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
 
+import lance
+import numpy as np
+import pandas as pd
+
+from ..models import ExportError, StorageContents
 from .manager import StorageManager
-from ..models import StorageContents, ExportError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -26,7 +27,9 @@ class LanceStorageExporter:
         """Initialize exporter with storage manager.
 
         Args:
+        ----
             storage_manager: StorageManager instance
+
         """
         self.storage_manager = storage_manager
 
@@ -42,6 +45,7 @@ class LanceStorageExporter:
         """Export a single shard to specified format.
 
         Args:
+        ----
             shard_name: Name of the shard to export
             format: Export format ('jsonl', 'json', 'csv', 'parquet', 'txt')
             output_path: Output file or directory path
@@ -50,10 +54,12 @@ class LanceStorageExporter:
             **kwargs: Format-specific options
 
         Returns:
+        -------
             Number of items exported
+
         """
         logger.debug(f"Getting shard contents for {shard_name}")
-        self.storage_manager.initialize()
+        await self.storage_manager.initialize()
         contents = await self.storage_manager.get_shard_contents(
             shard_name, limit=limit, columns=columns
         )
@@ -108,6 +114,7 @@ class LanceStorageExporter:
         """Export all shards (or filtered shards) to specified format.
 
         Args:
+        ----
             format: Export format
             output_path: Base output path
             columns: Columns to export
@@ -116,7 +123,9 @@ class LanceStorageExporter:
             **kwargs: Format-specific options
 
         Returns:
+        -------
             Dictionary mapping shard names to export counts
+
         """
         results = {}
 
@@ -186,12 +195,15 @@ class LanceStorageExporter:
         """Export to a new Lance dataset, optionally filtering shards.
 
         Args:
+        ----
             output_path: Path for the output Lance dataset
             columns: Specific columns to include
             shard_filter: List of shard names to include
 
         Returns:
+        -------
             Total number of rows exported
+
         """
         output_path = Path(output_path)
         if output_path.exists():
@@ -246,6 +258,7 @@ class LanceStorageExporter:
         """Export to Hugging Face Hub with per-shard parquet files.
 
         Args:
+        ----
             dataset_name: Name for the dataset (e.g., "username/dataset-name")
             token: Hugging Face API token
             license: License for the dataset
@@ -258,11 +271,13 @@ class LanceStorageExporter:
             max_shard_size_gb: Max size per parquet file in GB
 
         Returns:
+        -------
             URL of the uploaded dataset
+
         """
         try:
-            from huggingface_hub import HfApi, DatasetCard, create_repo
             import pyarrow.parquet as pq
+            from huggingface_hub import DatasetCard, HfApi, create_repo
         except ImportError:
             raise ExportError(
                 "huggingface_hub is required for HF export. "
@@ -272,10 +287,8 @@ class LanceStorageExporter:
         api = HfApi(token=token)
 
         # Check/create repo
-        repo_exists = False
         try:
             api.dataset_info(dataset_name)
-            repo_exists = True
             logger.info(f"Dataset {dataset_name} already exists, will update it")
         except:
             logger.info(f"Creating new dataset: {dataset_name}")

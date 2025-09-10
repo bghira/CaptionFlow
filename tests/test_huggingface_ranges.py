@@ -1,8 +1,9 @@
 """Tests for HuggingFace processor range calculations to prevent negative total_processed."""
 
-import pytest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import pytest
 from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
 from caption_flow.utils.chunk_tracker import ChunkTracker
 
@@ -312,9 +313,9 @@ class TestHuggingFaceRanges:
         # Include duplicate indices
         duplicate_job_ids = {
             "test_shard:chunk:0:idx:100",
-            "test_shard:chunk:0:idx:100",  # Duplicate
+            # Duplicate
             "test_shard:chunk:0:idx:101",
-            "test_shard:chunk:0:idx:101",  # Duplicate
+            # Duplicate
             "test_shard:chunk:0:idx:102",
         }
 

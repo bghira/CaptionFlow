@@ -1,37 +1,23 @@
 """Comprehensive tests for processor compatibility and chunk tracking."""
 
-import pytest
-import asyncio
-import tempfile
-import shutil
-import json
-import os
-from pathlib import Path
-from datetime import datetime
 import datetime as _datetime
-from unittest.mock import Mock, AsyncMock, patch, MagicMock, PropertyMock
-from typing import Dict, Any, List, Set
-from collections import defaultdict
+import io
+import shutil
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import Mock, patch
+
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from PIL import Image
-import io
 
 # Import pytest-asyncio
 pytest_plugins = ("pytest_asyncio",)
 import pytest_asyncio
-
-# Import the modules to test
-from caption_flow.storage import StorageManager
-from caption_flow.models import Caption, Contributor, JobId, ProcessingStage, StageResult
-from caption_flow.processors import WorkUnit, WorkAssignment, ProcessorConfig, WorkResult
-from caption_flow.utils.chunk_tracker import ChunkTracker, ChunkState
-
-# Import processor implementations
-from caption_flow.processors.webdataset import (
-    WebDatasetOrchestratorProcessor,
-    WebDatasetWorkerProcessor,
-)
+from caption_flow.models import Caption, JobId
+from caption_flow.processors import ProcessorConfig, WorkResult, WorkUnit
 from caption_flow.processors.huggingface import (
     HuggingFaceDatasetOrchestratorProcessor,
     HuggingFaceDatasetWorkerProcessor,
@@ -40,6 +26,16 @@ from caption_flow.processors.local_filesystem import (
     LocalFilesystemOrchestratorProcessor,
     LocalFilesystemWorkerProcessor,
 )
+
+# Import processor implementations
+from caption_flow.processors.webdataset import (
+    WebDatasetOrchestratorProcessor,
+    WebDatasetWorkerProcessor,
+)
+
+# Import the modules to test
+from caption_flow.storage import StorageManager
+from caption_flow.utils.chunk_tracker import ChunkTracker
 
 
 class ProcessorTestBase:
@@ -406,8 +402,6 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
         dummy_parquet = temp_dir / "data.parquet"
 
         # Create a simple parquet file with PyArrow
-        import pyarrow as pa
-        import pyarrow.parquet as pq
 
         # Create a dummy table
         table = pa.table({"dummy": pa.array([1] * 1000)})
@@ -442,15 +436,14 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
         dummy_parquet = temp_dir / "data.parquet"
 
         # Create a parquet file with test data
-        import pyarrow as pa
-        import pyarrow.parquet as pq
 
         # Create test data with image bytes
         data = []
         for i in range(100):
             # Create a tiny test image
-            from PIL import Image
             import io
+
+            from PIL import Image
 
             img = Image.new("RGB", (10, 10), color=(i, i, i))
             img_bytes = io.BytesIO()
@@ -611,11 +604,13 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
         """Test HTTP server setup for image serving."""
         orchestrator = LocalFilesystemOrchestratorProcessor()
 
-        with patch("uvicorn.Config") as mock_config:
-            with patch("uvicorn.Server") as mock_server:
-                with patch("asyncio.new_event_loop") as mock_loop:
-                    # Make mock_loop return a proper event loop
-                    mock_loop.return_value = asyncio.new_event_loop()
+        with patch("uvicorn.Config"):
+            with patch("uvicorn.Server"):
+                with patch(
+                    "caption_flow.processors.local_filesystem.threading.Thread"
+                ) as mock_thread:
+                    # Mock the threading to prevent actual thread creation
+                    mock_thread.return_value.start = Mock()
 
                     orchestrator.initialize(orchestrator_config, storage_manager)
 
@@ -765,7 +760,7 @@ class TestCrossProcessorCompatibility(ProcessorTestBase):
             "local_filesystem": "local",
         }
 
-        for proc_type, shard_id in processor_shards.items():
+        for _proc_type, shard_id in processor_shards.items():
             for i in range(3):
                 caption = self.create_mock_caption(shard_id, "0", str(i), i)
                 await storage.save_caption(caption)

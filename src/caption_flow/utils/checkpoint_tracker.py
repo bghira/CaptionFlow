@@ -1,14 +1,14 @@
 """Base class for checkpoint tracking with persistent state."""
 
+import datetime as _datetime
 import json
 import logging
-from abc import ABC, abstractmethod
 import os
-from pathlib import Path
-from typing import Dict, Any, Optional
-from datetime import datetime
-import datetime as _datetime
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())

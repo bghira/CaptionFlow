@@ -1,20 +1,18 @@
 """DataWorker for retrieving data from various sources and forwarding to orchestrator or storage."""
 
 import asyncio
+import io
 import json
 import logging
-import io
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, AsyncIterator
-from queue import Queue, Empty
-from threading import Thread, Event
+from queue import Empty, Queue
+from threading import Event
+from typing import Any, AsyncIterator, Dict, Optional
 
+import boto3
 import pandas as pd
 import pyarrow.parquet as pq
-from PIL import Image
-import boto3
 from botocore.config import Config
 
 from .base import BaseWorker
@@ -179,7 +177,7 @@ class DataWorker(BaseWorker):
                         try:
                             self.send_queue.put_nowait(batch)
                             batch = []
-                        except:
+                        except Exception:
                             # Queue full, wait
                             await asyncio.sleep(1)
 

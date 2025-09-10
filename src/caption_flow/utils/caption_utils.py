@@ -1,6 +1,6 @@
 """Caption processing utilities from the original vLLM script."""
 
-from typing import List, Dict
+from typing import Dict, List
 
 
 class CaptionUtils:

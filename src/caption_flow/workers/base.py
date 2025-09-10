@@ -4,13 +4,12 @@ import asyncio
 import json
 import logging
 import ssl
-import time
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
 from threading import Event
+from typing import Any, Dict, Optional
 
 import websockets
-from websockets.client import WebSocketClientProtocol
+from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +30,7 @@ class BaseWorker(ABC):
 
         # State
         self.worker_id: Optional[str] = None
-        self.websocket: Optional[WebSocketClientProtocol] = None
+        self.websocket: Optional[ClientConnection] = None
         self.running = False
         self.connected = Event()
         self.main_loop: Optional[asyncio.AbstractEventLoop] = None
