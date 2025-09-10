@@ -252,8 +252,10 @@ class ChunkTracker(CheckpointTracker):
         now = datetime.now(_datetime.UTC)
         time_since_last_save = (now - self._last_save).total_seconds()
 
-        if (self._pending_changes >= self._save_batch_size or
-            time_since_last_save >= self._auto_save_interval):
+        if (
+            self._pending_changes >= self._save_batch_size
+            or time_since_last_save >= self._auto_save_interval
+        ):
             self._do_save()
 
     def _do_save(self) -> bool:

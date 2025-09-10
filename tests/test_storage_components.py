@@ -268,7 +268,10 @@ class TestHuggingFaceWithRealStorage:
         # Multiple workers updating same chunk
         for i in range(3):
             task = update_storage_and_tracker(
-                f"worker_{i}", "shard1:chunk:0", i * 10, 10  # Different ranges
+                f"worker_{i}",
+                "shard1:chunk:0",
+                i * 10,
+                10,  # Different ranges
             )
             tasks.append(task)
 

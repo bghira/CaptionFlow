@@ -897,7 +897,8 @@ class TestHuggingFaceWithRealStorage:
         # Create real storage manager
         storage_dir = temp_checkpoint_dir / "storage"
         storage = StorageManager(
-            data_dir=storage_dir, caption_buffer_size=10  # Small buffer to force frequent flushes
+            data_dir=storage_dir,
+            caption_buffer_size=10,  # Small buffer to force frequent flushes
         )
         await storage.initialize()
 

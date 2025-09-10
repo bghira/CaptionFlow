@@ -80,8 +80,7 @@ def orchestrator_config(temp_checkpoint_dir):
 
 @pytest.mark.asyncio
 async def test_fix_prevents_duplicate_assignments(orchestrator_config, temp_checkpoint_dir):
-    """Test that our fix prevents workers from being assigned work that's already completed.
-    """
+    """Test that our fix prevents workers from being assigned work that's already completed."""
     print("\n" + "=" * 80)
     print("TESTING FIX: DUPLICATE ASSIGNMENT PREVENTION")
     print("=" * 80)
@@ -286,8 +285,7 @@ async def test_fix_prevents_duplicate_assignments(orchestrator_config, temp_chec
 
 @pytest.mark.asyncio
 async def test_chunk_tracker_sync_with_storage(orchestrator_config, temp_checkpoint_dir):
-    """Test that chunk tracker properly syncs with storage during release_assignments.
-    """
+    """Test that chunk tracker properly syncs with storage during release_assignments."""
     print("\n" + "=" * 60)
     print("TESTING CHUNK TRACKER STORAGE SYNC")
     print("=" * 60)

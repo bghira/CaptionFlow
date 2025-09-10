@@ -774,10 +774,10 @@ class CaptionWorker(BaseWorker):
                     # Fallback to tokenizer
                     prompt_length = len(tokenizer.encode(test_req.get("prompt", "")))
 
-                # Account for all prompts (multiply by number of prompts as upper bound)
-                estimated_total = prompt_length * len(stage.prompts)
-
-                if estimated_total < max_length:
+                # Check individual prompt length (prompts are processed one by one)
+                # Use a small safety buffer to account for token estimation variations
+                safety_buffer = 50
+                if prompt_length < max_length - safety_buffer:
                     processable.append(item)
                     logger.debug(
                         f"Item {item.item_key} validated: {prompt_length} tokens per prompt"
@@ -785,8 +785,8 @@ class CaptionWorker(BaseWorker):
                 else:
                     too_long.append(item)
                     logger.warning(
-                        f"Item {item.item_key} too long: {prompt_length} tokens per prompt, "
-                        f"estimated {estimated_total} total vs max {max_length}"
+                        f"Item {item.item_key} too long: {prompt_length} tokens "
+                        f"vs max {max_length - safety_buffer} (with safety buffer)"
                     )
 
             except Exception as e:
