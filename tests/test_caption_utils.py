@@ -317,17 +317,13 @@ class TestCaptionUtilsValidateCaption:
     def test_validate_borderline_cases(self):
         """Test validation of borderline cases."""
         # Should pass - contains refusal word but in valid context
-        assert (
-            CaptionUtils.validate_caption(
-                "the warrior refuses to surrender in this epic battle scene"
-            )
+        assert CaptionUtils.validate_caption(
+            "the warrior refuses to surrender in this epic battle scene"
         )
 
         # Should pass - contains generic word but in longer context
-        assert (
-            CaptionUtils.validate_caption(
-                "this beautiful picture shows a magnificent sunset over mountains"
-            )
+        assert CaptionUtils.validate_caption(
+            "this beautiful picture shows a magnificent sunset over mountains"
         )
 
         # Should fail - too short even though contains valid words

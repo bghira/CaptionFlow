@@ -172,7 +172,7 @@ def setup_logging(verbose: bool = False):
                 show_time=True,
             )
         ]
-        log_file = log_dir / 'caption_flow.log'
+        log_file = log_dir / "caption_flow.log"
         log_msg = f"[yellow]Warning: Could not write to log file {log_file}: {e}[/yellow]"
 
     logging.basicConfig(
@@ -315,6 +315,68 @@ def worker(ctx, config: Optional[str], **kwargs):
         asyncio.run(worker_instance.shutdown())
 
 
+def _load_monitor_config(config, server, token):
+    """Load monitor configuration from file or fallback to orchestrator config."""
+    base_config = ConfigManager.find_config("monitor", config)
+
+    if not base_config:
+        orch_config = ConfigManager.find_config("orchestrator")
+        if orch_config and "monitor" in orch_config:
+            base_config = {"monitor": orch_config["monitor"]}
+            console.print("[dim]Using monitor config from orchestrator.yaml[/dim]")
+        else:
+            base_config = {}
+            if not server or not token:
+                console.print("[yellow]No monitor config found, using CLI args[/yellow]")
+
+    return base_config.get("monitor", base_config)
+
+
+def _apply_monitor_overrides(config_data, server, token, no_verify_ssl):
+    """Apply CLI overrides to monitor configuration."""
+    if server:
+        config_data["server"] = server
+    if token:
+        config_data["token"] = token
+    if no_verify_ssl:
+        config_data["verify_ssl"] = False
+
+
+def _debug_monitor_config(config_data):
+    """Print debug information about monitor configuration."""
+    console.print("\n[cyan]Final monitor configuration:[/cyan]")
+    console.print(f"  Server: {config_data.get('server', 'NOT SET')}")
+    console.print(
+        f"  Token: {'***' + config_data.get('token', '')[-4:] if config_data.get('token') else 'NOT SET'}"
+    )
+    console.print(f"  Verify SSL: {config_data.get('verify_ssl', True)}")
+    console.print()
+
+
+def _validate_monitor_config(config_data):
+    """Validate required monitor configuration fields."""
+    if not config_data.get("server"):
+        console.print("[red]Error: --server required (or set 'server' in monitor.yaml)[/red]")
+        console.print("\n[dim]Example monitor.yaml:[/dim]")
+        console.print("server: wss://localhost:8765")
+        console.print("token: your-token-here")
+        sys.exit(1)
+
+    if not config_data.get("token"):
+        console.print("[red]Error: --token required (or set 'token' in monitor.yaml)[/red]")
+        console.print("\n[dim]Example monitor.yaml:[/dim]")
+        console.print("server: wss://localhost:8765")
+        console.print("token: your-token-here")
+        sys.exit(1)
+
+
+def _set_monitor_defaults(config_data):
+    """Set default values for optional monitor settings."""
+    config_data.setdefault("refresh_interval", 1.0)
+    config_data.setdefault("show_inactive_workers", False)
+    config_data.setdefault("max_log_lines", 100)
+
+
 @main.command()
 @click.option("--config", type=click.Path(exists=True), help="Configuration file")
 @click.option("--server", help="Orchestrator WebSocket URL")
@@ -331,72 +393,19 @@ def monitor(
     debug: bool,
 ):
     """Start the monitoring TUI."""
-    # Enable debug logging if requested
     if debug:
         setup_logging(verbose=True)
         console.print("[yellow]Debug mode enabled[/yellow]")
 
-    # Load configuration
-    base_config = ConfigManager.find_config("monitor", config)
+    config_data = _load_monitor_config(config, server, token)
+    _apply_monitor_overrides(config_data, server, token, no_verify_ssl)
 
-    if not base_config:
-        # Try to find monitor config in orchestrator config as fallback
-        orch_config = ConfigManager.find_config("orchestrator")
-        if orch_config and "monitor" in orch_config:
-            base_config = {"monitor": orch_config["monitor"]}
-            console.print("[dim]Using monitor config from orchestrator.yaml[/dim]")
-        else:
-            base_config = {}
-            if not server or not token:
-                console.print("[yellow]No monitor config found, using CLI args[/yellow]")
-
-    # Handle different config structures
-    # Case 1: Config has top-level 'monitor' section
-    if "monitor" in base_config:
-        config_data = base_config["monitor"]
-    # Case 2: Config IS the monitor config (no wrapper)
-    else:
-        config_data = base_config
-
-    # Apply CLI overrides (CLI always wins)
-    if server:
-        config_data["server"] = server
-    if token:
-        config_data["token"] = token
-    if no_verify_ssl:
-        config_data["verify_ssl"] = False
-
-    # Debug output
     if debug:
-        console.print("\n[cyan]Final monitor configuration:[/cyan]")
-        console.print(f"  Server: {config_data.get('server', 'NOT SET')}")
-        console.print(
-            f"  Token: {'***' + config_data.get('token', '')[-4:] if config_data.get('token') else 'NOT SET'}"
-        )
-        console.print(f"  Verify SSL: {config_data.get('verify_ssl', True)}")
-        console.print()
+        _debug_monitor_config(config_data)
 
-    # Validate required fields
-    if not config_data.get("server"):
-        console.print("[red]Error: --server required (or set 'server' in monitor.yaml)[/red]")
-        console.print("\n[dim]Example monitor.yaml:[/dim]")
-        console.print("server: wss://localhost:8765")
-        console.print("token: your-token-here")
-        sys.exit(1)
+    _validate_monitor_config(config_data)
+    _set_monitor_defaults(config_data)
 
-    if not config_data.get("token"):
-        console.print("[red]Error: --token required (or set 'token' in monitor.yaml)[/red]")
-        console.print("\n[dim]Example monitor.yaml:[/dim]")
-        console.print("server: wss://localhost:8765")
-        console.print("token: your-token-here")
-        sys.exit(1)
-
-    # Set defaults for optional settings
-    config_data.setdefault("refresh_interval", 1.0)
-    config_data.setdefault("show_inactive_workers", False)
-    config_data.setdefault("max_log_lines", 100)
-
-    # Create and start monitor
     try:
         monitor_instance = Monitor(config_data)
 
@@ -479,6 +488,84 @@ def view(ctx, data_dir: str, refresh_rate: int, no_images: bool):
         sys.exit(1)
 
 
+def _load_admin_credentials(config, server, token):
+    """Load admin server and token from config if not provided."""
+    if server and token:
+        return server, token
+
+    base_config = ConfigManager.find_config("orchestrator", config) or {}
+    admin_config = base_config.get("admin", {})
+    admin_tokens = base_config.get("orchestrator", {}).get("auth", {}).get("admin_tokens", [])
+
+    final_server = server or admin_config.get("server", "ws://localhost:8765")
+    final_token = token or admin_config.get("token")
+
+    if not final_token and admin_tokens:
+        console.print("Using first admin token.")
+        final_token = admin_tokens[0].get("token")
+
+    return final_server, final_token
+
+
+def _setup_ssl_context(server, no_verify_ssl):
+    """Setup SSL context for websocket connection."""
+    import ssl
+
+    ssl_context = None
+    if server.startswith("wss://"):
+        ssl_context = ssl.create_default_context()
+        if no_verify_ssl:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
+    return ssl_context
+
+
+async def _authenticate_admin(websocket, token):
+    """Authenticate as admin with the websocket."""
+    await websocket.send(json.dumps({"token": token, "role": "admin"}))
+
+    response = await websocket.recv()
+    auth_response = json.loads(response)
+
+    if "error" in auth_response:
+        console.print(f"[red]Authentication failed: {auth_response['error']}[/red]")
+        return False
+
+    console.print("[green]✓ Authenticated as admin[/green]")
+    return True
+
+
+async def _send_reload_command(websocket, new_cfg):
+    """Send reload command and handle response."""
+    await websocket.send(json.dumps({"type": "reload_config", "config": new_cfg}))
+
+    response = await websocket.recv()
+    reload_response = json.loads(response)
+
+    if reload_response.get("type") == "reload_complete":
+        if "message" in reload_response and "No changes" in reload_response["message"]:
+            console.print(f"[yellow]{reload_response['message']}[/yellow]")
+        else:
+            console.print("[green]✓ Configuration reloaded successfully![/green]")
+
+            if "updated" in reload_response and reload_response["updated"]:
+                console.print("\n[cyan]Updated sections:[/cyan]")
+                for section in reload_response["updated"]:
+                    console.print(f"  • {section}")
+
+            if "warnings" in reload_response and reload_response["warnings"]:
+                console.print("\n[yellow]Warnings:[/yellow]")
+                for warning in reload_response["warnings"]:
+                    console.print(f"  ⚠ {warning}")
+
+        return True
+    else:
+        error = reload_response.get("error", "Unknown error")
+        console.print(f"[red]Reload failed: {error} ({reload_response=})[/red]")
+        return False
+
+
 @main.command()
 @click.option("--config", type=click.Path(exists=True), help="Configuration file")
 @click.option("--server", help="Orchestrator WebSocket URL")
@@ -495,29 +582,9 @@ def reload_config(
     no_verify_ssl: bool,
 ):
     """Reload orchestrator configuration via admin connection."""
-    import ssl
-
     import websockets
 
-    # Load base config to get server/token if not provided via CLI
-    if not server or not token:
-        base_config = ConfigManager.find_config("orchestrator", config) or {}
-        admin_config = base_config.get("admin", {})
-        admin_tokens = base_config.get("orchestrator", {}).get("auth", {}).get("admin_tokens", [])
-        has_admin_tokens = False
-        if len(admin_tokens) > 0:
-            has_admin_tokens = True
-            first_admin_token = admin_tokens[0].get("token", None)
-        # Do not print sensitive admin token to console.
-
-        if not server:
-            server = admin_config.get("server", "ws://localhost:8765")
-        if not token:
-            token = admin_config.get("token", None)
-            if token is None and has_admin_tokens:
-                # grab the first one, we'll just assume we're localhost.
-                console.print("Using first admin token.")
-                token = first_admin_token
+    server, token = _load_admin_credentials(config, server, token)
 
     if not server:
         console.print("[red]Error: --server required (or set in config)[/red]")
@@ -528,66 +595,22 @@ def reload_config(
 
     console.print(f"[cyan]Loading configuration from {new_config}...[/cyan]")
 
-    # Load the new configuration
     new_cfg = ConfigManager.load_yaml(Path(new_config))
     if not new_cfg:
         console.print("[red]Failed to load configuration[/red]")
         sys.exit(1)
 
-    # Setup SSL
-    ssl_context = None
-    if server.startswith("wss://"):
-        if no_verify_ssl:
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-        else:
-            ssl_context = ssl.create_default_context()
+    ssl_context = _setup_ssl_context(server, no_verify_ssl)
 
     async def send_reload():
         try:
             async with websockets.connect(
                 server, ssl=ssl_context, ping_interval=20, ping_timeout=60, close_timeout=10
             ) as websocket:
-                # Authenticate as admin
-                await websocket.send(json.dumps({"token": token, "role": "admin"}))
-
-                response = await websocket.recv()
-                auth_response = json.loads(response)
-
-                if "error" in auth_response:
-                    console.print(f"[red]Authentication failed: {auth_response['error']}[/red]")
+                if not await _authenticate_admin(websocket, token):
                     return False
 
-                console.print("[green]✓ Authenticated as admin[/green]")
-
-                # Send reload command
-                await websocket.send(json.dumps({"type": "reload_config", "config": new_cfg}))
-
-                response = await websocket.recv()
-                reload_response = json.loads(response)
-
-                if reload_response.get("type") == "reload_complete":
-                    if "message" in reload_response and "No changes" in reload_response["message"]:
-                        console.print(f"[yellow]{reload_response['message']}[/yellow]")
-                    else:
-                        console.print("[green]✓ Configuration reloaded successfully![/green]")
-
-                        if "updated" in reload_response and reload_response["updated"]:
-                            console.print("\n[cyan]Updated sections:[/cyan]")
-                            for section in reload_response["updated"]:
-                                console.print(f"  • {section}")
-
-                        if "warnings" in reload_response and reload_response["warnings"]:
-                            console.print("\n[yellow]Warnings:[/yellow]")
-                            for warning in reload_response["warnings"]:
-                                console.print(f"  ⚠ {warning}")
-
-                    return True
-                else:
-                    error = reload_response.get("error", "Unknown error")
-                    console.print(f"[red]Reload failed: {error} ({reload_response=})[/red]")
-                    return False
+                return await _send_reload_command(websocket, new_cfg)
 
         except Exception as e:
             console.print(f"[red]Error: {e}[/red]")
@@ -598,37 +621,17 @@ def reload_config(
         sys.exit(1)
 
 
-@main.command()
-@click.option("--data-dir", default="./caption_data", help="Storage directory")
-@click.option("--checkpoint-dir", default="./checkpoints", help="Checkpoint directory")
-@click.option("--fix", is_flag=True, help="Fix issues by resetting abandoned chunks")
-@click.option("--verbose", is_flag=True, help="Show detailed information")
-def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
-    """Scan for sparse or abandoned chunks and optionally fix them."""
-    import pyarrow.parquet as pq
-
-    from .storage import StorageManager
-    from .utils.chunk_tracker import ChunkTracker
-
-    console.print("[bold cyan]Scanning for sparse/abandoned chunks...[/bold cyan]\n")
-
-    checkpoint_path = Path(checkpoint_dir) / "chunks.json"
-    if not checkpoint_path.exists():
-        console.print("[red]No chunk checkpoint found![/red]")
-        return
-
-    tracker = ChunkTracker(checkpoint_path)
-    storage = StorageManager(Path(data_dir))
-
-    # Get and display stats
-    stats = tracker.get_stats()
+def _display_chunk_stats(stats):
+    """Display chunk statistics."""
     console.print(f"[green]Total chunks:[/green] {stats['total']}")
     console.print(f"[green]Completed:[/green] {stats['completed']}")
     console.print(f"[yellow]Pending:[/yellow] {stats['pending']}")
     console.print(f"[yellow]Assigned:[/yellow] {stats['assigned']}")
     console.print(f"[red]Failed:[/red] {stats['failed']}\n")
 
-    # Find abandoned chunks
+
+def _find_abandoned_chunks(tracker):
+    """Find chunks that have been assigned for too long."""
     abandoned_chunks = []
     stale_threshold = 3600  # 1 hour
     current_time = datetime.now(_datetime.UTC)
@@ -639,24 +642,31 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
             if age > stale_threshold:
                 abandoned_chunks.append((chunk_id, chunk_state, age))
 
-    if abandoned_chunks:
-        console.print(f"[red]Found {len(abandoned_chunks)} abandoned chunks:[/red]")
-        for chunk_id, chunk_state, age in abandoned_chunks[:10]:
-            age_str = f"{age/3600:.1f} hours" if age > 3600 else f"{age/60:.1f} minutes"
-            console.print(f"  • {chunk_id} (assigned to {chunk_state.assigned_to} {age_str} ago)")
+    return abandoned_chunks
 
-        if len(abandoned_chunks) > 10:
-            console.print(f"  ... and {len(abandoned_chunks) - 10} more")
 
-        if fix:
-            console.print("\n[yellow]Resetting abandoned chunks to pending...[/yellow]")
-            for chunk_id, _, _ in abandoned_chunks:
-                tracker.mark_failed(chunk_id)
-            console.print(f"[green]✓ Reset {len(abandoned_chunks)} chunks[/green]")
+def _display_abandoned_chunks(abandoned_chunks, fix, tracker):
+    """Display abandoned chunks and optionally fix them."""
+    if not abandoned_chunks:
+        return
 
-    # Check for sparse shards
-    console.print("\n[bold cyan]Checking for sparse shards...[/bold cyan]")
+    console.print(f"[red]Found {len(abandoned_chunks)} abandoned chunks:[/red]")
+    for chunk_id, chunk_state, age in abandoned_chunks[:10]:
+        age_str = f"{age/3600:.1f} hours" if age > 3600 else f"{age/60:.1f} minutes"
+        console.print(f"  • {chunk_id} (assigned to {chunk_state.assigned_to} {age_str} ago)")
 
+    if len(abandoned_chunks) > 10:
+        console.print(f"  ... and {len(abandoned_chunks) - 10} more")
+
+    if fix:
+        console.print("\n[yellow]Resetting abandoned chunks to pending...[/yellow]")
+        for chunk_id, _, _ in abandoned_chunks:
+            tracker.mark_failed(chunk_id)
+        console.print(f"[green]✓ Reset {len(abandoned_chunks)} chunks[/green]")
+
+
+def _find_sparse_shards(tracker):
+    """Find shards with gaps or issues."""
     shards_summary = tracker.get_shards_summary()
     sparse_shards = []
 
@@ -675,60 +685,108 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
             if has_gaps or shard_info["failed_chunks"] > 0:
                 sparse_shards.append((shard_name, shard_info, has_gaps))
 
-    if sparse_shards:
-        console.print(f"\n[yellow]Found {len(sparse_shards)} sparse/incomplete shards:[/yellow]")
-        for shard_name, shard_info, has_gaps in sparse_shards[:5]:
-            status = []
-            if shard_info["pending_chunks"] > 0:
-                status.append(f"{shard_info['pending_chunks']} pending")
-            if shard_info["assigned_chunks"] > 0:
-                status.append(f"{shard_info['assigned_chunks']} assigned")
-            if shard_info["failed_chunks"] > 0:
-                status.append(f"{shard_info['failed_chunks']} failed")
-            if has_gaps:
-                status.append("has gaps")
+    return sparse_shards
 
-            console.print(f"  • {shard_name}: {', '.join(status)}")
+
+def _display_sparse_shards(sparse_shards):
+    """Display sparse/incomplete shards."""
+    if not sparse_shards:
+        return
+
+    console.print(f"\n[yellow]Found {len(sparse_shards)} sparse/incomplete shards:[/yellow]")
+    for shard_name, shard_info, has_gaps in sparse_shards[:5]:
+        status = []
+        if shard_info["pending_chunks"] > 0:
+            status.append(f"{shard_info['pending_chunks']} pending")
+        if shard_info["assigned_chunks"] > 0:
+            status.append(f"{shard_info['assigned_chunks']} assigned")
+        if shard_info["failed_chunks"] > 0:
+            status.append(f"{shard_info['failed_chunks']} failed")
+        if has_gaps:
+            status.append("has gaps")
+
+        console.print(f"  • {shard_name}: {', '.join(status)}")
+        console.print(
+            f"    Progress: {shard_info['completed_chunks']}/{shard_info['total_chunks']} chunks"
+        )
+
+    if len(sparse_shards) > 5:
+        console.print(f"  ... and {len(sparse_shards) - 5} more")
+
+
+def _cross_check_storage(storage, tracker, fix):
+    """Cross-check chunk tracker against storage."""
+    import pyarrow.parquet as pq
+
+    console.print("\n[bold cyan]Cross-checking with stored captions...[/bold cyan]")
+
+    try:
+        table = pq.read_table(storage.captions_path, columns=["chunk_id"])
+        stored_chunk_ids = set(c for c in table["chunk_id"].to_pylist() if c)
+
+        tracker_completed = set(c for c, s in tracker.chunks.items() if s.status == "completed")
+
+        missing_in_storage = tracker_completed - stored_chunk_ids
+        missing_in_tracker = stored_chunk_ids - set(tracker.chunks.keys())
+
+        if missing_in_storage:
             console.print(
-                f"    Progress: {shard_info['completed_chunks']}/{shard_info['total_chunks']} chunks"
+                f"\n[red]Chunks marked complete but missing from storage:[/red] {len(missing_in_storage)}"
+            )
+            for chunk_id in list(missing_in_storage)[:5]:
+                console.print(f"  • {chunk_id}")
+
+            if fix:
+                console.print("[yellow]Resetting these chunks to pending...[/yellow]")
+                for chunk_id in missing_in_storage:
+                    tracker.mark_failed(chunk_id)
+                console.print(f"[green]✓ Reset {len(missing_in_storage)} chunks[/green]")
+
+        if missing_in_tracker:
+            console.print(
+                f"\n[yellow]Chunks in storage but not tracked:[/yellow] {len(missing_in_tracker)}"
             )
 
-        if len(sparse_shards) > 5:
-            console.print(f"  ... and {len(sparse_shards) - 5} more")
+    except Exception as e:
+        console.print(f"[red]Error reading storage: {e}[/red]")
+
+
+@main.command()
+@click.option("--data-dir", default="./caption_data", help="Storage directory")
+@click.option("--checkpoint-dir", default="./checkpoints", help="Checkpoint directory")
+@click.option("--fix", is_flag=True, help="Fix issues by resetting abandoned chunks")
+@click.option("--verbose", is_flag=True, help="Show detailed information")
+def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
+    """Scan for sparse or abandoned chunks and optionally fix them."""
+    from .storage import StorageManager
+    from .utils.chunk_tracker import ChunkTracker
+
+    console.print("[bold cyan]Scanning for sparse/abandoned chunks...[/bold cyan]\n")
+
+    checkpoint_path = Path(checkpoint_dir) / "chunks.json"
+    if not checkpoint_path.exists():
+        console.print("[red]No chunk checkpoint found![/red]")
+        return
+
+    tracker = ChunkTracker(checkpoint_path)
+    storage = StorageManager(Path(data_dir))
+
+    # Get and display stats
+    stats = tracker.get_stats()
+    _display_chunk_stats(stats)
+
+    # Find and handle abandoned chunks
+    abandoned_chunks = _find_abandoned_chunks(tracker)
+    _display_abandoned_chunks(abandoned_chunks, fix, tracker)
+
+    # Check for sparse shards
+    console.print("\n[bold cyan]Checking for sparse shards...[/bold cyan]")
+    sparse_shards = _find_sparse_shards(tracker)
+    _display_sparse_shards(sparse_shards)
 
     # Cross-check with storage if verbose
     if storage.captions_path.exists() and verbose:
-        console.print("\n[bold cyan]Cross-checking with stored captions...[/bold cyan]")
-
-        try:
-            table = pq.read_table(storage.captions_path, columns=["chunk_id"])
-            stored_chunk_ids = set(c for c in table["chunk_id"].to_pylist() if c)
-
-            tracker_completed = set(c for c, s in tracker.chunks.items() if s.status == "completed")
-
-            missing_in_storage = tracker_completed - stored_chunk_ids
-            missing_in_tracker = stored_chunk_ids - set(tracker.chunks.keys())
-
-            if missing_in_storage:
-                console.print(
-                    f"\n[red]Chunks marked complete but missing from storage:[/red] {len(missing_in_storage)}"
-                )
-                for chunk_id in list(missing_in_storage)[:5]:
-                    console.print(f"  • {chunk_id}")
-
-                if fix:
-                    console.print("[yellow]Resetting these chunks to pending...[/yellow]")
-                    for chunk_id in missing_in_storage:
-                        tracker.mark_failed(chunk_id)
-                    console.print(f"[green]✓ Reset {len(missing_in_storage)} chunks[/green]")
-
-            if missing_in_tracker:
-                console.print(
-                    f"\n[yellow]Chunks in storage but not tracked:[/yellow] {len(missing_in_tracker)}"
-                )
-
-        except Exception as e:
-            console.print(f"[red]Error reading storage: {e}[/red]")
+        _cross_check_storage(storage, tracker, fix)
 
     # Summary
     console.print("\n[bold cyan]Summary:[/bold cyan]")
@@ -750,6 +808,156 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
 
     if fix:
         tracker.save_checkpoint()
+
+
+def _display_export_stats(stats):
+    """Display storage statistics."""
+    console.print("\n[bold cyan]Storage Statistics:[/bold cyan]")
+    console.print(f"[green]Total rows:[/green] {stats['total_rows']:,}")
+    console.print(f"[green]Total outputs:[/green] {stats['total_outputs']:,}")
+    console.print(f"[green]Shards:[/green] {stats['shard_count']} ({', '.join(stats['shards'])})")
+    console.print(f"[green]Output fields:[/green] {', '.join(stats['output_fields'])}")
+
+    if stats.get("field_stats"):
+        console.print("\n[cyan]Field breakdown:[/cyan]")
+        for field, count in stats["field_stats"].items():
+            console.print(f"  • {field}: {count['total_items']:,} items")
+
+
+def _prepare_export_params(shard, shards, columns):
+    """Prepare shard filter and column list."""
+    shard_filter = None
+    if shard:
+        shard_filter = [shard]
+    elif shards:
+        shard_filter = [s.strip() for s in shards.split(",")]
+
+    column_list = None
+    if columns:
+        column_list = [col.strip() for col in columns.split(",")]
+        console.print(f"\n[cyan]Exporting columns:[/cyan] {', '.join(column_list)}")
+
+    return shard_filter, column_list
+
+
+async def _export_all_formats(
+    exporter, output, shard_filter, column_list, limit, filename_column, export_column
+):
+    """Export to all formats."""
+    base_name = output or "caption_export"
+    base_path = Path(base_name)
+    results = {}
+
+    for export_format in ["jsonl", "csv", "parquet", "json", "txt"]:
+        console.print(f"\n[cyan]Exporting to {export_format.upper()}...[/cyan]")
+        try:
+            format_results = await exporter.export_all_shards(
+                export_format,
+                base_path,
+                columns=column_list,
+                limit_per_shard=limit,
+                shard_filter=shard_filter,
+                filename_column=filename_column,
+                export_column=export_column,
+            )
+            results[export_format] = sum(format_results.values())
+        except Exception as e:
+            console.print(f"[yellow]Skipping {export_format}: {e}[/yellow]")
+            results[export_format] = 0
+
+    console.print("\n[green]✓ Export complete![/green]")
+    for fmt, count in results.items():
+        if count > 0:
+            console.print(f"  • {fmt.upper()}: {count:,} items")
+
+
+async def _export_to_lance(exporter, output, column_list, shard_filter):
+    """Export to Lance dataset."""
+    output_path = output or "exported_captions.lance"
+    console.print(f"\n[cyan]Exporting to Lance dataset:[/cyan] {output_path}")
+    total_rows = await exporter.export_to_lance(
+        output_path, columns=column_list, shard_filter=shard_filter
+    )
+    console.print(f"[green]✓ Exported {total_rows:,} rows to Lance dataset[/green]")
+
+
+async def _export_to_huggingface(exporter, hf_dataset, license, private, nsfw, tags, shard_filter):
+    """Export to Hugging Face Hub."""
+    if not hf_dataset:
+        console.print("[red]Error: --hf-dataset required for huggingface_hub format[/red]")
+        console.print("[dim]Example: --hf-dataset username/my-caption-dataset[/dim]")
+        sys.exit(1)
+
+    tag_list = None
+    if tags:
+        tag_list = [tag.strip() for tag in tags.split(",")]
+
+    console.print(f"\n[cyan]Uploading to Hugging Face Hub:[/cyan] {hf_dataset}")
+    if private:
+        console.print("[dim]Privacy: Private dataset[/dim]")
+    if nsfw:
+        console.print("[dim]Content: Not for all audiences[/dim]")
+    if tag_list:
+        console.print(f"[dim]Tags: {', '.join(tag_list)}[/dim]")
+    if shard_filter:
+        console.print(f"[dim]Shards: {', '.join(shard_filter)}[/dim]")
+
+    url = await exporter.export_to_huggingface_hub(
+        dataset_name=hf_dataset,
+        license=license,
+        private=private,
+        nsfw=nsfw,
+        tags=tag_list,
+        shard_filter=shard_filter,
+    )
+    console.print(f"[green]✓ Dataset uploaded to: {url}[/green]")
+
+
+async def _export_single_format(
+    exporter,
+    format,
+    output,
+    shard_filter,
+    column_list,
+    limit,
+    filename_column,
+    export_column,
+    verbose,
+):
+    """Export to a single format."""
+    output_path = output or "export"
+
+    if shard_filter and len(shard_filter) == 1:
+        console.print(f"\n[cyan]Exporting shard {shard_filter[0]} to {format.upper()}...[/cyan]")
+        count = await exporter.export_shard(
+            shard_filter[0],
+            format,
+            output_path,
+            columns=column_list,
+            limit=limit,
+            filename_column=filename_column,
+            export_column=export_column,
+        )
+        console.print(f"[green]✓ Exported {count:,} items[/green]")
+    else:
+        console.print(f"\n[cyan]Exporting to {format.upper()}...[/cyan]")
+        results = await exporter.export_all_shards(
+            format,
+            output_path,
+            columns=column_list,
+            limit_per_shard=limit,
+            shard_filter=shard_filter,
+            filename_column=filename_column,
+            export_column=export_column,
+        )
+
+        total = sum(results.values())
+        console.print(f"[green]✓ Exported {total:,} items total[/green]")
+
+        if verbose and len(results) > 1:
+            console.print("\n[dim]Per-shard breakdown:[/dim]")
+            for shard_name, count in sorted(results.items()):
+                console.print(f"  • {shard_name}: {count:,} items")
 
 
 @main.command()
@@ -779,6 +987,106 @@ def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
 @click.option("--private", is_flag=True, help="Make HF dataset private")
 @click.option("--nsfw", is_flag=True, help="Add not-for-all-audiences tag")
 @click.option("--tags", help="Comma-separated tags for HF dataset")
+def _validate_export_setup(data_dir):
+    """Validate export setup and create storage manager."""
+    from .storage import StorageManager
+
+    storage_path = Path(data_dir)
+    if not storage_path.exists():
+        console.print(f"[red]Storage directory not found: {data_dir}[/red]")
+        sys.exit(1)
+
+    return StorageManager(storage_path)
+
+
+async def _run_export_process(
+    storage,
+    format,
+    output,
+    shard,
+    shards,
+    columns,
+    limit,
+    filename_column,
+    export_column,
+    verbose,
+    hf_dataset,
+    license,
+    private,
+    nsfw,
+    tags,
+    stats_only,
+    optimize,
+):
+    """Execute the main export process."""
+    from .storage.exporter import ExportError, LanceStorageExporter
+
+    await storage.initialize()
+
+    stats = await storage.get_caption_stats()
+    _display_export_stats(stats)
+
+    if stats_only:
+        return
+
+    if optimize:
+        console.print("\n[yellow]Optimizing storage...[/yellow]")
+        await storage.optimize_storage()
+
+    shard_filter, column_list = _prepare_export_params(shard, shards, columns)
+    exporter = LanceStorageExporter(storage)
+
+    if format == "all":
+        await _export_all_formats(
+            exporter, output, shard_filter, column_list, limit, filename_column, export_column
+        )
+    elif format == "lance":
+        await _export_to_lance(exporter, output, column_list, shard_filter)
+    elif format == "huggingface_hub":
+        await _export_to_huggingface(
+            exporter, hf_dataset, license, private, nsfw, tags, shard_filter
+        )
+    else:
+        await _export_single_format(
+            exporter,
+            format,
+            output,
+            shard_filter,
+            column_list,
+            limit,
+            filename_column,
+            export_column,
+            verbose,
+        )
+
+
+@main.command()
+@click.option("--data-dir", default="./caption_data", help="Storage directory")
+@click.option(
+    "--format",
+    type=click.Choice(
+        ["jsonl", "json", "csv", "txt", "parquet", "lance", "huggingface_hub", "all"],
+        case_sensitive=False,
+    ),
+    default="jsonl",
+    help="Export format (default: jsonl)",
+)
+@click.option("--output", help="Output filename or directory")
+@click.option("--limit", type=int, help="Maximum number of items to export")
+@click.option("--columns", help="Comma-separated list of columns to include")
+@click.option("--export-column", default="captions", help="Column to export (default: captions)")
+@click.option("--filename-column", default="filename", help="Filename column (default: filename)")
+@click.option("--shard", help="Export only specific shard (e.g., 'data-001')")
+@click.option("--shards", help="Comma-separated list of shards to export")
+@click.option("--include-empty", is_flag=True, help="Include items with empty/null export column")
+@click.option("--stats-only", is_flag=True, help="Show statistics only, don't export")
+@click.option("--optimize", is_flag=True, help="Optimize storage before export")
+@click.option("--verbose", is_flag=True, help="Verbose output")
+@click.option("--hf-dataset", help="HuggingFace Hub dataset name (for huggingface_hub format)")
+@click.option("--license", default="MIT", help="Dataset license (default: MIT)")
+@click.option("--private", is_flag=True, help="Make HuggingFace dataset private")
+@click.option("--nsfw", is_flag=True, help="Mark dataset as NSFW")
+@click.option("--tags", help="Comma-separated tags for HuggingFace dataset")
 def export(
     data_dir: str,
     format: str,
@@ -800,181 +1108,35 @@ def export(
     tags: Optional[str],
 ):
     """Export caption data to various formats with per-shard support."""
-    from .storage import StorageManager
-    from .storage.exporter import ExportError, LanceStorageExporter
+    from .storage.exporter import ExportError
 
-    # Initialize storage manager
-    storage_path = Path(data_dir)
-    if not storage_path.exists():
-        console.print(f"[red]Storage directory not found: {data_dir}[/red]")
-        sys.exit(1)
+    storage = _validate_export_setup(data_dir)
 
-    storage = StorageManager(storage_path)
-
-    async def run_export():
-        await storage.initialize()
-
-        # Show statistics first
-        stats = await storage.get_caption_stats()
-        console.print("\n[bold cyan]Storage Statistics:[/bold cyan]")
-        console.print(f"[green]Total rows:[/green] {stats['total_rows']:,}")
-        console.print(f"[green]Total outputs:[/green] {stats['total_outputs']:,}")
-        console.print(
-            f"[green]Shards:[/green] {stats['shard_count']} ({', '.join(stats['shards'])})"
-        )
-        console.print(f"[green]Output fields:[/green] {', '.join(stats['output_fields'])}")
-
-        if stats.get("field_stats"):
-            console.print("\n[cyan]Field breakdown:[/cyan]")
-            for field, count in stats["field_stats"].items():
-                console.print(f"  • {field}: {count['total_items']:,} items")
-
-        if stats_only:
-            return
-
-        # Optimize storage if requested
-        if optimize:
-            console.print("\n[yellow]Optimizing storage...[/yellow]")
-            await storage.optimize_storage()
-
-        # Prepare shard filter
-        shard_filter = None
-        if shard:
-            shard_filter = [shard]
-        elif shards:
-            shard_filter = [s.strip() for s in shards.split(",")]
-
-        # Prepare columns list
-        column_list = None
-        if columns:
-            column_list = [col.strip() for col in columns.split(",")]
-            console.print(f"\n[cyan]Exporting columns:[/cyan] {', '.join(column_list)}")
-
-        # Create exporter
-        exporter = LanceStorageExporter(storage)
-
-        # Handle different export formats
-        try:
-            if format == "all":
-                # Export all shards to multiple formats
-                base_name = output or "caption_export"
-                base_path = Path(base_name)
-
-                results = {}
-
-                # Export each format
-                for export_format in ["jsonl", "csv", "parquet", "json", "txt"]:
-                    console.print(f"\n[cyan]Exporting to {export_format.upper()}...[/cyan]")
-                    try:
-                        format_results = await exporter.export_all_shards(
-                            export_format,
-                            base_path,
-                            columns=column_list,
-                            limit_per_shard=limit,
-                            shard_filter=shard_filter,
-                            filename_column=filename_column,
-                            export_column=export_column,
-                        )
-                        results[export_format] = sum(format_results.values())
-                    except Exception as e:
-                        console.print(f"[yellow]Skipping {export_format}: {e}[/yellow]")
-                        results[export_format] = 0
-
-                console.print("\n[green]✓ Export complete![/green]")
-                for fmt, count in results.items():
-                    if count > 0:
-                        console.print(f"  • {fmt.upper()}: {count:,} items")
-
-            elif format == "lance":
-                # Export to a new Lance dataset
-                output_path = output or "exported_captions.lance"
-                console.print(f"\n[cyan]Exporting to Lance dataset:[/cyan] {output_path}")
-                total_rows = await exporter.export_to_lance(
-                    output_path, columns=column_list, shard_filter=shard_filter
-                )
-                console.print(f"[green]✓ Exported {total_rows:,} rows to Lance dataset[/green]")
-
-            elif format == "huggingface_hub":
-                # Export to Hugging Face Hub
-                if not hf_dataset:
-                    console.print(
-                        "[red]Error: --hf-dataset required for huggingface_hub format[/red]"
-                    )
-                    console.print("[dim]Example: --hf-dataset username/my-caption-dataset[/dim]")
-                    sys.exit(1)
-
-                # Parse tags
-                tag_list = None
-                if tags:
-                    tag_list = [tag.strip() for tag in tags.split(",")]
-
-                console.print(f"\n[cyan]Uploading to Hugging Face Hub:[/cyan] {hf_dataset}")
-                if private:
-                    console.print("[dim]Privacy: Private dataset[/dim]")
-                if nsfw:
-                    console.print("[dim]Content: Not for all audiences[/dim]")
-                if tag_list:
-                    console.print(f"[dim]Tags: {', '.join(tag_list)}[/dim]")
-                if shard_filter:
-                    console.print(f"[dim]Shards: {', '.join(shard_filter)}[/dim]")
-
-                url = await exporter.export_to_huggingface_hub(
-                    dataset_name=hf_dataset,
-                    license=license,
-                    private=private,
-                    nsfw=nsfw,
-                    tags=tag_list,
-                    shard_filter=shard_filter,
-                )
-                console.print(f"[green]✓ Dataset uploaded to: {url}[/green]")
-
-            else:
-                # Single format export
-                output_path = output or "export"
-
-                if shard_filter and len(shard_filter) == 1:
-                    # Export single shard
-                    console.print(
-                        f"\n[cyan]Exporting shard {shard_filter[0]} to {format.upper()}...[/cyan]"
-                    )
-                    count = await exporter.export_shard(
-                        shard_filter[0],
-                        format,
-                        output_path,
-                        columns=column_list,
-                        limit=limit,
-                        filename_column=filename_column,
-                        export_column=export_column,
-                    )
-                    console.print(f"[green]✓ Exported {count:,} items[/green]")
-                else:
-                    # Export multiple shards
-                    console.print(f"\n[cyan]Exporting to {format.upper()}...[/cyan]")
-                    results = await exporter.export_all_shards(
-                        format,
-                        output_path,
-                        columns=column_list,
-                        limit_per_shard=limit,
-                        shard_filter=shard_filter,
-                        filename_column=filename_column,
-                        export_column=export_column,
-                    )
-
-                    total = sum(results.values())
-                    console.print(f"[green]✓ Exported {total:,} items total[/green]")
-
-                    if verbose and len(results) > 1:
-                        console.print("\n[dim]Per-shard breakdown:[/dim]")
-                        for shard_name, count in sorted(results.items()):
-                            console.print(f"  • {shard_name}: {count:,} items")
-
-        except ExportError as e:
-            console.print(f"[red]Export error: {e}[/red]")
-            sys.exit(1)
-
-    # Run the async export
     try:
-        asyncio.run(run_export())
+        asyncio.run(
+            _run_export_process(
+                storage,
+                format,
+                output,
+                shard,
+                shards,
+                columns,
+                limit,
+                filename_column,
+                export_column,
+                verbose,
+                hf_dataset,
+                license,
+                private,
+                nsfw,
+                tags,
+                stats_only,
+                optimize,
+            )
+        )
+    except ExportError as e:
+        console.print(f"[red]Export error: {e}[/red]")
+        sys.exit(1)
     except KeyboardInterrupt:
         console.print("\n[yellow]Export cancelled[/yellow]")
         sys.exit(1)
