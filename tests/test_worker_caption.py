@@ -879,5 +879,194 @@ class TestCaptionWorkerProcessors:
         assert worker.processor is not None
 
 
+class TestCaptionWorkerConfigReload:
+    """Test CaptionWorker config reload functionality."""
+
+    @pytest.fixture
+    def worker_config(self):
+        return {
+            "name": "test_worker",
+            "token": "test_token",
+            "server": "ws://localhost:8765",
+            "server_url": "ws://localhost:8765",
+            "gpu_id": 0,
+        }
+
+    @pytest.fixture
+    def initial_vllm_config(self):
+        return {
+            "model": "test-model-v1",
+            "batch_size": 4,
+            "max_model_len": 16384,
+            "stages": [
+                {
+                    "name": "caption",
+                    "model": "test-model-v1",
+                    "prompts": ["describe this image"],
+                    "output_field": "captions",
+                    "requires": [],
+                }
+            ],
+        }
+
+    def test_config_reload_failure_restores_state(self, worker_config, initial_vllm_config):
+        """Test that config reload failure properly restores previous state."""
+        worker = CaptionWorker(worker_config)
+
+        # Set up initial state
+        worker.vllm_config = initial_vllm_config
+        worker.stages = worker._parse_stages_config(initial_vllm_config)
+        worker.stage_order = worker._topological_sort_stages(worker.stages)
+        worker.mock_mode = False
+
+        # Mock model manager with working models
+        mock_model_manager = Mock()
+        mock_model_manager.models = {"test-model-v1": "loaded_model"}
+        mock_model_manager.processors = {"test-model-v1": "loaded_processor"}
+        mock_model_manager.tokenizers = {"test-model-v1": "loaded_tokenizer"}
+        mock_model_manager.sampling_params = {"caption": "loaded_sampling"}
+        worker.model_manager = mock_model_manager
+
+        # New config that will cause setup failure
+        new_config = {
+            "model": "test-model-v2",
+            "batch_size": 8,
+            "stages": [
+                {
+                    "name": "caption",
+                    "model": "test-model-v2",
+                    "prompts": ["analyze this image"],
+                    "output_field": "captions",
+                    "requires": [],
+                }
+            ],
+        }
+
+        # Mock _setup_vllm to fail on first call (new config) but succeed on second call (restore)
+        setup_call_count = 0
+
+        def mock_setup_vllm():
+            nonlocal setup_call_count
+            setup_call_count += 1
+            if setup_call_count == 1:
+                raise Exception("Failed to load new model")
+            # Second call succeeds (restoration)
+            return
+
+        with patch.object(worker, "_setup_vllm", side_effect=mock_setup_vllm):
+            # Attempt config update
+            result = worker._handle_vllm_config_update(new_config)
+
+        # Should return False due to failure
+        assert result is False
+
+        # Should have restored original config
+        assert worker.vllm_config == initial_vllm_config
+
+        # Should have restored original stages
+        assert len(worker.stages) == 1
+        assert worker.stages[0].model == "test-model-v1"
+        assert worker.stages[0].prompts == ["describe this image"]
+
+        # Should have called _setup_vllm twice (once for new config, once for restore)
+        assert setup_call_count == 2
+
+        # Model manager cleanup should have been called
+        mock_model_manager.cleanup.assert_called()
+
+    def test_model_manager_get_model_for_stage_keyerror_handling(self):
+        """Test that get_model_for_stage provides helpful error messages."""
+        from caption_flow.workers.caption import MultiStageVLLMManager
+
+        manager = MultiStageVLLMManager()
+
+        # Test missing model
+        with pytest.raises(KeyError) as exc_info:
+            manager.get_model_for_stage("caption", "missing-model")
+        assert "Model 'missing-model' not found" in str(exc_info.value)
+        assert "Available models: []" in str(exc_info.value)
+
+        # Add a model but missing stage
+        manager.models["test-model"] = Mock()
+        manager.processors["test-model"] = Mock()
+        manager.tokenizers["test-model"] = Mock()
+
+        with pytest.raises(KeyError) as exc_info:
+            manager.get_model_for_stage("missing-stage", "test-model")
+        assert "Sampling params for stage 'missing-stage' not found" in str(exc_info.value)
+        assert "Available stages: []" in str(exc_info.value)
+
+    def test_process_batch_handles_missing_model_manager(self, worker_config):
+        """Test that batch processing handles missing model manager gracefully."""
+        worker = CaptionWorker(worker_config)
+
+        # Create a mock processing item
+        mock_image = Image.new("RGB", (100, 100), "red")
+        item = ProcessingItem(
+            unit_id="test-unit",
+            job_id="test-job",
+            chunk_id="test-chunk",
+            item_key="test-item",
+            item_index=0,
+            image=mock_image,
+            image_data=b"fake_data",
+            metadata={},
+        )
+
+        # Set up worker state without model manager
+        worker.vllm_config = {"max_model_len": 16384}
+        mock_stage = Mock()
+        mock_stage.name = "test-stage"
+        worker.stages = [mock_stage]
+        worker.stage_order = ["test-stage"]
+        worker.model_manager = None  # Simulate missing model manager
+
+        # Process batch should handle missing model manager
+        result = worker._process_batch_multi_stage([item])
+
+        # Should return empty results and increment failed items
+        assert result == []
+        assert worker.items_failed == 1
+
+    def test_process_batch_handles_model_keyerror(self, worker_config):
+        """Test that batch processing handles KeyError from get_model_for_stage."""
+        worker = CaptionWorker(worker_config)
+
+        # Create a mock processing item
+        mock_image = Image.new("RGB", (100, 100), "red")
+        item = ProcessingItem(
+            unit_id="test-unit",
+            job_id="test-job",
+            chunk_id="test-chunk",
+            item_key="test-item",
+            item_index=0,
+            image=mock_image,
+            image_data=b"fake_data",
+            metadata={},
+        )
+
+        # Set up worker state
+        worker.vllm_config = {"max_model_len": 16384}
+
+        # Create mock stage
+        mock_stage = Mock()
+        mock_stage.name = "test-stage"
+        mock_stage.model = "missing-model"
+        worker.stages = [mock_stage]
+        worker.stage_order = ["test-stage"]
+
+        # Mock model manager that raises KeyError
+        mock_model_manager = Mock()
+        mock_model_manager.get_model_for_stage.side_effect = KeyError("Model not found")
+        worker.model_manager = mock_model_manager
+
+        # Process batch should handle KeyError gracefully
+        result = worker._process_batch_multi_stage([item])
+
+        # Should return empty results and increment failed items
+        assert result == []
+        assert worker.items_failed == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

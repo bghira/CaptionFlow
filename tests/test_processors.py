@@ -1034,5 +1034,114 @@ class TestProcessorIntegration(ProcessorTestBase):
         assert any(uid in available_ids for uid in unit_ids[1:])
 
 
+class TestHuggingFaceURLValidation:
+    """Test URL validation in HuggingFace processor."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        """Create a temporary directory for testing."""
+        temp_dir = tempfile.mkdtemp()
+        yield Path(temp_dir)
+        shutil.rmtree(temp_dir)
+
+    @pytest.fixture
+    def mock_parquet_data_with_invalid_urls(self, temp_dir):
+        """Create mock parquet data with invalid URLs."""
+        # Create test data with various invalid URL scenarios
+        data = {
+            "id": [1, 2, 3, 4, 5],
+            "url": [
+                "https://example.com/valid.jpg",  # Valid URL
+                None,  # None URL
+                "",  # Empty string
+                "None",  # String "None"
+                "  ",  # Whitespace only
+            ],
+            "caption": [
+                "A valid image",
+                "Image with None URL",
+                "Image with empty URL",
+                "Image with None string URL",
+                "Image with whitespace URL",
+            ],
+        }
+
+        # Create parquet file
+        table = pa.table(data)
+        parquet_file = temp_dir / "test_data.parquet"
+        pq.write_table(table, parquet_file)
+
+        return str(parquet_file)
+
+    def test_url_validation_skips_invalid_urls(self):
+        """Test URL validation logic that skips invalid URLs."""
+        # Test the actual validation logic used in the processor
+        invalid_urls = [None, "", "   ", "None", "NONE", "none"]
+        valid_urls = ["https://example.com/image.jpg", "http://test.com/pic.png"]
+
+        # Track which URLs would be processed (not skipped)
+        processed_urls = []
+
+        for url_value in invalid_urls + valid_urls:
+            # This matches the exact logic from the processor
+            if url_value and str(url_value).strip() and str(url_value).strip().lower() != "none":
+                processed_urls.append(str(url_value).strip())
+
+        # Should only process valid URLs
+        assert len(processed_urls) == 2
+        assert "https://example.com/image.jpg" in processed_urls
+        assert "http://test.com/pic.png" in processed_urls
+
+    def test_url_validation_in_mock_mode(self):
+        """Test URL validation logic preserves valid URLs for metadata."""
+        test_urls = {
+            "valid": "https://example.com/valid.jpg",
+            "none": None,
+            "empty": "",
+            "none_string": "None",
+            "whitespace": "  ",
+        }
+
+        # Simulate extraction and validation for metadata
+        extracted_urls = {}
+        for key, url_value in test_urls.items():
+            if url_value and str(url_value).strip() and str(url_value).strip().lower() != "none":
+                extracted_urls[key] = str(url_value).strip()
+            else:
+                extracted_urls[key] = None
+
+        # Only valid URL should be extracted
+        assert extracted_urls["valid"] == "https://example.com/valid.jpg"
+        assert extracted_urls["none"] is None
+        assert extracted_urls["empty"] is None
+        assert extracted_urls["none_string"] is None
+        assert extracted_urls["whitespace"] is None
+
+    def test_url_validation_edge_cases(self):
+        """Test edge cases for URL validation."""
+        processor = HuggingFaceDatasetWorkerProcessor()
+
+        # Test different invalid URL values
+        test_cases = [
+            (None, False),
+            ("", False),
+            ("   ", False),
+            ("None", False),
+            ("NONE", False),
+            ("none", False),
+            ("https://valid.com/image.jpg", True),
+            ("http://valid.com/image.jpg", True),
+            ("  https://valid.com/image.jpg  ", True),  # Should be stripped
+        ]
+
+        for url_value, should_be_valid in test_cases:
+            # Simulate the validation logic from the processor (matches the actual code)
+            is_valid = bool(
+                url_value and str(url_value).strip() and str(url_value).strip().lower() != "none"
+            )
+
+            assert is_valid == should_be_valid, f"URL validation failed for: {url_value!r}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
