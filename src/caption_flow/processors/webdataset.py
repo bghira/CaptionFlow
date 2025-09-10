@@ -533,8 +533,8 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         for start_idx, end_idx in ranges:
                             self.chunk_tracker.mark_items_processed(chunk_id, start_idx, end_idx)
 
-                # Save checkpoint after updating
-                self.chunk_tracker.save()
+                # Flush checkpoint after major update
+                self.chunk_tracker.flush()
 
     def get_stats(self) -> Dict[str, Any]:
         """Get processor statistics."""
@@ -571,9 +571,9 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         if self.unit_creation_thread:
             self.unit_creation_thread.join(timeout=5)
 
-        # Save checkpoint
+        # Flush final checkpoint on cleanup
         if self.chunk_tracker:
-            self.chunk_tracker.save()
+            self.chunk_tracker.flush()
 
 
 class WebDatasetWorkerProcessor(WorkerProcessor):

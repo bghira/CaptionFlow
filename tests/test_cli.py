@@ -8,14 +8,13 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import yaml
-from click.testing import CliRunner
-
 from caption_flow.cli import (
     ConfigManager,
     apply_cli_overrides,
     main,
     setup_logging,
 )
+from click.testing import CliRunner
 
 
 @pytest.fixture

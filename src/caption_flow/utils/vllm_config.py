@@ -142,7 +142,8 @@ class VLLMConfigManager:
     ) -> Tuple[bool, Optional[Any]]:
         """Update vLLM configuration at runtime without reload.
 
-        Returns:
+        Returns
+        -------
             Tuple of (success, new_sampling_params)
 
         """

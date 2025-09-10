@@ -8,12 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from caption_flow.utils.certificates import CertificateManager
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-
-from caption_flow.utils.certificates import CertificateManager
 
 
 @pytest.fixture

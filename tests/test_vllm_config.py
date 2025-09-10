@@ -3,7 +3,6 @@
 from unittest.mock import Mock, patch
 
 import pytest
-
 from caption_flow.utils.vllm_config import VLLMConfigChange, VLLMConfigManager
 
 

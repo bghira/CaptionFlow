@@ -8,7 +8,6 @@ from enum import Enum
 from pathlib import Path
 
 import pytest
-
 from caption_flow.utils.json_utils import (
     json_serializer,
     parse_datetime,

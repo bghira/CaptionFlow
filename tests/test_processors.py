@@ -16,7 +16,6 @@ from PIL import Image
 # Import pytest-asyncio
 pytest_plugins = ("pytest_asyncio",)
 import pytest_asyncio
-
 from caption_flow.models import Caption, JobId
 from caption_flow.processors import ProcessorConfig, WorkResult, WorkUnit
 from caption_flow.processors.huggingface import (

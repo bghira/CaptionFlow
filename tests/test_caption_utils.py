@@ -1,7 +1,6 @@
 """Tests for the caption_utils module."""
 
 import pytest
-
 from caption_flow.utils.caption_utils import CaptionUtils
 
 

@@ -76,6 +76,7 @@ class CertificateManager:
         """Generate Let's Encrypt certificate.
 
         Args:
+        ----
             domain: Domain name for certificate
             email: Email for Let's Encrypt account
             output_dir: Custom output directory (uses /etc/letsencrypt by default)

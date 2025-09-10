@@ -145,6 +145,9 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         cfg = config.config
 
+        # Store storage reference for chunk state synchronization
+        self.storage = storage
+
         # Dataset configuration
         dataset_cfg = cfg.get("dataset", {})
         self.dataset_name = dataset_cfg.get("dataset_path")
@@ -396,8 +399,115 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             self.current_chunk_index = max_chunk_index + 1
             logger.info(f"Resuming from chunk index {self.current_chunk_index}")
 
-        # Save checkpoint after updating
-        self.chunk_tracker.save()
+        # Flush checkpoint after major update
+        self.chunk_tracker.flush()
+
+    def _create_work_units_from_chunk(self, chunk_index: int) -> List[WorkUnit]:
+        """Create one or more work units from a chunk, splitting large gaps in unprocessed ranges."""
+        units = []
+        base_unit = self._create_work_unit(chunk_index)
+
+        if not base_unit:
+            return []
+
+        # Check if we should split this into multiple work units based on gaps
+        unprocessed_ranges = base_unit.data["unprocessed_ranges"]
+
+        if len(unprocessed_ranges) <= 1:
+            # Single range or no ranges, return as-is
+            return [base_unit]
+
+        # Check for large gaps between ranges that suggest we should split
+        total_span = unprocessed_ranges[-1][1] - unprocessed_ranges[0][0] + 1
+        total_work = sum(end - start + 1 for start, end in unprocessed_ranges)
+        gap_ratio = (total_span - total_work) / total_span if total_span > 0 else 0
+
+        # If gaps are more than 50% of the span, split into separate work units
+        if gap_ratio > 0.5 and len(unprocessed_ranges) > 1:
+            logger.debug(
+                f"Splitting chunk {chunk_index} with {len(unprocessed_ranges)} ranges (gap ratio: {gap_ratio:.1%})"
+            )
+
+            # Create separate work units for each contiguous range group
+            current_group = []
+
+            for i, (start, end) in enumerate(unprocessed_ranges):
+                if not current_group:
+                    current_group = [(start, end)]
+                else:
+                    # Check gap to previous range
+                    prev_end = current_group[-1][1]
+                    gap_size = start - prev_end - 1
+
+                    # If gap is large (>100 items), start new group
+                    if gap_size > 100:
+                        # Create work unit for current group
+                        units.append(self._create_range_work_unit(chunk_index, current_group))
+                        current_group = [(start, end)]
+                    else:
+                        # Add to current group
+                        current_group.append((start, end))
+
+            # Don't forget the last group
+            if current_group:
+                units.append(self._create_range_work_unit(chunk_index, current_group))
+
+            return [unit for unit in units if unit is not None]
+        else:
+            # Keep as single unit
+            return [base_unit]
+
+    def _create_range_work_unit(
+        self, chunk_index: int, ranges: List[Tuple[int, int]]
+    ) -> Optional[WorkUnit]:
+        """Create a work unit for specific ranges within a chunk."""
+        if not ranges:
+            return None
+
+        current_index = chunk_index * self.chunk_size
+        chunk_size = min(self.chunk_size, self.total_items - current_index)
+
+        # Find shard for this chunk
+        shard_id, local_idx = self._get_shard_for_index(current_index)
+        shard_name = Path(self.shard_info[shard_id]["filename"]).stem
+
+        # Create unique unit ID that includes range info
+        range_suffix = f"r{len(ranges)}"  # r2 = 2 ranges, etc.
+        job_id_obj = JobId(
+            shard_id=shard_name, chunk_id=str(chunk_index), sample_id=str(current_index)
+        )
+        base_unit_id = job_id_obj.get_chunk_str()
+        unit_id = f"{base_unit_id}_{range_suffix}"
+
+        unprocessed_items = sum(end - start + 1 for start, end in ranges)
+
+        unit = WorkUnit(
+            unit_id=unit_id,
+            chunk_id=base_unit_id,  # Keep original chunk_id for tracking
+            source_id=shard_name,
+            unit_size=unprocessed_items,
+            data={
+                "dataset_name": self.dataset_name,
+                "config": self.config,
+                "split": self.split,
+                "start_index": current_index,
+                "chunk_size": chunk_size,
+                "actual_work_size": unprocessed_items,
+                "unprocessed_ranges": ranges,
+                "range_based": True,
+                "is_split_unit": True,  # Flag to indicate this is a split from larger chunk
+                "shard_ids": [shard_id],
+                "data_files": self.data_files,
+            },
+            metadata={
+                "dataset": self.dataset_name,
+                "shard_name": shard_name,
+                "chunk_index": chunk_index,
+                "range_count": len(ranges),
+            },
+        )
+
+        return unit
 
     def _create_work_unit(self, chunk_index: int) -> Optional[WorkUnit]:
         """Create a single work unit for a chunk index."""
@@ -439,20 +549,35 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         # If all ranges are processed, return None (shouldn't happen if status tracking is correct)
         if not unprocessed_ranges:
+            logger.debug(f"Chunk {unit_id} has no unprocessed ranges, skipping")
             return None
 
+        # Calculate actual unprocessed items and total work to be assigned
+        unprocessed_items = sum(end - start + 1 for start, end in unprocessed_ranges)
+
+        # Skip assignment if there are very few unprocessed items (< 10 items)
+        if unprocessed_items < 10:
+            logger.debug(
+                f"Chunk {unit_id} has only {unprocessed_items} unprocessed items, skipping assignment"
+            )
+            return None
+
+        # Create work unit that represents ONLY the unprocessed ranges
+        # This is the key fix: don't assign the full chunk, assign only unprocessed parts
         unit = WorkUnit(
             unit_id=unit_id,
             chunk_id=unit_id,
             source_id=shard_name,
-            unit_size=chunk_size,
+            unit_size=unprocessed_items,  # Only the unprocessed items
             data={
                 "dataset_name": self.dataset_name,
                 "config": self.config,
                 "split": self.split,
-                "start_index": current_index,
-                "chunk_size": chunk_size,
-                "unprocessed_ranges": unprocessed_ranges,  # Use calculated ranges
+                "start_index": current_index,  # Keep original chunk start for reference
+                "chunk_size": chunk_size,  # Keep original chunk size for reference
+                "actual_work_size": unprocessed_items,  # NEW: actual work to be done
+                "unprocessed_ranges": unprocessed_ranges,  # The specific ranges to process
+                "range_based": True,  # NEW: flag to indicate this is range-based
                 "shard_ids": [shard_id],
                 "data_files": self.data_files,
             },
@@ -583,7 +708,8 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
             # Force checkpoint save if needed
             if self.chunk_tracker:
-                self.chunk_tracker.save()
+                # Flush statistics updates immediately
+                self.chunk_tracker.flush()
 
     def get_work_units(self, count: int, worker_id: str) -> List[WorkUnit]:
         """Get available work units for a worker."""
@@ -593,22 +719,53 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             worker_id,
             len(self.pending_units),
         )
+
+        # Periodically sync with storage to ensure we don't assign already-completed work
+        # This is especially important when workers reconnect
+        if hasattr(self, "storage") and self.storage and len(self.pending_units) > 0:
+            try:
+                processed_job_ids = self.storage.get_all_processed_job_ids()
+                if processed_job_ids:
+                    logger.debug(
+                        f"Syncing chunk tracker with {len(processed_job_ids)} processed items before assignment"
+                    )
+                    self.update_from_storage(processed_job_ids)
+                    # Flush after storage sync to ensure consistency
+                    self.chunk_tracker.flush()
+            except Exception as e:
+                logger.warning(f"Failed to sync with storage during work assignment: {e}")
+
         assigned = []
         with self.lock:
             while len(assigned) < count and self.pending_units:
                 unit_id = self.pending_units.popleft()
 
-                # Create work unit on demand
+                # Create work units on demand (may create multiple units from one chunk)
                 chunk_index = int(unit_id.split(":")[-1])
-                unit = self._create_work_unit(chunk_index)
+                units = self._create_work_units_from_chunk(chunk_index)
 
-                if unit:
-                    self.assigned_units[worker_id].add(unit_id)
+                for unit in units:
+                    if len(assigned) >= count:
+                        # Put remaining units back in queue for next worker
+                        self.pending_units.appendleft(
+                            f"{unit.metadata['shard_name']}:chunk:{chunk_index}"
+                        )
+                        break
+
+                    # Use the unit's actual unit_id for tracking
+                    actual_unit_id = unit.unit_id
+                    self.assigned_units[worker_id].add(actual_unit_id)
                     assigned.append(unit)
-                    logger.debug("Assigning unit %s to worker %s", unit_id, worker_id)
+                    logger.debug(
+                        "Assigning unit %s (%d items) to worker %s",
+                        actual_unit_id,
+                        unit.data.get("actual_work_size", unit.unit_size),
+                        worker_id,
+                    )
 
                     if self.chunk_tracker:
-                        self.chunk_tracker.mark_assigned(unit_id, worker_id)
+                        # Track assignment using the base chunk_id for chunk tracker compatibility
+                        self.chunk_tracker.mark_assigned(unit.chunk_id, worker_id)
 
         logger.debug("Returning %d work units to worker %s", len(assigned), worker_id)
         return assigned
@@ -641,12 +798,52 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
     def release_assignments(self, worker_id: str) -> None:
         """Release all assignments for a disconnected worker."""
         logger.debug("Releasing assignments for worker %s", worker_id)
+
+        # FIRST: Sync with storage to ensure chunk tracker is up-to-date
+        # This prevents reassigning work that was already completed by this or other workers
+        if hasattr(self, "storage") and self.storage:
+            try:
+                processed_job_ids = self.storage.get_all_processed_job_ids()
+                if processed_job_ids:
+                    logger.info(
+                        f"Syncing chunk tracker with {len(processed_job_ids)} processed items before releasing assignments"
+                    )
+                    self.update_from_storage(processed_job_ids)
+                    # Flush after storage sync to ensure consistency
+                    self.chunk_tracker.flush()
+            except Exception as e:
+                logger.warning(f"Failed to sync with storage before releasing assignments: {e}")
+
         with self.lock:
             unit_ids = list(self.assigned_units.get(worker_id, []))
 
             for unit_id in unit_ids:
-                logger.debug(f"Adding {unit_id} to pending queue")
-                self.pending_units.append(unit_id)
+                # Check if this chunk is already fully processed before re-queuing
+                should_requeue = True
+                if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
+                    chunk_state = self.chunk_tracker.chunks[unit_id]
+                    if chunk_state.status == "completed":
+                        logger.info(f"Not re-queuing completed chunk {unit_id}")
+                        should_requeue = False
+                    elif chunk_state.processed_ranges:
+                        # Check if chunk is mostly complete (>90% processed)
+                        total_items = chunk_state.chunk_size
+                        processed_items = sum(
+                            end - start + 1 for start, end in chunk_state.processed_ranges
+                        )
+                        completion_rate = processed_items / total_items if total_items > 0 else 0
+
+                        if completion_rate > 0.9:
+                            logger.info(
+                                f"Not re-queuing nearly complete chunk {unit_id} ({completion_rate:.1%} done)"
+                            )
+                            should_requeue = False
+
+                if should_requeue:
+                    logger.debug(f"Adding {unit_id} to pending queue")
+                    self.pending_units.append(unit_id)
+                else:
+                    logger.debug(f"Skipping re-queue of {unit_id} (already processed)")
 
             if worker_id in self.assigned_units:
                 del self.assigned_units[worker_id]

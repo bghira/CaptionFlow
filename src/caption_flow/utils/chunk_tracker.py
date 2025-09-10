@@ -34,8 +34,16 @@ class ChunkState:
     assigned_to: Optional[str] = None
     assigned_at: Optional[datetime] = None
 
+    # Cache for expensive range calculations
+    _cached_merged_ranges: Optional[List[Tuple[int, int]]] = field(default=None, init=False)
+    _cached_unprocessed_ranges: Optional[List[Tuple[int, int]]] = field(default=None, init=False)
+    _cache_invalidated: bool = field(default=True, init=False)
+
     def add_processed_range(self, start: int, end: int):
         """Add a processed range and merge if needed."""
+        # Invalidate cache before modifying ranges
+        self._invalidate_cache()
+
         # Add new range
         self.processed_ranges.append((start, end))
 
@@ -60,6 +68,7 @@ class ChunkState:
 
     def mark_completed(self):
         """Mark chunk as completed and clear unnecessary data to save memory."""
+        self._invalidate_cache()
         self.status = "completed"
         self.completed_at = datetime.now(_datetime.UTC)
         # Clear processed_ranges since we don't need them after completion
@@ -67,17 +76,35 @@ class ChunkState:
         # self.assigned_to = None
         # self.assigned_at = None
 
+    def _invalidate_cache(self):
+        """Invalidate cached range calculations."""
+        self._cached_merged_ranges = None
+        self._cached_unprocessed_ranges = None
+        self._cache_invalidated = True
+
+    def _get_merged_ranges(self) -> List[Tuple[int, int]]:
+        """Get merged ranges with caching."""
+        if self._cached_merged_ranges is None:
+            self._cached_merged_ranges = self._merge_ranges(self.processed_ranges)
+        return self._cached_merged_ranges
+
     def get_unprocessed_ranges(self) -> List[Tuple[int, int]]:
         """Get ranges of unprocessed items within the chunk (relative indices)."""
         if self.status == "completed":
             return []
 
         if not self.processed_ranges:
-            logger.info(f"Chunk {self.chunk_id} has no processed ranges, returning full range")
+            if self._cache_invalidated:  # Only log once per invalidation
+                logger.info(f"Chunk {self.chunk_id} has no processed ranges, returning full range")
+                self._cache_invalidated = False
             return [(0, self.chunk_size - 1)]
 
-        # Merge ranges first to ensure no overlaps
-        merged_ranges = self._merge_ranges(self.processed_ranges)
+        # Use cached result if available
+        if self._cached_unprocessed_ranges is not None:
+            return self._cached_unprocessed_ranges
+
+        # Calculate and cache unprocessed ranges
+        merged_ranges = self._get_merged_ranges()
 
         unprocessed = []
         current_pos = 0
@@ -91,18 +118,23 @@ class ChunkState:
         if current_pos < self.chunk_size:
             unprocessed.append((current_pos, self.chunk_size - 1))
 
-        # Log for debugging
-        if not unprocessed:
-            logger.info(
-                f"Chunk {self.chunk_id} has processed ranges {merged_ranges} covering entire chunk size {self.chunk_size}"
-            )
-        else:
-            logger.debug(f"Merged ranges for chunk {self.chunk_id}: {merged_ranges}")
-            total_processed = sum(end - start + 1 for start, end in merged_ranges)
-            total_unprocessed = sum(end - start + 1 for start, end in unprocessed)
-            logger.debug(
-                f"Chunk {self.chunk_id}: {total_processed} processed, {total_unprocessed} unprocessed"
-            )
+        # Cache the result
+        self._cached_unprocessed_ranges = unprocessed
+
+        # Log for debugging (only when cache is being computed)
+        if self._cache_invalidated:
+            if not unprocessed:
+                logger.info(
+                    f"Chunk {self.chunk_id} has processed ranges {merged_ranges} covering entire chunk size {self.chunk_size}"
+                )
+            else:
+                logger.debug(f"Merged ranges for chunk {self.chunk_id}: {merged_ranges}")
+                total_processed = sum(end - start + 1 for start, end in merged_ranges)
+                total_unprocessed = sum(end - start + 1 for start, end in unprocessed)
+                logger.debug(
+                    f"Chunk {self.chunk_id}: {total_processed} processed, {total_unprocessed} unprocessed"
+                )
+            self._cache_invalidated = False
 
         return unprocessed
 
@@ -147,6 +179,10 @@ class ChunkState:
         # Ensure processed_ranges exists
         d.setdefault("processed_ranges", [])
         d.setdefault("processed_count", 0)
+        # Remove cache fields from dict if they exist (shouldn't be serialized)
+        d.pop("_cached_merged_ranges", None)
+        d.pop("_cached_unprocessed_ranges", None)
+        d.pop("_cache_invalidated", None)
         return cls(**d)
 
 
@@ -158,12 +194,22 @@ class ChunkTracker(CheckpointTracker):
         checkpoint_file: Path,
         max_completed_chunks_in_memory: int = 1000,
         archive_after_hours: int = 24,
+        save_batch_size: int = 10,
+        auto_save_interval: int = 60,
     ):
         self.chunks: Dict[str, ChunkState] = {}
         self.max_completed_chunks_in_memory = max_completed_chunks_in_memory
         self.archive_after_hours = archive_after_hours
         self._completed_count = 0  # Track count without storing all IDs
         self.lock = Lock()
+
+        # Batching mechanism
+        self._dirty = False
+        self._pending_changes = 0
+        self._save_batch_size = save_batch_size
+        self._auto_save_interval = auto_save_interval
+        self._last_save = datetime.now(_datetime.UTC)
+
         super().__init__(checkpoint_file)
 
     def _get_default_state(self) -> Dict[str, Any]:
@@ -197,6 +243,39 @@ class ChunkTracker(CheckpointTracker):
             "completed_count": self._completed_count,
         }
 
+    def _mark_dirty(self):
+        """Mark tracker as having pending changes."""
+        self._dirty = True
+        self._pending_changes += 1
+
+        # Auto-save based on batch size or time interval
+        now = datetime.now(_datetime.UTC)
+        time_since_last_save = (now - self._last_save).total_seconds()
+
+        if (self._pending_changes >= self._save_batch_size or
+            time_since_last_save >= self._auto_save_interval):
+            self._do_save()
+
+    def _do_save(self) -> bool:
+        """Internal method to perform the actual save."""
+        super().save()  # Parent method returns None but triggers save
+        # Reset dirty state since save was initiated successfully
+        self._dirty = False
+        self._pending_changes = 0
+        self._last_save = datetime.now(_datetime.UTC)
+        return True
+
+    def save(self, force: bool = False) -> bool:
+        """Save state to checkpoint file, with batching optimization."""
+        if not force and not self._dirty:
+            return False
+        return self._do_save()
+
+    def flush(self):
+        """Force save any pending changes."""
+        if self._dirty:
+            self._do_save()
+
     def _archive_old_completed_chunks(self):
         """Remove old completed chunks from memory to prevent unbounded growth."""
         if not self.archive_after_hours:
@@ -217,7 +296,7 @@ class ChunkTracker(CheckpointTracker):
             for chunk_id in chunks_to_remove:
                 del self.chunks[chunk_id]
             logger.info(f"Archived {len(chunks_to_remove)} old completed chunks from memory")
-            self.save()
+            self._mark_dirty()
 
     def _limit_completed_chunks_in_memory(self):
         """Keep only the most recent completed chunks in memory."""
@@ -235,7 +314,7 @@ class ChunkTracker(CheckpointTracker):
                 del self.chunks[chunk_id]
 
             logger.info(f"Removed {to_remove} oldest completed chunks from memory")
-            self.save()
+            self._mark_dirty()
 
     def add_chunk(
         self, chunk_id: str, shard_name: str, shard_url: str, start_index: int, chunk_size: int
@@ -255,7 +334,7 @@ class ChunkTracker(CheckpointTracker):
             chunk_size=chunk_size,
             status="pending",
         )
-        self.save()
+        self._mark_dirty()
 
         # Periodically clean up old chunks
         if len(self.chunks) % 100 == 0:
@@ -271,7 +350,7 @@ class ChunkTracker(CheckpointTracker):
             chunk.status = "assigned"
             chunk.assigned_to = worker_id
             chunk.assigned_at = datetime.now(_datetime.UTC)
-            self.save()
+            self._mark_dirty()
 
     def mark_completed(self, chunk_id: str):
         """Mark chunk as completed."""
@@ -281,7 +360,7 @@ class ChunkTracker(CheckpointTracker):
             chunk.mark_completed()  # This clears processed_ranges
             if not was_completed:
                 self._completed_count += 1
-            self.save()
+            self._mark_dirty()
             logger.debug(f"Chunk {chunk_id} marked as completed")
 
             # Check if we need to clean up
@@ -295,7 +374,7 @@ class ChunkTracker(CheckpointTracker):
             chunk.status = "pending"  # Reset to pending for retry
             chunk.assigned_to = None
             chunk.assigned_at = None
-            self.save()
+            self._mark_dirty()
 
     def mark_pending(self, chunk_id: str):
         """Mark chunk as pending (for manual reset)."""
@@ -306,7 +385,7 @@ class ChunkTracker(CheckpointTracker):
             chunk.status = "pending"
             chunk.assigned_to = None
             chunk.assigned_at = None
-            self.save()
+            self._mark_dirty()
 
     def release_worker_chunks(self, worker_id: str):
         """Release all chunks assigned to a worker."""
@@ -317,7 +396,8 @@ class ChunkTracker(CheckpointTracker):
                 chunk.assigned_to = None
                 chunk.assigned_at = None
                 released_chunks.append(chunk_id)
-        self.save()
+        if released_chunks:
+            self._mark_dirty()
         return released_chunks
 
     def get_pending_chunks(self, shard_name: Optional[str] = None) -> List[str]:
@@ -495,7 +575,7 @@ class ChunkTracker(CheckpointTracker):
             self._process_chunk_indices(chunk_indices)
 
         logger.info("Sync with storage completed")
-        self.save()
+        self._mark_dirty()
 
     def _process_chunk_indices(self, chunk_indices: Dict[str, Set[int]]):
         """Process a batch of chunk indices."""
@@ -560,6 +640,9 @@ class ChunkTracker(CheckpointTracker):
             )
             return
 
+        # Invalidate cache before modifying ranges
+        chunk_state._invalidate_cache()
+
         # Add to processed ranges
         chunk_state.processed_ranges.append((relative_start, relative_end))
 
@@ -575,8 +658,8 @@ class ChunkTracker(CheckpointTracker):
             logger.info(f"Chunk {chunk_id} is now complete")
             chunk_state.status = "completed"
 
-        # Save checkpoint after updating
-        self.save()
+        # Mark as dirty, will be saved based on batching logic
+        self._mark_dirty()
 
     def get_chunk_with_unprocessed_items(self, chunk_id: str) -> Optional[Dict[str, Any]]:
         """Get chunk info with unprocessed item ranges."""

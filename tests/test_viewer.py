@@ -7,7 +7,6 @@ from unittest.mock import Mock
 
 import pandas as pd
 import pytest
-
 from caption_flow.viewer import DatasetViewer, SelectableListItem
 
 

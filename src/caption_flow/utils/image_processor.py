@@ -24,9 +24,11 @@ class ImageProcessor:
         """Prepare image for inference.
 
         Args:
+        ----
             image: PIL Image to prepare
 
         Returns:
+        -------
             Prepared PIL Image
 
         """

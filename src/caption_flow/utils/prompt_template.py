@@ -17,6 +17,7 @@ class PromptTemplate:
         """Initialize with a prompt template.
 
         Args:
+        ----
             template: Prompt template string, e.g.
                      "describe this image. tags: {column:user_tags}"
 
@@ -33,9 +34,11 @@ class PromptTemplate:
         """Format the template with actual column values.
 
         Args:
+        ----
             item_data: Dictionary containing column values from dataset
 
         Returns:
+        -------
             Formatted prompt string
 
         """
@@ -66,7 +69,8 @@ class PromptTemplate:
     def validate_columns(self, available_columns: List[str]) -> List[str]:
         """Validate that required columns are available.
 
-        Returns:
+        Returns
+        -------
             List of missing column names
 
         """
@@ -84,6 +88,7 @@ class PromptTemplateManager:
         """Initialize with list of prompt strings (which may contain templates).
 
         Args:
+        ----
             prompts: List of prompt strings
 
         """
@@ -104,9 +109,11 @@ class PromptTemplateManager:
         """Format all templates with item data.
 
         Args:
+        ----
             item_data: Dictionary containing column values
 
         Returns:
+        -------
             List of formatted prompts
 
         """
@@ -125,7 +132,8 @@ class PromptTemplateManager:
     def validate_all(self, available_columns: List[str]) -> Dict[str, List[str]]:
         """Validate all templates against available columns.
 
-        Returns:
+        Returns
+        -------
             Dict mapping template string to list of missing columns
 
         """

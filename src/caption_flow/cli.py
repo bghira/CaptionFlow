@@ -1019,7 +1019,7 @@ async def _run_export_process(
     optimize,
 ):
     """Execute the main export process."""
-    from .storage.exporter import ExportError, LanceStorageExporter
+    from .storage.exporter import LanceStorageExporter
 
     await storage.initialize()
 

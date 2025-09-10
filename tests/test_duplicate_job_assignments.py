@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Dict, Set
 
 import pytest
-
 from caption_flow.models import JobId
 from caption_flow.processors import ProcessorConfig
 from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
@@ -885,7 +884,6 @@ import time
 from typing import Dict, Set
 
 import pytest
-
 from caption_flow.models import Caption
 from caption_flow.utils import ChunkTracker
 

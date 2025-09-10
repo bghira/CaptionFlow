@@ -4,7 +4,6 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
-
 from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
 from caption_flow.utils.chunk_tracker import ChunkTracker
 

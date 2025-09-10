@@ -27,6 +27,7 @@ class LanceStorageExporter:
         """Initialize exporter with storage manager.
 
         Args:
+        ----
             storage_manager: StorageManager instance
 
         """
@@ -44,6 +45,7 @@ class LanceStorageExporter:
         """Export a single shard to specified format.
 
         Args:
+        ----
             shard_name: Name of the shard to export
             format: Export format ('jsonl', 'json', 'csv', 'parquet', 'txt')
             output_path: Output file or directory path
@@ -52,6 +54,7 @@ class LanceStorageExporter:
             **kwargs: Format-specific options
 
         Returns:
+        -------
             Number of items exported
 
         """
@@ -111,6 +114,7 @@ class LanceStorageExporter:
         """Export all shards (or filtered shards) to specified format.
 
         Args:
+        ----
             format: Export format
             output_path: Base output path
             columns: Columns to export
@@ -119,6 +123,7 @@ class LanceStorageExporter:
             **kwargs: Format-specific options
 
         Returns:
+        -------
             Dictionary mapping shard names to export counts
 
         """
@@ -190,11 +195,13 @@ class LanceStorageExporter:
         """Export to a new Lance dataset, optionally filtering shards.
 
         Args:
+        ----
             output_path: Path for the output Lance dataset
             columns: Specific columns to include
             shard_filter: List of shard names to include
 
         Returns:
+        -------
             Total number of rows exported
 
         """
@@ -251,6 +258,7 @@ class LanceStorageExporter:
         """Export to Hugging Face Hub with per-shard parquet files.
 
         Args:
+        ----
             dataset_name: Name for the dataset (e.g., "username/dataset-name")
             token: Hugging Face API token
             license: License for the dataset
@@ -263,6 +271,7 @@ class LanceStorageExporter:
             max_shard_size_gb: Max size per parquet file in GB
 
         Returns:
+        -------
             URL of the uploaded dataset
 
         """

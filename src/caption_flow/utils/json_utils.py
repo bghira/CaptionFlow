@@ -13,10 +13,12 @@ def safe_json_dumps(obj: Any, **kwargs) -> str:
     """Safely serialize objects to JSON, handling special types.
 
     Args:
+    ----
         obj: Object to serialize
         **kwargs: Additional arguments to pass to json.dumps
 
     Returns:
+    -------
         JSON string representation
 
     """
@@ -27,9 +29,11 @@ def safe_dict(obj: Any) -> Dict[str, Any]:
     """Convert an object to a dictionary, handling special types.
 
     Args:
+    ----
         obj: Object to convert (dataclass, dict, etc.)
 
     Returns:
+    -------
         Dictionary with JSON-serializable values
 
     """
@@ -49,9 +53,11 @@ def sanitize_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     """Recursively sanitize a dictionary to ensure all values are JSON-serializable.
 
     Args:
+    ----
         data: Dictionary to sanitize
 
     Returns:
+    -------
         Sanitized dictionary
 
     """
@@ -86,9 +92,11 @@ def sanitize_value(value: Any) -> Any:
     """Sanitize a single value for JSON serialization.
 
     Args:
+    ----
         value: Value to sanitize
 
     Returns:
+    -------
         JSON-serializable value
 
     """
@@ -118,12 +126,15 @@ def json_serializer(obj: Any) -> Any:
     """Default JSON serializer for special types.
 
     Args:
+    ----
         obj: Object to serialize
 
     Returns:
+    -------
         JSON-serializable representation
 
     Raises:
+    ------
         TypeError: If object type is not supported
 
     """
@@ -149,9 +160,11 @@ def parse_datetime(dt_string: Union[str, datetime, None]) -> Union[datetime, Non
     """Parse a datetime string or return existing datetime.
 
     Args:
+    ----
         dt_string: ISO format datetime string, datetime object, or None
 
     Returns:
+    -------
         datetime object or None
 
     """
@@ -176,9 +189,11 @@ def to_json_dict(obj: Any) -> Dict[str, Any]:
     This is a convenience wrapper around safe_dict.
 
     Args:
+    ----
         obj: Object to convert
 
     Returns:
+    -------
         JSON-serializable dictionary
 
     """
@@ -191,10 +206,12 @@ def to_json_string(obj: Any, indent: int = None) -> str:
     This is a convenience wrapper around safe_json_dumps.
 
     Args:
+    ----
         obj: Object to convert
         indent: Number of spaces for indentation (None for compact)
 
     Returns:
+    -------
         JSON string
 
     """

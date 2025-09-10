@@ -8,8 +8,6 @@ from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 import pytest
-from PIL import Image
-
 from caption_flow.models import JobId
 from caption_flow.processors.base import ProcessorConfig, WorkResult, WorkUnit
 from caption_flow.processors.webdataset import (
@@ -18,6 +16,7 @@ from caption_flow.processors.webdataset import (
 )
 from caption_flow.storage import StorageManager
 from caption_flow.utils.chunk_tracker import ChunkTracker
+from PIL import Image
 
 
 class TestWebDatasetOrchestratorProcessor:

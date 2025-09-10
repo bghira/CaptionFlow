@@ -7,7 +7,6 @@ from websockets.asyncio.server import ServerConnection
 # Import pytest-asyncio
 pytest_plugins = ("pytest_asyncio",)
 import pytest_asyncio
-
 from caption_flow.orchestrator import Orchestrator
 
 

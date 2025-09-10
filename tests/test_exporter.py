@@ -11,7 +11,6 @@ import lance
 import pandas as pd
 import pytest
 import pytest_asyncio
-
 from caption_flow.models import Caption, StorageContents
 from caption_flow.storage import StorageManager
 from caption_flow.storage.exporter import LanceStorageExporter, StorageExporter

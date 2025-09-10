@@ -181,10 +181,12 @@ class WorkerProcessor(ABC):
         """Process a single work unit, yielding items to be captioned.
 
         Args:
+        ----
             unit: The work unit to process
             context: Runtime context (e.g., models, sampling params)
 
         Yields:
+        ------
             Dict containing:
                 - image: PIL Image
                 - metadata: Dict of metadata

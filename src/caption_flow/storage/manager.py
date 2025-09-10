@@ -134,9 +134,11 @@ class StorageManager:
         Currently, we just use a single output shard, but this allows for future implementation of multiple.
 
         Args:
+        ----
             output_shard (Optional[str]): The output shard identifier. If None, uses default shard.
 
         Returns:
+        -------
             duckdb.DuckDBPyConnection: The DuckDB connection for the specified shard.
 
         """

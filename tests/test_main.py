@@ -14,7 +14,6 @@ import pytest
 # Import pytest-asyncio
 pytest_plugins = ("pytest_asyncio",)
 import pytest_asyncio
-
 from caption_flow.models import Caption, Contributor, JobId, ProcessingStage
 
 # Import the modules to test
