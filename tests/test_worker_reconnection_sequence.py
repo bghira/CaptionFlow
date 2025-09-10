@@ -9,11 +9,15 @@ import asyncio
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Set
+from collections import deque, defaultdict
+import threading
+from unittest.mock import Mock
 
 import pytest
 from caption_flow.models import JobId
 from caption_flow.processors import ProcessorConfig
 from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
+from caption_flow.processors.base import WorkUnit
 
 
 class MockStorageManager:
@@ -71,8 +75,65 @@ async def test_worker_reconnection_lower_sequence_assignment(
     )
     storage = MockStorageManager()
 
-    processor.initialize(processor_config, storage)
-    await asyncio.sleep(2)  # Wait for initial unit creation
+    # Mock the initialization to avoid real dataset loading
+    processor.dataset_name = orchestrator_config["dataset"]["dataset_path"]
+    processor.config = "default"
+    processor.split = "train"
+    processor.chunk_size = orchestrator_config["chunk_size"]
+    processor.min_buffer = orchestrator_config["min_chunk_buffer"]
+    processor.buffer_multiplier = orchestrator_config["chunk_buffer_multiplier"]
+    processor.storage = storage
+    processor.data_files = {}
+
+    # Initialize components manually
+    from caption_flow.utils.chunk_tracker import ChunkTracker
+
+    processor.chunk_tracker = ChunkTracker(temp_checkpoint_dir / "chunks.json")
+    processor.lock = threading.Lock()
+    processor.work_units = {}
+    processor.pending_units = deque()
+    processor.assigned_units = defaultdict(set)
+    processor.stop_creation = threading.Event()
+    processor.unit_creation_thread = None
+    processor.stop_creation.set()  # Prevent background thread
+
+    # Create initial work units manually
+    for chunk_idx in range(10):  # Create 10 chunks for testing
+        chunk_id = f"photos_sequential:chunk:{chunk_idx}"
+        chunk_start = chunk_idx * 1000
+
+        work_unit = WorkUnit(
+            unit_id=chunk_id,
+            chunk_id=chunk_id,
+            source_id="photos_sequential",
+            unit_size=1000,
+            data={
+                "start_index": chunk_start,
+                "chunk_size": 1000,
+                "shard_name": "photos_sequential",
+            },
+            metadata={
+                "chunk_index": chunk_idx,
+                "shard_name": "photos_sequential",
+            },
+        )
+
+        processor.work_units[chunk_id] = work_unit
+        processor.pending_units.append(chunk_id)
+
+        # Add to chunk tracker
+        processor.chunk_tracker.add_chunk(
+            chunk_id, "photos_sequential", "dummy_shard.parquet", chunk_start, 1000
+        )
+
+    # Mock the _create_work_units_from_chunk method
+    def mock_create_work_units_from_chunk(chunk_index):
+        chunk_id = f"photos_sequential:chunk:{chunk_index}"
+        if chunk_id in processor.work_units:
+            return [processor.work_units[chunk_id]]
+        return []
+
+    processor._create_work_units_from_chunk = mock_create_work_units_from_chunk
 
     # Track all job IDs and worker assignments
     all_job_ids = set()
@@ -140,8 +201,8 @@ async def test_worker_reconnection_lower_sequence_assignment(
     processor.release_assignments(disconnecting_worker)
     print(f"    Released assignments for {disconnecting_worker}")
 
-    # Allow time for work units to be re-queued
-    await asyncio.sleep(0.5)
+    # Allow time for work units to be re-queued (reduced from 0.5s)
+    await asyncio.sleep(0.01)
 
     print("\n3. PHASE 3: Worker reconnection and new assignment")
 
@@ -220,7 +281,7 @@ async def test_worker_reconnection_lower_sequence_assignment(
     if duplicate_job_ids:
         print("\n  🚨 DUPLICATE JOB IDs DETECTED:")
         for i, dup in enumerate(duplicate_job_ids[:10]):
-            print(f"    {i+1}. {dup['job_id']}")
+            print(f"    {i + 1}. {dup['job_id']}")
             print(f"       Worker: {dup['worker']}")
             print(f"       Chunk: {dup['chunk_index']}")
             print(f"       Sample: {dup['sample_index']}")
@@ -327,8 +388,65 @@ async def test_prevent_duplicate_assignments_on_reconnection(
     )
     storage = MockStorageManager()
 
-    processor.initialize(processor_config, storage)
-    await asyncio.sleep(2)
+    # Mock the initialization to avoid real dataset loading
+    processor.dataset_name = orchestrator_config["dataset"]["dataset_path"]
+    processor.config = "default"
+    processor.split = "train"
+    processor.chunk_size = orchestrator_config["chunk_size"]
+    processor.min_buffer = orchestrator_config["min_chunk_buffer"]
+    processor.buffer_multiplier = orchestrator_config["chunk_buffer_multiplier"]
+    processor.storage = storage
+    processor.data_files = {}
+
+    # Initialize components manually
+    from caption_flow.utils.chunk_tracker import ChunkTracker
+
+    processor.chunk_tracker = ChunkTracker(temp_checkpoint_dir / "chunks.json")
+    processor.lock = threading.Lock()
+    processor.work_units = {}
+    processor.pending_units = deque()
+    processor.assigned_units = defaultdict(set)
+    processor.stop_creation = threading.Event()
+    processor.unit_creation_thread = None
+    processor.stop_creation.set()  # Prevent background thread
+
+    # Create initial work units manually
+    for chunk_idx in range(10):  # Create 10 chunks for testing
+        chunk_id = f"photos_sequential:chunk:{chunk_idx}"
+        chunk_start = chunk_idx * 1000
+
+        work_unit = WorkUnit(
+            unit_id=chunk_id,
+            chunk_id=chunk_id,
+            source_id="photos_sequential",
+            unit_size=1000,
+            data={
+                "start_index": chunk_start,
+                "chunk_size": 1000,
+                "shard_name": "photos_sequential",
+            },
+            metadata={
+                "chunk_index": chunk_idx,
+                "shard_name": "photos_sequential",
+            },
+        )
+
+        processor.work_units[chunk_id] = work_unit
+        processor.pending_units.append(chunk_id)
+
+        # Add to chunk tracker
+        processor.chunk_tracker.add_chunk(
+            chunk_id, "photos_sequential", "dummy_shard.parquet", chunk_start, 1000
+        )
+
+    # Mock the _create_work_units_from_chunk method
+    def mock_create_work_units_from_chunk(chunk_index):
+        chunk_id = f"photos_sequential:chunk:{chunk_index}"
+        if chunk_id in processor.work_units:
+            return [processor.work_units[chunk_id]]
+        return []
+
+    processor._create_work_units_from_chunk = mock_create_work_units_from_chunk
 
     # Track all job IDs globally to detect any duplicates
     global_job_ids = set()
@@ -367,9 +485,9 @@ async def test_prevent_duplicate_assignments_on_reconnection(
                 )
                 job_id_str = job_id_obj.get_sample_str()
 
-                assert (
-                    job_id_str not in global_job_ids
-                ), f"Duplicate job ID in initial assignment: {job_id_str}"
+                assert job_id_str not in global_job_ids, (
+                    f"Duplicate job ID in initial assignment: {job_id_str}"
+                )
                 global_job_ids.add(job_id_str)
 
     # Phase 2: Simulate disconnection and reconnection
@@ -385,8 +503,8 @@ async def test_prevent_duplicate_assignments_on_reconnection(
     # Release assignments
     processor.release_assignments(disconnecting_worker)
 
-    # Small delay for re-queuing
-    await asyncio.sleep(0.1)
+    # Small delay for re-queuing (reduced)
+    await asyncio.sleep(0.01)
 
     # Reconnect and get new assignments
     new_units = processor.get_work_units(count=2, worker_id=disconnecting_worker)
@@ -452,9 +570,9 @@ async def test_prevent_duplicate_assignments_on_reconnection(
                 )
                 job_id_str = job_id_obj.get_sample_str()
 
-                assert (
-                    job_id_str not in all_currently_assigned_jobs
-                ), f"Duplicate active assignment: {job_id_str}"
+                assert job_id_str not in all_currently_assigned_jobs, (
+                    f"Duplicate active assignment: {job_id_str}"
+                )
                 all_currently_assigned_jobs.add(job_id_str)
 
     processor.stop_creation.set()

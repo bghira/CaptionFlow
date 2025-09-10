@@ -9,14 +9,17 @@ This test demonstrates:
 
 import asyncio
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Set
+import threading
+from unittest.mock import Mock
 
 import pytest
 from caption_flow.models import Caption, JobId
 from caption_flow.processors import ProcessorConfig
 from caption_flow.processors.huggingface import HuggingFaceDatasetOrchestratorProcessor
+from caption_flow.processors.base import WorkUnit
 
 
 class MockStorageManager:
@@ -105,8 +108,65 @@ async def test_worker_reconnection_demonstrates_issue_and_solution(
     )
     storage = MockStorageManager()
 
-    processor.initialize(processor_config, storage)
-    await asyncio.sleep(2)  # Wait for initial unit creation
+    # Mock the initialization to avoid real dataset loading
+    processor.dataset_name = orchestrator_config["dataset"]["dataset_path"]
+    processor.config = "default"
+    processor.split = "train"
+    processor.chunk_size = orchestrator_config["chunk_size"]
+    processor.min_buffer = orchestrator_config["min_chunk_buffer"]
+    processor.buffer_multiplier = orchestrator_config["chunk_buffer_multiplier"]
+    processor.storage = storage
+    processor.data_files = {}
+
+    # Initialize components manually
+    from caption_flow.utils.chunk_tracker import ChunkTracker
+
+    processor.chunk_tracker = ChunkTracker(temp_checkpoint_dir / "chunks.json")
+    processor.lock = threading.Lock()
+    processor.work_units = {}
+    processor.pending_units = deque()
+    processor.assigned_units = defaultdict(set)
+    processor.stop_creation = threading.Event()
+    processor.unit_creation_thread = None
+    processor.stop_creation.set()  # Prevent background thread
+
+    # Create initial work units manually
+    for chunk_idx in range(15):  # Create 15 chunks for testing
+        chunk_id = f"photos_sequential:chunk:{chunk_idx}"
+        chunk_start = chunk_idx * 100  # Use 100-item chunks as per config
+
+        work_unit = WorkUnit(
+            unit_id=chunk_id,
+            chunk_id=chunk_id,
+            source_id="photos_sequential",
+            unit_size=100,
+            data={
+                "start_index": chunk_start,
+                "chunk_size": 100,
+                "shard_name": "photos_sequential",
+            },
+            metadata={
+                "chunk_index": chunk_idx,
+                "shard_name": "photos_sequential",
+            },
+        )
+
+        processor.work_units[chunk_id] = work_unit
+        processor.pending_units.append(chunk_id)
+
+        # Add to chunk tracker
+        processor.chunk_tracker.add_chunk(
+            chunk_id, "photos_sequential", "dummy_shard.parquet", chunk_start, 100
+        )
+
+    # Mock the _create_work_units_from_chunk method
+    def mock_create_work_units_from_chunk(chunk_index):
+        chunk_id = f"photos_sequential:chunk:{chunk_index}"
+        if chunk_id in processor.work_units:
+            return [processor.work_units[chunk_id]]
+        return []
+
+    processor._create_work_units_from_chunk = mock_create_work_units_from_chunk
 
     print("\n📊 PHASE 1: ESTABLISH BASELINE - Initial Worker Assignments")
 
@@ -204,7 +264,7 @@ async def test_worker_reconnection_demonstrates_issue_and_solution(
     processor.release_assignments(worker_1)
     print(f"    ⚡ Released assignments for {worker_1}")
 
-    await asyncio.sleep(0.5)  # Allow time for re-queuing
+    await asyncio.sleep(0.01)  # Allow time for re-queuing (reduced)
 
     print("\n🔌 PHASE 4: WORKER RECONNECTION & REASSIGNMENT")
 
@@ -384,8 +444,65 @@ async def test_proposed_solution_smarter_chunk_assignment(orchestrator_config, t
     )
     storage = MockStorageManager()
 
-    processor.initialize(processor_config, storage)
-    await asyncio.sleep(2)
+    # Mock the initialization to avoid real dataset loading
+    processor.dataset_name = orchestrator_config["dataset"]["dataset_path"]
+    processor.config = "default"
+    processor.split = "train"
+    processor.chunk_size = orchestrator_config["chunk_size"]
+    processor.min_buffer = orchestrator_config["min_chunk_buffer"]
+    processor.buffer_multiplier = orchestrator_config["chunk_buffer_multiplier"]
+    processor.storage = storage
+    processor.data_files = {}
+
+    # Initialize components manually
+    from caption_flow.utils.chunk_tracker import ChunkTracker
+
+    processor.chunk_tracker = ChunkTracker(temp_checkpoint_dir / "chunks.json")
+    processor.lock = threading.Lock()
+    processor.work_units = {}
+    processor.pending_units = deque()
+    processor.assigned_units = defaultdict(set)
+    processor.stop_creation = threading.Event()
+    processor.unit_creation_thread = None
+    processor.stop_creation.set()  # Prevent background thread
+
+    # Create initial work units manually
+    for chunk_idx in range(15):  # Create 15 chunks for testing
+        chunk_id = f"photos_sequential:chunk:{chunk_idx}"
+        chunk_start = chunk_idx * 100  # Use 100-item chunks as per config
+
+        work_unit = WorkUnit(
+            unit_id=chunk_id,
+            chunk_id=chunk_id,
+            source_id="photos_sequential",
+            unit_size=100,
+            data={
+                "start_index": chunk_start,
+                "chunk_size": 100,
+                "shard_name": "photos_sequential",
+            },
+            metadata={
+                "chunk_index": chunk_idx,
+                "shard_name": "photos_sequential",
+            },
+        )
+
+        processor.work_units[chunk_id] = work_unit
+        processor.pending_units.append(chunk_id)
+
+        # Add to chunk tracker
+        processor.chunk_tracker.add_chunk(
+            chunk_id, "photos_sequential", "dummy_shard.parquet", chunk_start, 100
+        )
+
+    # Mock the _create_work_units_from_chunk method
+    def mock_create_work_units_from_chunk(chunk_index):
+        chunk_id = f"photos_sequential:chunk:{chunk_index}"
+        if chunk_id in processor.work_units:
+            return [processor.work_units[chunk_id]]
+        return []
+
+    processor._create_work_units_from_chunk = mock_create_work_units_from_chunk
 
     print("\n🧠 INTELLIGENT ASSIGNMENT STRATEGY:")
     print("  1. Track which chunks are being actively processed")
@@ -413,7 +530,7 @@ async def test_proposed_solution_smarter_chunk_assignment(orchestrator_config, t
 
     # Simulate worker 1 disconnect
     processor.release_assignments(worker_1)
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.01)  # Small delay for re-queuing (reduced)
 
     # Smart reassignment: should prefer new chunks over reassigning worker 2's chunks
     units_w1_reconnect = processor.get_work_units(count=2, worker_id=worker_1)
@@ -439,9 +556,9 @@ async def test_proposed_solution_smarter_chunk_assignment(orchestrator_config, t
     processor.stop_creation.set()
 
     # The green test should demonstrate no conflicts
-    assert (
-        len(overlap_with_active) == 0
-    ), f"Smart assignment should avoid conflicts, but found {overlap_with_active}"
+    assert len(overlap_with_active) == 0, (
+        f"Smart assignment should avoid conflicts, but found {overlap_with_active}"
+    )
 
     print("\n  🎯 SOLUTION VALIDATION:")
     print("    ✅ Smarter chunk assignment prevents duplicate work")
