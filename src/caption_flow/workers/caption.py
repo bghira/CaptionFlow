@@ -137,6 +137,19 @@ class MultiStageVLLMManager:
 
     def get_model_for_stage(self, stage_name: str, model_name: str) -> Tuple[Any, Any, Any, Any]:
         """Get model components for a stage."""
+        if model_name not in self.models:
+            raise KeyError(
+                f"Model '{model_name}' not found in loaded models. Available models: {list(self.models.keys())}"
+            )
+        if model_name not in self.processors:
+            raise KeyError(f"Processor for model '{model_name}' not found")
+        if model_name not in self.tokenizers:
+            raise KeyError(f"Tokenizer for model '{model_name}' not found")
+        if stage_name not in self.sampling_params:
+            raise KeyError(
+                f"Sampling params for stage '{stage_name}' not found. Available stages: {list(self.sampling_params.keys())}"
+            )
+
         return (
             self.models[model_name],
             self.processors[model_name],
@@ -489,7 +502,19 @@ class CaptionWorker(BaseWorker):
                     return True
                 except Exception as e:
                     logger.error(f"Failed to reload vLLM: {e}")
+                    # Restore previous state
                     self.vllm_config = old_config
+                    self.stages = self._parse_stages_config(old_config)
+                    self.stage_order = self._topological_sort_stages(self.stages)
+                    # Attempt to restore previous models
+                    try:
+                        self._setup_vllm()
+                    except Exception as restore_error:
+                        logger.error(f"Failed to restore previous vLLM state: {restore_error}")
+                        # Clean up broken state
+                        if self.model_manager:
+                            self.model_manager.cleanup()
+                            self.model_manager = None
                     return False
             else:
                 # Clean up models if switching to mock mode
@@ -886,10 +911,21 @@ class CaptionWorker(BaseWorker):
             stage = next(s for s in self.stages if s.name == stage_name)
             logger.debug(f"Processing batch through stage: {stage_name}")
 
+            # Check if model manager is properly initialized
+            if not self.model_manager:
+                logger.error("Model manager not initialized")
+                self.items_failed += len(batch)
+                return []
+
             # Get model components
-            llm, processor, tokenizer, sampling_params = self.model_manager.get_model_for_stage(
-                stage_name, stage.model
-            )
+            try:
+                llm, processor, tokenizer, sampling_params = self.model_manager.get_model_for_stage(
+                    stage_name, stage.model
+                )
+            except KeyError as e:
+                logger.error(f"Model not found during batch processing: {e}")
+                self.items_failed += len(batch)
+                return []
 
             # Validate batch before processing
             processable_batch, too_long_items = self._validate_and_split_batch(
