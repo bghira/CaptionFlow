@@ -58,7 +58,7 @@ jobs:
         file: ./coverage.xml
         fail_ci_if_error: false
         verbose: true
-
+        token: ${{ secrets.CODECOV_TOKEN }}
   lint:
     runs-on: ubuntu-latest
     steps:
