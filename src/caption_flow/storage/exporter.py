@@ -53,7 +53,7 @@ class LanceStorageExporter:
             Number of items exported
         """
         logger.debug(f"Getting shard contents for {shard_name}")
-        self.storage_manager.initialize()
+        await self.storage_manager.initialize()
         contents = await self.storage_manager.get_shard_contents(
             shard_name, limit=limit, columns=columns
         )

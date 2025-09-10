@@ -134,8 +134,8 @@ class CertificateManager:
         return {
             "subject": cert.subject.rfc4514_string(),
             "issuer": cert.issuer.rfc4514_string(),
-            "not_before": cert.not_valid_before,
-            "not_after": cert.not_valid_after,
+            "not_before": cert.not_valid_before_utc,
+            "not_after": cert.not_valid_after_utc,
             "serial_number": cert.serial_number,
             "is_self_signed": cert.issuer == cert.subject,
         }

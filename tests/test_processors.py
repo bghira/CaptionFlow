@@ -613,9 +613,11 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
 
         with patch("uvicorn.Config") as mock_config:
             with patch("uvicorn.Server") as mock_server:
-                with patch("asyncio.new_event_loop") as mock_loop:
-                    # Make mock_loop return a proper event loop
-                    mock_loop.return_value = asyncio.new_event_loop()
+                with patch(
+                    "caption_flow.processors.local_filesystem.threading.Thread"
+                ) as mock_thread:
+                    # Mock the threading to prevent actual thread creation
+                    mock_thread.return_value.start = Mock()
 
                     orchestrator.initialize(orchestrator_config, storage_manager)
 

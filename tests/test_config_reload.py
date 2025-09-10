@@ -2,7 +2,7 @@ import pytest
 import json
 import asyncio
 from unittest.mock import AsyncMock, Mock, patch
-from websockets.server import WebSocketServerProtocol
+from websockets.asyncio.server import ServerConnection
 
 # Import pytest-asyncio
 pytest_plugins = ("pytest_asyncio",)
@@ -68,7 +68,7 @@ class TestConfigReload:
         }
 
         # Mock websocket
-        websocket = AsyncMock(spec=WebSocketServerProtocol)
+        websocket = AsyncMock(spec=ServerConnection)
 
         # Perform config reload
         await orchestrator._handle_config_reload(websocket, new_config)
@@ -103,7 +103,7 @@ class TestConfigReload:
         }
 
         # Mock websocket
-        websocket = AsyncMock(spec=WebSocketServerProtocol)
+        websocket = AsyncMock(spec=ServerConnection)
 
         # Perform config reload
         await orchestrator._handle_config_reload(websocket, new_config)
@@ -141,7 +141,7 @@ class TestConfigReload:
         }
 
         # Mock websocket
-        websocket = AsyncMock(spec=WebSocketServerProtocol)
+        websocket = AsyncMock(spec=ServerConnection)
 
         # Perform config reload
         await orchestrator._handle_config_reload(websocket, new_config)
@@ -179,7 +179,7 @@ class TestConfigReload:
         }
 
         # Mock websocket
-        websocket = AsyncMock(spec=WebSocketServerProtocol)
+        websocket = AsyncMock(spec=ServerConnection)
 
         # Perform config reload
         await orchestrator._handle_config_reload(websocket, new_config)
@@ -203,7 +203,7 @@ class TestConfigReload:
         }
 
         # Mock websocket
-        websocket = AsyncMock(spec=WebSocketServerProtocol)
+        websocket = AsyncMock(spec=ServerConnection)
 
         # Perform config reload - should not crash
         await orchestrator._handle_config_reload(websocket, new_config)
@@ -238,7 +238,7 @@ class TestConfigReload:
             }
         }
 
-        websocket = AsyncMock(spec=WebSocketServerProtocol)
+        websocket = AsyncMock(spec=ServerConnection)
         await orchestrator._handle_config_reload(websocket, new_config)
 
         # Test authentication after reload - should still work

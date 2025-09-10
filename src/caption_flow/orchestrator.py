@@ -13,7 +13,7 @@ from collections import defaultdict
 import threading
 
 import websockets
-from websockets.server import WebSocketServerProtocol
+from websockets.asyncio.server import ServerConnection
 
 from .storage import StorageManager
 from .models import Caption, Contributor, JobId
@@ -71,8 +71,8 @@ class Orchestrator:
         self.chunks_per_request = config.get("chunks_per_request", 2)
 
         # Track connections
-        self.workers: Dict[str, WebSocketServerProtocol] = {}
-        self.monitors: Set[WebSocketServerProtocol] = set()
+        self.workers: Dict[str, ServerConnection] = {}
+        self.monitors: Set[ServerConnection] = set()
         self.workers_by_user = defaultdict(set)
 
         # SSL configuration
@@ -162,11 +162,11 @@ class Orchestrator:
         processed_job_ids = self.storage.get_all_processed_job_ids()
         self.processor.update_from_storage(processed_job_ids)
 
-    async def _send_leaderboard_to_monitor(self, websocket: WebSocketServerProtocol):
+    async def _send_leaderboard_to_monitor(self, websocket: ServerConnection):
         """Alias for _send_monitor_leaderboard for backward compatibility."""
         await self._send_monitor_leaderboard(websocket)
 
-    async def handle_connection(self, websocket: WebSocketServerProtocol):
+    async def handle_connection(self, websocket: ServerConnection):
         """Handle new WebSocket connection."""
         try:
             # Authenticate
@@ -195,7 +195,7 @@ class Orchestrator:
             logger.error(f"Connection error: {e}", exc_info=True)
             await websocket.close()
 
-    async def _handle_worker(self, websocket: WebSocketServerProtocol, auth_ticket):
+    async def _handle_worker(self, websocket: ServerConnection, auth_ticket):
         """Handle worker connection lifecycle."""
         # Generate unique worker ID
         base_name = getattr(auth_ticket, "name", "worker")
@@ -283,9 +283,7 @@ class Orchestrator:
             and current_monitors == new_monitors
         )
 
-    async def _handle_config_reload(
-        self, websocket: WebSocketServerProtocol, new_config: Dict[str, Any]
-    ):
+    async def _handle_config_reload(self, websocket: ServerConnection, new_config: Dict[str, Any]):
         """Handle configuration reload request."""
         logger.info("Processing configuration reload request")
 
@@ -501,7 +499,7 @@ class Orchestrator:
                 exc_info=True,
             )
 
-    async def _handle_monitor(self, websocket: WebSocketServerProtocol):
+    async def _handle_monitor(self, websocket: ServerConnection):
         """Handle monitor connection."""
         self.monitors.add(websocket)
         logger.info(f"Monitor connected (total: {len(self.monitors)})")
@@ -522,7 +520,7 @@ class Orchestrator:
         finally:
             self.monitors.discard(websocket)
 
-    async def _handle_admin(self, websocket: WebSocketServerProtocol, auth_ticket):
+    async def _handle_admin(self, websocket: ServerConnection, auth_ticket):
         """Handle admin connection."""
         admin_id = getattr(auth_ticket, "name", "admin")
         logger.info(f"Admin {admin_id} connected")
@@ -544,7 +542,7 @@ class Orchestrator:
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Admin {admin_id} disconnected")
 
-    async def _handle_data_worker(self, websocket: WebSocketServerProtocol, auth_ticket):
+    async def _handle_data_worker(self, websocket: ServerConnection, auth_ticket):
         """Handle data worker connection."""
         worker_id = getattr(auth_ticket, "name", str(uuid.uuid4()))
         self.data_workers[worker_id] = websocket
@@ -613,7 +611,7 @@ class Orchestrator:
         finally:
             del self.data_workers[worker_id]
 
-    async def _send_monitor_initial_data(self, websocket: WebSocketServerProtocol):
+    async def _send_monitor_initial_data(self, websocket: ServerConnection):
         """Send initial data to monitor in a separate task to avoid blocking."""
         total_start = time.time()
         try:
@@ -670,7 +668,7 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Error sending initial monitor data: {e}")
 
-    async def _send_monitor_leaderboard(self, websocket: WebSocketServerProtocol):
+    async def _send_monitor_leaderboard(self, websocket: ServerConnection):
         """Send leaderboard data to a specific monitor."""
         total_start = time.time()
         try:
@@ -735,7 +733,7 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Error sending leaderboard to monitor: {e}")
 
-    async def _send_monitor_stats(self, websocket: WebSocketServerProtocol):
+    async def _send_monitor_stats(self, websocket: ServerConnection):
         """Send current stats to a monitor."""
         # Get processor stats
         processor_stats = self.processor.get_stats()

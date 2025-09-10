@@ -136,7 +136,7 @@ class TestGenerateSelfSigned:
             cert = x509.load_pem_x509_certificate(f.read())
 
         # Check validity period (should be ~365 days)
-        validity_period = cert.not_valid_after - cert.not_valid_before
+        validity_period = cert.not_valid_after_utc - cert.not_valid_before_utc
         assert 364 <= validity_period.days <= 366  # Allow some tolerance
 
     def test_generate_self_signed_subject_alternative_names(self, cert_manager, temp_output_dir):

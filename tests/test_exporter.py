@@ -1,6 +1,7 @@
 """Tests for storage exporter functionality."""
 
 import pytest
+import pytest_asyncio
 import asyncio
 import json
 import csv
@@ -28,7 +29,7 @@ def temp_storage_dir():
         yield Path(temp_dir)
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def populated_storage_manager(temp_storage_dir):
     """Create a StorageManager with test data."""
     storage = StorageManager(temp_storage_dir)
@@ -127,14 +128,14 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_exporter_initialization(self, populated_storage_manager):
         """Test that LanceStorageExporter initializes correctly."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         assert exporter.storage_manager == storage
 
     @pytest.mark.asyncio
     async def test_export_shard_jsonl(self, populated_storage_manager, temp_storage_dir):
         """Test exporting shard to JSONL format."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         output_path = temp_storage_dir / "test_export.jsonl"
 
@@ -163,7 +164,7 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_export_shard_csv(self, populated_storage_manager, temp_storage_dir):
         """Test exporting shard to CSV format."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         output_path = temp_storage_dir / "test_export.csv"
 
@@ -184,7 +185,7 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_export_shard_json_directory(self, populated_storage_manager, temp_storage_dir):
         """Test exporting shard to JSON directory format."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         output_dir = temp_storage_dir / "json_export"
 
@@ -211,7 +212,7 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_export_shard_txt(self, populated_storage_manager, temp_storage_dir):
         """Test exporting shard to TXT format."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         output_dir = temp_storage_dir / "txt_export"
 
@@ -235,7 +236,7 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_export_shard_parquet(self, populated_storage_manager, temp_storage_dir):
         """Test exporting shard to Parquet format."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         output_path = temp_storage_dir / "test_export.parquet"
 
@@ -255,7 +256,7 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_export_all_shards(self, populated_storage_manager, temp_storage_dir):
         """Test exporting all shards to multiple formats."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
 
         results = await exporter.export_all_shards("jsonl", temp_storage_dir)
@@ -270,7 +271,7 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_export_with_column_filter(self, populated_storage_manager, temp_storage_dir):
         """Test exporting with specific columns."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         output_path = temp_storage_dir / "filtered.jsonl"
 
@@ -293,7 +294,7 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_export_with_limit(self, populated_storage_manager, temp_storage_dir):
         """Test exporting with row limit."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         output_path = temp_storage_dir / "limited.jsonl"
 
@@ -312,7 +313,7 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_export_nonexistent_shard(self, populated_storage_manager, temp_storage_dir):
         """Test exporting non-existent shard returns 0."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         output_path = temp_storage_dir / "empty.jsonl"
 
@@ -329,7 +330,7 @@ class TestLanceStorageExporter:
     @pytest.mark.asyncio
     async def test_export_to_lance(self, populated_storage_manager, temp_storage_dir):
         """Test exporting to Lance format."""
-        storage = await populated_storage_manager
+        storage = populated_storage_manager
         exporter = LanceStorageExporter(storage)
         output_path = temp_storage_dir / "exported.lance"
 

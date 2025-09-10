@@ -650,7 +650,17 @@ class TestCaptionWorkerProcessors:
             },
         }
 
-        await worker._handle_welcome(welcome_data)
+        # Mock the heavy initialization operations to speed up CI
+        with patch(
+            "caption_flow.processors.local_filesystem.LocalFilesystemWorkerProcessor.initialize"
+        ) as mock_init:
+            # Just set the required attributes without full initialization
+            def mock_initialize(config):
+                worker.processor.dataset_path = "/tmp/images"
+
+            mock_init.side_effect = mock_initialize
+
+            await worker._handle_welcome(welcome_data)
 
         assert worker.processor_type == "local_filesystem"
         assert worker.processor is not None
