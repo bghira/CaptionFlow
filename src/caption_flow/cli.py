@@ -1276,33 +1276,6 @@ async def _export_single_format(
                 console.print(f"  • {shard_name}: {count:,} items")
 
 
-@main.command()
-@click.option("--data-dir", default="./caption_data", help="Storage directory")
-@click.option(
-    "--format",
-    type=click.Choice(
-        ["jsonl", "json", "csv", "txt", "parquet", "lance", "huggingface_hub", "all"],
-        case_sensitive=False,
-    ),
-    default="jsonl",
-    help="Export format (default: jsonl)",
-)
-@click.option("--output", "-o", help="Output path (file for jsonl/csv, directory for json/txt)")
-@click.option("--limit", type=int, help="Limit number of rows to export")
-@click.option("--columns", help="Comma-separated list of columns to export (default: all)")
-@click.option("--export-column", default="captions", help="Column to export for txt format")
-@click.option("--filename-column", default="filename", help="Column containing filenames")
-@click.option("--shard", help="Specific shard to export (e.g., data-0001)")
-@click.option("--shards", help="Comma-separated list of shards to export")
-@click.option("--include-empty", is_flag=True, help="Include rows with empty export column")
-@click.option("--stats-only", is_flag=True, help="Show statistics without exporting")
-@click.option("--optimize", is_flag=True, help="Optimize storage before export")
-@click.option("--verbose", is_flag=True, help="Show detailed export progress")
-@click.option("--hf-dataset", help="Dataset name on HF Hub (e.g., username/dataset-name)")
-@click.option("--license", default="apache-2.0", help="License for the dataset")
-@click.option("--private", is_flag=True, help="Make HF dataset private")
-@click.option("--nsfw", is_flag=True, help="Add not-for-all-audiences tag")
-@click.option("--tags", help="Comma-separated tags for HF dataset")
 def _validate_export_setup(data_dir):
     """Validate export setup and create storage manager."""
     from .storage import StorageManager
@@ -1333,6 +1306,7 @@ async def _run_export_process(
     tags,
     stats_only,
     optimize,
+    include_empty,
 ):
     """Execute the main export process."""
     from .storage.exporter import LanceStorageExporter
@@ -1448,6 +1422,7 @@ def export(
                 tags,
                 stats_only,
                 optimize,
+                include_empty,
             )
         )
     except ExportError as e:
