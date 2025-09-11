@@ -41,9 +41,9 @@ class Orchestrator:
 
         # Processor configuration
         processor_type = config.get("dataset", {}).get("processor_type", None)
-        assert processor_type is not None, (
-            "You must supply processor_type in your orchestrator dataset configuration."
-        )
+        assert (
+            processor_type is not None
+        ), "You must supply processor_type in your orchestrator dataset configuration."
         processor_config = ProcessorConfig(processor_type=processor_type, config=config)
 
         # Initialize processor

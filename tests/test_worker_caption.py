@@ -859,9 +859,9 @@ class TestCaptionWorker:
                 work_failed_call = sent_data
                 break
 
-        assert work_failed_call is not None, (
-            "work_failed message should have been sent for incomplete unit"
-        )
+        assert (
+            work_failed_call is not None
+        ), "work_failed message should have been sent for incomplete unit"
         assert work_failed_call["unit_id"] == "unit1"
         assert "Processing incomplete" in work_failed_call["error"]
         assert "1/3 items processed" in work_failed_call["error"]

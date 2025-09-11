@@ -486,9 +486,9 @@ async def test_prevent_duplicate_assignments_on_reconnection(
                 )
                 job_id_str = job_id_obj.get_sample_str()
 
-                assert job_id_str not in global_job_ids, (
-                    f"Duplicate job ID in initial assignment: {job_id_str}"
-                )
+                assert (
+                    job_id_str not in global_job_ids
+                ), f"Duplicate job ID in initial assignment: {job_id_str}"
                 global_job_ids.add(job_id_str)
 
     # Phase 2: Simulate disconnection and reconnection
@@ -573,9 +573,9 @@ async def test_prevent_duplicate_assignments_on_reconnection(
                 )
                 job_id_str = job_id_obj.get_sample_str()
 
-                assert job_id_str not in all_currently_assigned_jobs, (
-                    f"Duplicate active assignment: {job_id_str}"
-                )
+                assert (
+                    job_id_str not in all_currently_assigned_jobs
+                ), f"Duplicate active assignment: {job_id_str}"
                 all_currently_assigned_jobs.add(job_id_str)
 
     processor.stop_creation.set()

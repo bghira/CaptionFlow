@@ -201,9 +201,9 @@ class TestHuggingFaceWithRealStorage:
         processor.stop_creation.set()
         await storage.close()
 
-        assert len(duplicate_job_ids) == 0, (
-            f"Found {len(duplicate_job_ids)} duplicate job IDs in storage"
-        )
+        assert (
+            len(duplicate_job_ids) == 0
+        ), f"Found {len(duplicate_job_ids)} duplicate job IDs in storage"
 
     @pytest.mark.asyncio
     async def test_storage_chunk_tracker_sync_issues(self, temp_checkpoint_dir):

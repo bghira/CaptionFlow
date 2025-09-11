@@ -71,9 +71,9 @@ class TestConfigReload:
         await orchestrator._handle_config_reload(websocket, new_config)
 
         # Check that AuthManager object is preserved when no auth in config
-        assert orchestrator.auth is initial_auth_manager, (
-            "AuthManager should be preserved when auth section is not in reload config"
-        )
+        assert (
+            orchestrator.auth is initial_auth_manager
+        ), "AuthManager should be preserved when auth section is not in reload config"
 
         # Verify chunks_per_request was updated
         assert orchestrator.chunks_per_request == 15
@@ -106,9 +106,9 @@ class TestConfigReload:
         await orchestrator._handle_config_reload(websocket, new_config)
 
         # Auth manager should be preserved when config is identical
-        assert orchestrator.auth is initial_auth_manager, (
-            "AuthManager should be preserved when auth config is identical"
-        )
+        assert (
+            orchestrator.auth is initial_auth_manager
+        ), "AuthManager should be preserved when auth config is identical"
 
         # Tokens should still work
         assert orchestrator.auth.worker_tokens["worker_token_1"] == "test_worker_1"
@@ -144,9 +144,9 @@ class TestConfigReload:
         await orchestrator._handle_config_reload(websocket, new_config)
 
         # Auth manager should be preserved when config is identical
-        assert orchestrator.auth is initial_auth_manager, (
-            "AuthManager should be preserved when auth config is identical to current config"
-        )
+        assert (
+            orchestrator.auth is initial_auth_manager
+        ), "AuthManager should be preserved when auth config is identical to current config"
 
         # Runtime state should be preserved
         assert hasattr(orchestrator.auth, "_runtime_state"), "Runtime state should be preserved"

@@ -34,9 +34,9 @@ class TestCaptionUtilsCleanCaption:
 
         for input_text, expected in test_cases:
             result = CaptionUtils.clean_caption(input_text)
-            assert result == expected, (
-                f"Failed for '{input_text}': got '{result}', expected '{expected}'"
-            )
+            assert (
+                result == expected
+            ), f"Failed for '{input_text}': got '{result}', expected '{expected}'"
 
     def test_clean_generic_phrases_case_insensitive(self):
         """Test that generic phrase removal is case insensitive."""
