@@ -57,7 +57,12 @@ class ProcessorTestBase:
         """Create a StorageManager instance."""
         storage = StorageManager(temp_dir, caption_buffer_size=5)
         await storage.initialize()
-        return storage
+        yield storage
+        # Cleanup: close storage and any background tasks
+        try:
+            await storage.cleanup()
+        except Exception:
+            pass  # Ignore cleanup errors in tests
 
     @pytest.fixture
     def chunk_tracker(self, temp_dir):
@@ -215,35 +220,38 @@ class TestWebDatasetProcessors(ProcessorTestBase):
             mock_discover.return_value = mock_webshart_dataset
 
             orchestrator = WebDatasetOrchestratorProcessor()
-            # Don't override chunk_tracker - let it create its own
-            orchestrator.initialize(orchestrator_config, storage_manager)
+            try:
+                # Don't override chunk_tracker - let it create its own
+                orchestrator.initialize(orchestrator_config, storage_manager)
 
-            # Wait for background thread to create units
-            import time
+                # Wait for background thread to create units
+                import time
 
-            time.sleep(0.2)
+                time.sleep(0.2)
 
-            # Create and assign a work unit
-            units = orchestrator.get_work_units(1, "worker1")
-            if units:
-                unit = units[0]
+                # Create and assign a work unit
+                units = orchestrator.get_work_units(1, "worker1")
+                if units:
+                    unit = units[0]
 
-                # Simulate processing some items
-                result = WorkResult(
-                    unit_id=unit.unit_id,
-                    source_id=unit.source_id,
-                    chunk_id=unit.chunk_id,
-                    sample_id="0",
-                    outputs={"captions": ["test caption"]},
-                    metadata={"_item_index": 0},
-                )
+                    # Simulate processing some items
+                    result = WorkResult(
+                        unit_id=unit.unit_id,
+                        source_id=unit.source_id,
+                        chunk_id=unit.chunk_id,
+                        sample_id="0",
+                        outputs={"captions": ["test caption"]},
+                        metadata={"_item_index": 0},
+                    )
 
-                orchestrator.handle_result(result)
+                    orchestrator.handle_result(result)
 
-                # Check that the orchestrator's chunk tracker was updated
-                chunk_state = orchestrator.chunk_tracker.chunks.get(unit.chunk_id)
-                assert chunk_state is not None
-                assert chunk_state.status == "assigned"
+                    # Check that the orchestrator's chunk tracker was updated
+                    chunk_state = orchestrator.chunk_tracker.chunks.get(unit.chunk_id)
+                    assert chunk_state is not None
+                    assert chunk_state.status == "assigned"
+            finally:
+                orchestrator.cleanup()
 
     def test_storage_synchronization(
         self, orchestrator_config, storage_manager, mock_webshart_dataset, temp_dir
@@ -253,22 +261,24 @@ class TestWebDatasetProcessors(ProcessorTestBase):
             mock_discover.return_value = mock_webshart_dataset
 
             orchestrator = WebDatasetOrchestratorProcessor()
+            try:
+                # Pre-populate storage with some processed items
+                processed_job_ids = set()
+                for i in range(50, 150, 10):
+                    job_id = JobId(
+                        shard_id="shard_0", chunk_id="0" if i < 100 else "1", sample_id=str(i)
+                    )
+                    processed_job_ids.add(str(job_id))  # Use str() instead of to_str()
 
-            # Pre-populate storage with some processed items
-            processed_job_ids = set()
-            for i in range(50, 150, 10):
-                job_id = JobId(
-                    shard_id="shard_0", chunk_id="0" if i < 100 else "1", sample_id=str(i)
-                )
-                processed_job_ids.add(str(job_id))  # Use str() instead of to_str()
+                storage_manager.get_all_processed_job_ids = Mock(return_value=processed_job_ids)
 
-            storage_manager.get_all_processed_job_ids = Mock(return_value=processed_job_ids)
+                orchestrator.initialize(orchestrator_config, storage_manager)
 
-            orchestrator.initialize(orchestrator_config, storage_manager)
-
-            # Check that processed items were recognized
-            assert orchestrator.chunk_tracker is not None
-            # Verify some chunks exist (exact behavior depends on implementation)
+                # Check that processed items were recognized
+                assert orchestrator.chunk_tracker is not None
+                # Verify some chunks exist (exact behavior depends on implementation)
+            finally:
+                orchestrator.cleanup()
 
     def test_worker_processing_mock_mode(self, worker_config):
         """Test worker processing in mock mode."""
@@ -367,12 +377,15 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
                     mock_builder.return_value = mock_builder_instance
 
                     orchestrator = HuggingFaceDatasetOrchestratorProcessor()
-                    orchestrator.initialize(orchestrator_config, storage_manager)
+                    try:
+                        orchestrator.initialize(orchestrator_config, storage_manager)
 
-                    assert orchestrator.dataset_name == "test_dataset"
-                    assert orchestrator.config == "default"
-                    assert orchestrator.split == "train"
-                    assert orchestrator.chunk_tracker is not None
+                        assert orchestrator.dataset_name == "test_dataset"
+                        assert orchestrator.config == "default"
+                        assert orchestrator.split == "train"
+                        assert orchestrator.chunk_tracker is not None
+                    finally:
+                        orchestrator.cleanup()
 
     def test_work_unit_dynamic_creation(self, orchestrator_config, storage_manager):
         """Test dynamic work unit creation based on demand."""
@@ -388,19 +401,22 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
                     mock_metadata.return_value = mock_meta
 
                     orchestrator = HuggingFaceDatasetOrchestratorProcessor()
-                    orchestrator.initialize(orchestrator_config, storage_manager)
+                    try:
+                        orchestrator.initialize(orchestrator_config, storage_manager)
 
-                    # Let background thread run
-                    import time
+                        # Let background thread run
+                        import time
 
-                    time.sleep(0.2)
+                        time.sleep(0.2)
 
-                    # Request units from multiple workers
-                    units1 = orchestrator.get_work_units(3, "worker1")
-                    units2 = orchestrator.get_work_units(2, "worker2")
+                        # Request units from multiple workers
+                        units1 = orchestrator.get_work_units(3, "worker1")
+                        units2 = orchestrator.get_work_units(2, "worker2")
 
-                    all_unit_ids = [u.unit_id for u in units1 + units2]
-                    assert len(set(all_unit_ids)) == len(all_unit_ids)  # No duplicates
+                        all_unit_ids = [u.unit_id for u in units1 + units2]
+                        assert len(set(all_unit_ids)) == len(all_unit_ids)  # No duplicates
+                    finally:
+                        orchestrator.cleanup()
 
     def test_shard_discovery_and_caching(self, orchestrator_config, storage_manager, temp_dir):
         """Test shard discovery and caching mechanism."""
@@ -422,15 +438,18 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
                 mock_download.return_value = str(dummy_parquet)
 
                 orchestrator = HuggingFaceDatasetOrchestratorProcessor()
-                orchestrator.initialize(orchestrator_config, storage_manager)
+                try:
+                    orchestrator.initialize(orchestrator_config, storage_manager)
 
-                assert orchestrator.total_items == 1000
-                assert len(orchestrator.shard_info) == 1
-                assert 0 in orchestrator.shard_info
+                    assert orchestrator.total_items == 1000
+                    assert len(orchestrator.shard_info) == 1
+                    assert 0 in orchestrator.shard_info
 
-                # Check cache file was created
-                cache_files = list(temp_dir.glob("**/checkpoints/*_shard_info.json"))
-                assert len(cache_files) > 0
+                    # Check cache file was created
+                    cache_files = list(temp_dir.glob("**/checkpoints/*_shard_info.json"))
+                    assert len(cache_files) > 0
+                finally:
+                    orchestrator.cleanup()
 
     # For test_worker_processing_with_ranges, replace with:
     def test_worker_processing_with_ranges(self, worker_config, temp_dir):
@@ -516,13 +535,16 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
                     await storage_manager.checkpoint()
 
                     orchestrator = HuggingFaceDatasetOrchestratorProcessor()
-                    orchestrator.initialize(orchestrator_config, storage_manager)
+                    try:
+                        orchestrator.initialize(orchestrator_config, storage_manager)
 
-                    # Verify chunk tracker was updated
-                    if orchestrator.chunk_tracker:
-                        # Check that some processing was recorded
-                        stats = orchestrator.chunk_tracker.get_stats()
-                        assert stats["total_in_memory"] >= 0
+                        # Verify chunk tracker was updated
+                        if orchestrator.chunk_tracker:
+                            # Check that some processing was recorded
+                            stats = orchestrator.chunk_tracker.get_stats()
+                            assert stats["total_in_memory"] >= 0
+                    finally:
+                        orchestrator.cleanup()
 
 
 # ============= Local Filesystem Processor Tests =============
@@ -592,19 +614,21 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
     def test_orchestrator_image_discovery(self, orchestrator_config, storage_manager):
         """Test local filesystem image discovery."""
         orchestrator = LocalFilesystemOrchestratorProcessor()
+        try:
+            # Mock HTTP server start
+            orchestrator._start_http_server = Mock()
 
-        # Mock HTTP server start
-        orchestrator._start_http_server = Mock()
+            orchestrator.initialize(orchestrator_config, storage_manager)
 
-        orchestrator.initialize(orchestrator_config, storage_manager)
+            # Should find 8 images (5 in root + 3 in subdir1)
+            assert orchestrator.total_images == 8
+            assert len(orchestrator.all_images) == 8
 
-        # Should find 8 images (5 in root + 3 in subdir1)
-        assert orchestrator.total_images == 8
-        assert len(orchestrator.all_images) == 8
-
-        # Check sorting
-        image_names = [img[0].name for img in orchestrator.all_images]
-        assert image_names == sorted(image_names)
+            # Check sorting
+            image_names = [img[0].name for img in orchestrator.all_images]
+            assert image_names == sorted(image_names)
+        finally:
+            orchestrator.cleanup()
 
     def test_http_server_integration(self, orchestrator_config, storage_manager):
         """Test HTTP server setup for image serving."""
@@ -911,77 +935,80 @@ class TestProcessorIntegration(ProcessorTestBase):
             mock_discover.return_value = mock_dataset
 
             orchestrator = WebDatasetOrchestratorProcessor()
-            orchestrator.initialize(config, storage)
+            try:
+                orchestrator.initialize(config, storage)
 
-            # Create worker
-            worker_config = ProcessorConfig(
-                processor_type="webdataset",
-                config={"dataset": {"dataset_path": "mock://test", "mock_results": True}},
-            )
-            worker = WebDatasetWorkerProcessor()
-            worker.gpu_id = 0
-            worker.initialize(worker_config)
+                # Create worker
+                worker_config = ProcessorConfig(
+                    processor_type="webdataset",
+                    config={"dataset": {"dataset_path": "mock://test", "mock_results": True}},
+                )
+                worker = WebDatasetWorkerProcessor()
+                worker.gpu_id = 0
+                worker.initialize(worker_config)
 
-            # Simulate workflow
-            import time
+                # Simulate workflow
+                import time
 
-            time.sleep(0.1)  # Let background thread create units
+                time.sleep(0.1)  # Let background thread create units
 
-            # Worker requests work
-            units = orchestrator.get_work_units(1, "test_worker")
-            assert len(units) > 0
+                # Worker requests work
+                units = orchestrator.get_work_units(1, "test_worker")
+                assert len(units) > 0
 
-            unit = units[0]
+                unit = units[0]
 
-            # Add required fields to unit data if missing
-            if "start_index" not in unit.data:
-                unit.data["start_index"] = 0
-            if "chunk_size" not in unit.data:
-                unit.data["chunk_size"] = unit.unit_size
+                # Add required fields to unit data if missing
+                if "start_index" not in unit.data:
+                    unit.data["start_index"] = 0
+                if "chunk_size" not in unit.data:
+                    unit.data["chunk_size"] = unit.unit_size
 
-            # Worker processes unit
-            context = {}
-            items = list(worker.process_unit(unit, context))
-            assert len(items) > 0
+                # Worker processes unit
+                context = {}
+                items = list(worker.process_unit(unit, context))
+                assert len(items) > 0
 
-            # Simulate caption generation
-            outputs = []
-            for item in items:
-                outputs.append(
-                    {
-                        "captions": [f"Generated caption for {item['item_key']}"],
-                        "metadata": item["metadata"],
-                    }
+                # Simulate caption generation
+                outputs = []
+                for item in items:
+                    outputs.append(
+                        {
+                            "captions": [f"Generated caption for {item['item_key']}"],
+                            "metadata": item["metadata"],
+                        }
+                    )
+
+                # Create result
+                result = worker.prepare_result(unit, outputs, 1000.0)
+
+                # Submit result to orchestrator
+                orchestrator.handle_result(result)
+
+                # Create and save caption
+                job_id = JobId.from_str(items[0]["job_id"])
+                caption = Caption(
+                    job_id=job_id,
+                    dataset="test_dataset",
+                    shard=unit.source_id,
+                    chunk_id=unit.chunk_id,
+                    item_key=items[0]["item_key"],
+                    caption=outputs[0]["captions"][0],
+                    outputs={"captions": outputs[0]["captions"]},
+                    contributor_id="test_worker",
+                    timestamp=datetime.now(_datetime.UTC),
+                    caption_count=1,
+                    metadata=items[0]["metadata"],
                 )
 
-            # Create result
-            result = worker.prepare_result(unit, outputs, 1000.0)
+                await storage.save_caption(caption)
+                await storage.checkpoint()
 
-            # Submit result to orchestrator
-            orchestrator.handle_result(result)
-
-            # Create and save caption
-            job_id = JobId.from_str(items[0]["job_id"])
-            caption = Caption(
-                job_id=job_id,
-                dataset="test_dataset",
-                shard=unit.source_id,
-                chunk_id=unit.chunk_id,
-                item_key=items[0]["item_key"],
-                caption=outputs[0]["captions"][0],
-                outputs={"captions": outputs[0]["captions"]},
-                contributor_id="test_worker",
-                timestamp=datetime.now(_datetime.UTC),
-                caption_count=1,
-                metadata=items[0]["metadata"],
-            )
-
-            await storage.save_caption(caption)
-            await storage.checkpoint()
-
-            # Verify complete workflow
-            stats = await storage.get_storage_stats()
-            assert stats["total_rows"] >= 1
+                # Verify complete workflow
+                stats = await storage.get_storage_stats()
+                assert stats["total_rows"] >= 1
+            finally:
+                orchestrator.cleanup()
 
     def test_failure_recovery(self, temp_dir):
         """Test recovery from worker failures."""

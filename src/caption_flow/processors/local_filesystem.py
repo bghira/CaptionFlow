@@ -527,6 +527,19 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
 
         return base_result
 
+    def cleanup(self):
+        """Clean up resources."""
+        logger.info("Cleaning up orchestrator")
+
+        # Stop background threads
+        self.stop_creation.set()
+        if self.unit_creation_thread:
+            self.unit_creation_thread.join(timeout=5)
+
+        # Flush final checkpoint on cleanup
+        if self.chunk_tracker:
+            self.chunk_tracker.flush()
+
     def get_image_paths(self) -> List[Tuple[Path, int]]:
         """Get the list of discovered image paths and sizes."""
         return self.all_images
