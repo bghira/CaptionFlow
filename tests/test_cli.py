@@ -395,6 +395,32 @@ class TestExportCommand:
         assert result.exit_code == 0
         assert "export" in result.output.lower()
 
+    def test_export_command_no_duplicate_registration(self, runner):
+        """Regression test: Ensure export command is only registered once.
+
+        This test prevents the bug where @main.command() was incorrectly
+        applied to _validate_export_setup() causing duplicate command
+        registration and argument parsing errors.
+        """
+        # Get all registered commands
+        commands = list(main.commands.keys())
+
+        # Count occurrences of 'export'
+        export_count = commands.count("export")
+
+        # Should be exactly one export command
+        assert export_count == 1, f"Expected 1 export command, found {export_count}: {commands}"
+
+        # Test that export command can handle basic arguments without parsing errors
+        result = runner.invoke(main, ["export", "--help"])
+        assert result.exit_code == 0
+        assert "Got unexpected extra arguments" not in result.output
+
+        # Test with a data directory argument (the one that was causing issues)
+        result = runner.invoke(main, ["export", "--data-dir", "caption_data", "--stats-only"])
+        # Should not get parsing errors (though it may fail for other reasons like missing files)
+        assert "Got unexpected extra arguments" not in result.output
+
     @patch("caption_flow.storage.StorageManager")
     @patch("caption_flow.cli.asyncio.run")
     def test_export_stats_only(self, mock_asyncio_run, mock_storage_class, runner, tmp_path):
