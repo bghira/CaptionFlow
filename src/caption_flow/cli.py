@@ -197,6 +197,90 @@ def apply_cli_overrides(config: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     return ConfigManager.merge_configs(config, overrides)
 
 
+def validate_orchestrator_auth_config(
+    config_data: Dict[str, Any], base_config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Validate and normalize orchestrator auth configuration.
+
+    Handles fallback from top-level auth to orchestrator.auth and validates
+    that auth configuration exists.
+
+    Args:
+        config_data: The orchestrator section config
+        base_config: The full loaded config (may contain top-level auth)
+
+    Returns:
+        Updated config_data with validated auth section
+
+    Raises:
+        ValueError: If no auth configuration is found
+    """
+    # Check if auth is already in the orchestrator section
+    if "auth" in config_data:
+        auth_config = config_data["auth"]
+        console.print("[dim]Using auth config from orchestrator section[/dim]")
+    # Fallback to top-level auth with warning
+    elif "auth" in base_config:
+        auth_config = base_config["auth"]
+        console.print(
+            "[yellow]Warning: Found auth config at top level, should be under 'orchestrator' section[/yellow]"
+        )
+        console.print("[dim]Moving auth config to orchestrator.auth section[/dim]")
+        config_data["auth"] = auth_config
+    else:
+        # No auth config found anywhere
+        console.print("[red]Error: No auth configuration found[/red]")
+        console.print("[dim]Auth config must be present either as:[/dim]")
+        console.print("[dim]  orchestrator.auth (recommended) or top-level auth (deprecated)[/dim]")
+        console.print("\n[cyan]Example auth configuration:[/cyan]")
+        console.print("orchestrator:")
+        console.print("  auth:")
+        console.print("    worker_tokens:")
+        console.print("      - token: 'your-worker-token'")
+        console.print("        name: 'Worker 1'")
+        console.print("    admin_tokens:")
+        console.print("      - token: 'your-admin-token'")
+        console.print("        name: 'Admin User'")
+        raise ValueError("Auth configuration is required for orchestrator")
+
+    # Validate auth structure
+    if not isinstance(auth_config, dict):
+        raise ValueError("Auth configuration must be a dictionary")
+
+    # Validate that at least one token type exists
+    token_types = ["worker_tokens", "admin_tokens", "monitor_tokens"]
+    has_tokens = False
+    for token_type in token_types:
+        if (
+            token_type in auth_config
+            and type(auth_config[token_type]).__name__ == "list"
+            and len(auth_config[token_type]) > 0
+        ):
+            has_tokens = True
+            break
+
+    if not has_tokens:
+        console.print("[red]Error: Auth configuration must contain at least one token type[/red]")
+        console.print(
+            "[dim]Required token types: worker_tokens, admin_tokens, or monitor_tokens[/dim]"
+        )
+        raise ValueError("At least one token type must be configured")
+
+    # Warn about missing critical token types
+    if "worker_tokens" not in auth_config or not auth_config["worker_tokens"]:
+        console.print(
+            "[yellow]Warning: No worker tokens configured - workers won't be able to connect[/yellow]"
+        )
+
+    if "admin_tokens" not in auth_config or not auth_config["admin_tokens"]:
+        console.print(
+            "[yellow]Warning: No admin tokens configured - admin operations will be unavailable[/yellow]"
+        )
+
+    console.print(f"[green]✓ Auth validation passed[/green]")
+    return config_data
+
+
 @click.group()
 @click.option("--verbose", is_flag=True, help="Enable verbose logging")
 @click.pass_context
@@ -227,6 +311,13 @@ def orchestrator(ctx, config: Optional[str], **kwargs):
         config_data = base_config["orchestrator"]
     else:
         config_data = base_config
+
+    # Validate and normalize auth configuration
+    try:
+        config_data = validate_orchestrator_auth_config(config_data, base_config)
+    except ValueError as e:
+        console.print(f"[red]Configuration error: {e}[/red]")
+        sys.exit(1)
 
     # Apply CLI overrides
     if kwargs.get("port"):
@@ -915,6 +1006,25 @@ def reload_config(
     if not new_cfg:
         console.print("[red]Failed to load configuration[/red]")
         sys.exit(1)
+
+    # Validate and normalize auth configuration for reload
+    console.print(f"[cyan]Validating configuration...[/cyan]")
+    if "orchestrator" in new_cfg:
+        orchestrator_config = new_cfg["orchestrator"]
+        try:
+            # Apply same auth validation as orchestrator startup
+            orchestrator_config = validate_orchestrator_auth_config(orchestrator_config, new_cfg)
+            new_cfg["orchestrator"] = orchestrator_config
+        except ValueError as e:
+            console.print(f"[red]Configuration validation error: {e}[/red]")
+            sys.exit(1)
+    else:
+        # If no orchestrator section, treat whole config as orchestrator config
+        try:
+            new_cfg = validate_orchestrator_auth_config(new_cfg, new_cfg)
+        except ValueError as e:
+            console.print(f"[red]Configuration validation error: {e}[/red]")
+            sys.exit(1)
 
     ssl_context = _setup_ssl_context(server, no_verify_ssl)
 

@@ -23,6 +23,20 @@ from caption_flow.workers.caption import (
 )
 
 
+def create_fast_caption_worker(worker_config):
+    """Create a CaptionWorker with mocked heavy initialization for fast testing."""
+    with patch("huggingface_hub.get_token", return_value="mock_token"):
+        # Mock the heavy ML model loading to speed up tests
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=Mock()):
+            with patch("transformers.AutoProcessor.from_pretrained", return_value=Mock()):
+                with patch("vllm.LLM", return_value=Mock()):
+                    with patch("vllm.SamplingParams", return_value=Mock()):
+                        worker = CaptionWorker(worker_config)
+                        # Don't create or assign event loops in tests - let pytest-asyncio handle it
+                        worker.main_loop = None
+                        return worker
+
+
 class TestCaptionWorker:
     """Test suite for CaptionWorker."""
 
@@ -74,11 +88,33 @@ class TestCaptionWorker:
 
     @pytest.fixture
     def caption_worker(self, worker_config):
-        """Create a CaptionWorker instance."""
-        with patch("huggingface_hub.get_token", return_value="mock_token"):
-            worker = CaptionWorker(worker_config)
-            worker.main_loop = asyncio.get_event_loop()
-            return worker
+        """Create a CaptionWorker instance with mocked heavy initialization."""
+        worker = create_fast_caption_worker(worker_config)
+        yield worker
+        # Cleanup: ensure any running tasks are cancelled and resources freed
+        try:
+            # Clean up any remaining queue items
+            while not worker.result_queue.empty():
+                try:
+                    worker.result_queue.get_nowait()
+                except:
+                    break
+
+            # Reset worker state
+            worker.running = False
+            worker.should_stop_processing.set()
+            worker.assigned_units.clear()
+            worker.current_unit = None
+
+            # Close model manager if exists
+            if hasattr(worker, "model_manager") and worker.model_manager:
+                try:
+                    worker.model_manager.cleanup()
+                except:
+                    pass
+
+        except Exception:
+            pass  # Ignore cleanup errors in tests
 
     @pytest.fixture
     def mock_websocket(self):
@@ -94,7 +130,12 @@ class TestCaptionWorker:
         """Create a StorageManager instance."""
         storage = StorageManager(tmp_path, caption_buffer_size=10)
         await storage.initialize()
-        return storage
+        yield storage
+        # Cleanup: close storage and any background tasks
+        try:
+            await storage.cleanup()
+        except Exception:
+            pass  # Ignore cleanup errors in tests
 
     def test_initialization(self, caption_worker):
         """Test worker initialization."""
@@ -446,16 +487,26 @@ class TestCaptionWorker:
             }
         )
 
-        # Run result sender briefly
+        # Run result sender briefly with proper cleanup
         sender_task = asyncio.create_task(caption_worker._result_sender())
-        await asyncio.sleep(0.1)
-        caption_worker.running = False
-        caption_worker.connected.is_set = Mock(return_value=False)
 
         try:
+            await asyncio.sleep(0.1)
+            caption_worker.running = False
+            caption_worker.connected.is_set = Mock(return_value=False)
+
+            # Wait for task to complete or timeout
             await asyncio.wait_for(sender_task, timeout=1.0)
         except asyncio.TimeoutError:
-            sender_task.cancel()
+            pass  # Expected timeout is fine
+        finally:
+            # Always cancel and wait for the task to ensure cleanup
+            if not sender_task.done():
+                sender_task.cancel()
+            try:
+                await sender_task
+            except asyncio.CancelledError:
+                pass  # Expected when cancelled
 
         # Check result was sent
         caption_worker.websocket.send.assert_called()
@@ -610,7 +661,7 @@ class TestCaptionWorker:
         caption_worker.connected.is_set = Mock(return_value=True)
         caption_worker.should_stop_processing = Mock()
         caption_worker.should_stop_processing.is_set = Mock(return_value=False)
-        caption_worker.main_loop = asyncio.get_event_loop()
+        # Don't set main_loop in tests - let pytest-asyncio handle event loop management
 
         # Mock model manager to raise error
         caption_worker.model_manager = Mock()
@@ -665,7 +716,7 @@ class TestCaptionWorker:
         caption_worker.connected.is_set = Mock(return_value=True)
         caption_worker.should_stop_processing = Mock()
         caption_worker.should_stop_processing.is_set = Mock(return_value=False)
-        caption_worker.main_loop = asyncio.get_event_loop()
+        # Don't set main_loop in tests - let pytest-asyncio handle event loop management
 
         # Mock processor that will simulate batch failures
         mock_processor = Mock()
@@ -766,7 +817,7 @@ class TestCaptionWorker:
         caption_worker.connected.is_set = Mock(return_value=True)
         caption_worker.should_stop_processing = Mock()
         caption_worker.should_stop_processing.is_set = Mock(return_value=False)
-        caption_worker.main_loop = asyncio.get_event_loop()
+        # Don't set main_loop in tests - let pytest-asyncio handle event loop management
 
         # Mock processor that yields fewer items than expected
         mock_processor = Mock()
@@ -808,9 +859,9 @@ class TestCaptionWorker:
                 work_failed_call = sent_data
                 break
 
-        assert work_failed_call is not None, (
-            "work_failed message should have been sent for incomplete unit"
-        )
+        assert (
+            work_failed_call is not None
+        ), "work_failed message should have been sent for incomplete unit"
         assert work_failed_call["unit_id"] == "unit1"
         assert "Processing incomplete" in work_failed_call["error"]
         assert "1/3 items processed" in work_failed_call["error"]
@@ -832,7 +883,7 @@ class TestCaptionWorkerProcessors:
     @pytest.mark.asyncio
     async def test_huggingface_processor_integration(self, worker_config):
         """Test CaptionWorker with HuggingFace processor."""
-        worker = CaptionWorker(worker_config)
+        worker = create_fast_caption_worker(worker_config)
 
         welcome_data = {
             "processor_type": "huggingface_datasets",
@@ -852,7 +903,7 @@ class TestCaptionWorkerProcessors:
     @pytest.mark.asyncio
     async def test_local_filesystem_processor_integration(self, worker_config):
         """Test CaptionWorker with LocalFilesystem processor."""
-        worker = CaptionWorker(worker_config)
+        worker = create_fast_caption_worker(worker_config)
 
         welcome_data = {
             "processor_type": "local_filesystem",
@@ -911,7 +962,7 @@ class TestCaptionWorkerConfigReload:
 
     def test_config_reload_failure_restores_state(self, worker_config, initial_vllm_config):
         """Test that config reload failure properly restores previous state."""
-        worker = CaptionWorker(worker_config)
+        worker = create_fast_caption_worker(worker_config)
 
         # Set up initial state
         worker.vllm_config = initial_vllm_config
@@ -998,7 +1049,7 @@ class TestCaptionWorkerConfigReload:
 
     def test_process_batch_handles_missing_model_manager(self, worker_config):
         """Test that batch processing handles missing model manager gracefully."""
-        worker = CaptionWorker(worker_config)
+        worker = create_fast_caption_worker(worker_config)
 
         # Create a mock processing item
         mock_image = Image.new("RGB", (100, 100), "red")
@@ -1030,7 +1081,7 @@ class TestCaptionWorkerConfigReload:
 
     def test_process_batch_handles_model_keyerror(self, worker_config):
         """Test that batch processing handles KeyError from get_model_for_stage."""
-        worker = CaptionWorker(worker_config)
+        worker = create_fast_caption_worker(worker_config)
 
         # Create a mock processing item
         mock_image = Image.new("RGB", (100, 100), "red")

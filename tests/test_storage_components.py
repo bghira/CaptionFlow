@@ -277,7 +277,7 @@ class TestHuggingFaceWithRealStorage:
 
         # Workers updating different chunks
         for i in range(2):
-            task = update_storage_and_tracker(f"worker_{i+3}", "shard1:chunk:1", i * 20, 20)
+            task = update_storage_and_tracker(f"worker_{i + 3}", "shard1:chunk:1", i * 20, 20)
             tasks.append(task)
 
         await asyncio.gather(*tasks)

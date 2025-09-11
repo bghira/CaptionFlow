@@ -1590,7 +1590,7 @@ async def test_huggingface_chunk_start_index_bug(temp_checkpoint_dir):
     if duplicates:
         print("\n❌ DUPLICATE JOB IDs FOUND:")
         for i, dup in enumerate(duplicates[:10]):
-            print(f"\n  Duplicate #{i+1}:")
+            print(f"\n  Duplicate #{i + 1}:")
             print(f"    Job ID: {dup['job_id']}")
             print(f"    Worker: {dup['worker']}")
             print(f"    Unit: {dup['unit']}")

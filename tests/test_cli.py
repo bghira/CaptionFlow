@@ -13,6 +13,7 @@ from caption_flow.cli import (
     apply_cli_overrides,
     main,
     setup_logging,
+    validate_orchestrator_auth_config,
 )
 from click.testing import CliRunner
 
@@ -185,6 +186,126 @@ class TestApplyCliOverrides:
         assert result == expected
 
 
+class TestValidateOrchestratorAuthConfig:
+    """Test validate_orchestrator_auth_config function."""
+
+    def test_valid_orchestrator_section_auth(self):
+        """Test valid auth config in orchestrator section."""
+        config_data = {
+            "port": 8765,
+            "auth": {
+                "worker_tokens": [{"token": "worker1", "name": "Worker 1"}],
+                "admin_tokens": [{"token": "admin1", "name": "Admin 1"}],
+            },
+        }
+        base_config = {"orchestrator": config_data}
+
+        result = validate_orchestrator_auth_config(config_data, base_config)
+
+        assert "auth" in result
+        assert result["auth"]["worker_tokens"][0]["token"] == "worker1"
+        assert result["auth"]["admin_tokens"][0]["token"] == "admin1"
+
+    def test_fallback_to_top_level_auth(self):
+        """Test fallback from top-level auth config with warning."""
+        config_data = {"port": 8765}
+        base_config = {
+            "orchestrator": config_data,
+            "auth": {"worker_tokens": [{"token": "worker1", "name": "Worker 1"}]},
+        }
+
+        result = validate_orchestrator_auth_config(config_data, base_config)
+
+        # Should move auth from base_config to config_data
+        assert "auth" in result
+        assert result["auth"]["worker_tokens"][0]["token"] == "worker1"
+
+    def test_no_auth_config_error(self):
+        """Test error when no auth config is found."""
+        config_data = {"port": 8765}
+        base_config = {"orchestrator": config_data}
+
+        with pytest.raises(ValueError, match="Auth configuration is required"):
+            validate_orchestrator_auth_config(config_data, base_config)
+
+    def test_invalid_auth_structure(self):
+        """Test error for invalid auth structure."""
+        config_data = {
+            "port": 8765,
+            "auth": "invalid_auth_string",  # Should be dict
+        }
+        base_config = {"orchestrator": config_data}
+
+        with pytest.raises(ValueError, match="Auth configuration must be a dictionary"):
+            validate_orchestrator_auth_config(config_data, base_config)
+
+    def test_no_tokens_configured_error(self):
+        """Test error when no token types are configured."""
+        config_data = {
+            "port": 8765,
+            "auth": {},  # Empty auth config
+        }
+        base_config = {"orchestrator": config_data}
+
+        with pytest.raises(ValueError, match="At least one token type must be configured"):
+            validate_orchestrator_auth_config(config_data, base_config)
+
+    def test_empty_token_lists_error(self):
+        """Test error when token lists exist but are empty."""
+        config_data = {
+            "port": 8765,
+            "auth": {"worker_tokens": [], "admin_tokens": [], "monitor_tokens": []},
+        }
+        base_config = {"orchestrator": config_data}
+
+        with pytest.raises(ValueError, match="At least one token type must be configured"):
+            validate_orchestrator_auth_config(config_data, base_config)
+
+    def test_valid_with_single_token_type(self):
+        """Test validation passes with just one token type."""
+        config_data = {
+            "port": 8765,
+            "auth": {"worker_tokens": [{"token": "worker1", "name": "Worker 1"}]},
+        }
+        base_config = {"orchestrator": config_data}
+
+        # Should not raise an exception
+        result = validate_orchestrator_auth_config(config_data, base_config)
+        assert "auth" in result
+        assert len(result["auth"]["worker_tokens"]) == 1
+
+    def test_validation_warnings_for_missing_critical_tokens(self, capsys):
+        """Test warnings are printed for missing critical token types."""
+        config_data = {
+            "port": 8765,
+            "auth": {"monitor_tokens": [{"token": "monitor1", "name": "Monitor 1"}]},
+        }
+        base_config = {"orchestrator": config_data}
+
+        validate_orchestrator_auth_config(config_data, base_config)
+
+        # Check that warnings were printed (captured by capsys if using rich console)
+        # This test verifies the function runs without errors when warnings are present
+
+    def test_preserves_other_config_data(self):
+        """Test that validation preserves other configuration data."""
+        config_data = {
+            "port": 8765,
+            "host": "0.0.0.0",
+            "ssl": {"cert": "path/to/cert"},
+            "auth": {"worker_tokens": [{"token": "worker1", "name": "Worker 1"}]},
+        }
+        base_config = {"orchestrator": config_data}
+
+        result = validate_orchestrator_auth_config(config_data, base_config)
+
+        # Should preserve all original data
+        assert result["port"] == 8765
+        assert result["host"] == "0.0.0.0"
+        assert result["ssl"]["cert"] == "path/to/cert"
+        assert "auth" in result
+
+
 class TestMainCommand:
     """Test main CLI command."""
 
@@ -227,10 +348,15 @@ class TestOrchestratorCommand:
     ):
         """Test running orchestrator command."""
         config_file = temp_config_dir / "orchestrator.yaml"
+        # Add auth config to sample_config for this test
+        config_with_auth = {
+            **sample_config,
+            "auth": {"worker_tokens": [{"token": "worker1", "name": "Worker 1"}]},
+        }
         with open(config_file, "w") as f:
-            yaml.dump(sample_config, f)
+            yaml.dump(config_with_auth, f)
 
-        mock_find_config.return_value = sample_config
+        mock_find_config.return_value = config_with_auth
         mock_orchestrator = Mock()
         mock_orchestrator_class.return_value = mock_orchestrator
 
@@ -239,6 +365,51 @@ class TestOrchestratorCommand:
         # Should attempt to find config and create orchestrator
         mock_find_config.assert_called()
         mock_orchestrator_class.assert_called()
+
+    def test_orchestrator_auth_validation_error(self, runner, temp_config_dir):
+        """Test orchestrator command fails when no auth config is provided."""
+        config_file = temp_config_dir / "orchestrator_no_auth.yaml"
+        config_without_auth = {
+            "orchestrator": {
+                "port": 8765,
+                "host": "localhost",
+                # No auth section
+            }
+        }
+        with open(config_file, "w") as f:
+            yaml.dump(config_without_auth, f)
+
+        result = runner.invoke(main, ["orchestrator", "--config", str(config_file)])
+
+        # Should exit with error due to missing auth config
+        assert result.exit_code == 1
+        assert "Auth configuration is required" in result.output
+
+    @patch("caption_flow.cli.Orchestrator")
+    @patch("caption_flow.cli.asyncio.run")
+    def test_orchestrator_auth_fallback_warning(
+        self, mock_asyncio_run, mock_orchestrator_class, runner, temp_config_dir
+    ):
+        """Test orchestrator command with top-level auth fallback shows warning."""
+        config_file = temp_config_dir / "orchestrator_top_level_auth.yaml"
+        config_with_top_level_auth = {
+            "orchestrator": {"port": 8765, "host": "localhost"},
+            "auth": {  # Top-level auth (deprecated)
+                "worker_tokens": [{"token": "worker1", "name": "Worker 1"}]
+            },
+        }
+        with open(config_file, "w") as f:
+            yaml.dump(config_with_top_level_auth, f)
+
+        mock_orchestrator = Mock()
+        mock_orchestrator_class.return_value = mock_orchestrator
+
+        result = runner.invoke(main, ["orchestrator", "--config", str(config_file)])
+
+        # Should run successfully but show warning
+        assert result.exit_code == 0
+        assert "Warning: Found auth config at top level" in result.output
+        assert "should be under 'orchestrator' section" in result.output
 
 
 class TestWorkerCommand:
@@ -525,9 +696,19 @@ class TestReloadConfigCommand:
         config_file = tmp_path / "new_config.yaml"
         config_file.touch()
 
-        mock_load_yaml.return_value = {"test": "config"}
+        # Mock config with valid auth structure
+        mock_config = {
+            "orchestrator": {
+                "port": 8765,
+                "auth": {
+                    "worker_tokens": [{"token": "worker1", "name": "Worker 1"}],
+                    "admin_tokens": [{"token": "admin1", "name": "Admin 1"}],
+                },
+            }
+        }
+        mock_load_yaml.return_value = mock_config
 
-        runner.invoke(
+        result = runner.invoke(
             main,
             [
                 "reload-config",
@@ -543,6 +724,137 @@ class TestReloadConfigCommand:
         # Should attempt to run async function
         mock_asyncio_run.assert_called()
         mock_load_yaml.assert_called()
+        # Should validate auth and succeed
+        assert result.exit_code == 0
+
+    def test_reload_config_auth_validation_error(self, runner, tmp_path):
+        """Test reload-config command fails when new config has no auth."""
+        config_file = tmp_path / "bad_config.yaml"
+        bad_config = {
+            "orchestrator": {
+                "port": 8765,
+                # No auth section - should fail validation
+            }
+        }
+        with open(config_file, "w") as f:
+            yaml.dump(bad_config, f)
+
+        result = runner.invoke(
+            main,
+            [
+                "reload-config",
+                "--server",
+                "ws://localhost:8765",
+                "--token",
+                "test-token",
+                "--new-config",
+                str(config_file),
+            ],
+        )
+
+        # Should exit with error due to validation failure
+        assert result.exit_code == 1
+        assert "Configuration validation error" in result.output
+        assert "Auth configuration is required" in result.output
+
+    def test_reload_config_auth_top_level_fallback(self, runner, tmp_path):
+        """Test reload-config handles top-level auth fallback with warning."""
+        config_file = tmp_path / "top_level_auth_config.yaml"
+        config_with_top_level_auth = {
+            "orchestrator": {
+                "port": 8765,
+            },
+            "auth": {  # Top-level auth (deprecated)
+                "worker_tokens": [{"token": "worker1", "name": "Worker 1"}]
+            },
+        }
+        with open(config_file, "w") as f:
+            yaml.dump(config_with_top_level_auth, f)
+
+        with patch("caption_flow.cli.asyncio.run", return_value=True):
+            result = runner.invoke(
+                main,
+                [
+                    "reload-config",
+                    "--server",
+                    "ws://localhost:8765",
+                    "--token",
+                    "test-token",
+                    "--new-config",
+                    str(config_file),
+                ],
+            )
+
+        # Should succeed but show warning about top-level auth
+        assert result.exit_code == 0
+        assert "Warning: Found auth config at top level" in result.output
+        assert "should be under 'orchestrator' section" in result.output
+
+    def test_reload_config_validates_nested_orchestrator_config(self, runner, tmp_path):
+        """Test reload-config validates orchestrator section properly."""
+        config_file = tmp_path / "nested_config.yaml"
+        nested_config = {
+            "orchestrator": {
+                "port": 8765,
+                "auth": {
+                    "worker_tokens": [{"token": "worker1", "name": "Worker 1"}],
+                    "admin_tokens": [{"token": "admin1", "name": "Admin 1"}],
+                },
+            }
+        }
+        with open(config_file, "w") as f:
+            yaml.dump(nested_config, f)
+
+        with patch("caption_flow.cli.asyncio.run", return_value=True):
+            result = runner.invoke(
+                main,
+                [
+                    "reload-config",
+                    "--server",
+                    "ws://localhost:8765",
+                    "--token",
+                    "test-token",
+                    "--new-config",
+                    str(config_file),
+                ],
+            )
+
+        # Should succeed with proper nested structure
+        assert result.exit_code == 0
+        assert "Using auth config from orchestrator section" in result.output
+        assert "✓ Auth validation passed" in result.output
+
+    def test_reload_config_validates_flat_config(self, runner, tmp_path):
+        """Test reload-config validates flat config (no orchestrator section)."""
+        config_file = tmp_path / "flat_config.yaml"
+        flat_config = {
+            "port": 8765,
+            "auth": {
+                "worker_tokens": [{"token": "worker1", "name": "Worker 1"}],
+                "admin_tokens": [{"token": "admin1", "name": "Admin 1"}],
+            },
+        }
+        with open(config_file, "w") as f:
+            yaml.dump(flat_config, f)
+
+        with patch("caption_flow.cli.asyncio.run", return_value=True):
+            result = runner.invoke(
+                main,
+                [
+                    "reload-config",
+                    "--server",
+                    "ws://localhost:8765",
+                    "--token",
+                    "test-token",
+                    "--new-config",
+                    str(config_file),
+                ],
+            )
+
+        # Should succeed with flat structure
+        assert result.exit_code == 0
+        assert "Using auth config from orchestrator section" in result.output
+        assert "✓ Auth validation passed" in result.output
 
 
 if __name__ == "__main__":
