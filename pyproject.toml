@@ -4,10 +4,8 @@ version = "0.4.1"
 description = "Self-contained distributed community captioning system"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
-license = {text = "MIT"}
-authors = [
-    {name = "bghira", email = "bghira@users.github.com"},
-]
+license = { text = "MIT" }
+authors = [{ name = "bghira", email = "bghira@users.github.com" }]
 keywords = ["captioning", "distributed", "vllm", "dataset", "community"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -70,8 +68,21 @@ target-version = ['py310']
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "B", "C90", "D"]
-ignore = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
+ignore = [
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    "D203",
+    "D213",
+]
 
 [tool.mypy]
 python_version = "3.11"
@@ -81,4 +92,3 @@ disallow_untyped_defs = true
 
 [tool.poetry.group.dev.dependencies]
 pytest-asyncio = "^1.1.0"
-

@@ -41,9 +41,9 @@ class Orchestrator:
 
         # Processor configuration
         processor_type = config.get("dataset", {}).get("processor_type", None)
-        assert (
-            processor_type is not None
-        ), "You must supply processor_type in your orchestrator dataset configuration."
+        assert processor_type is not None, (
+            "You must supply processor_type in your orchestrator dataset configuration."
+        )
         processor_config = ProcessorConfig(processor_type=processor_type, config=config)
 
         # Initialize processor
@@ -621,20 +621,20 @@ class Orchestrator:
             # Send current stats (already in memory)
             stats_start = time.time()
             await websocket.send(safe_json_dumps({"type": "stats", "data": self.stats}))
-            logger.debug(f"Monitor stats sent in {(time.time() - stats_start)*1000:.1f}ms")
+            logger.debug(f"Monitor stats sent in {(time.time() - stats_start) * 1000:.1f}ms")
 
             # Get processor stats instead of chunk stats
             processor_stats_start = time.time()
             processor_stats = self.processor.get_stats()
             logger.debug(
-                f"Processor stats retrieved in {(time.time() - processor_stats_start)*1000:.1f}ms"
+                f"Processor stats retrieved in {(time.time() - processor_stats_start) * 1000:.1f}ms"
             )
 
             stats_send_start = time.time()
             await websocket.send(
                 safe_json_dumps({"type": "processor_stats", "data": processor_stats})
             )
-            logger.debug(f"Processor stats sent in {(time.time() - stats_send_start)*1000:.1f}ms")
+            logger.debug(f"Processor stats sent in {(time.time() - stats_send_start) * 1000:.1f}ms")
 
             if websocket not in self.monitors:
                 return
@@ -647,18 +647,18 @@ class Orchestrator:
                     safe_json_dumps({"type": "leaderboard", "data": self._cached_leaderboard})
                 )
                 logger.debug(
-                    f"Cached leaderboard sent in {(time.time() - cache_send_start)*1000:.1f}ms"
+                    f"Cached leaderboard sent in {(time.time() - cache_send_start) * 1000:.1f}ms"
                 )
             else:
                 # Schedule leaderboard update separately
                 leaderboard_task_start = time.time()
                 asyncio.create_task(self._send_leaderboard_to_monitor(websocket))
                 logger.debug(
-                    f"Leaderboard task created in {(time.time() - leaderboard_task_start)*1000:.1f}ms"
+                    f"Leaderboard task created in {(time.time() - leaderboard_task_start) * 1000:.1f}ms"
                 )
 
             logger.debug(
-                f"Monitor initial data send completed in {(time.time() - total_start)*1000:.1f}ms"
+                f"Monitor initial data send completed in {(time.time() - total_start) * 1000:.1f}ms"
             )
 
         except websockets.exceptions.ConnectionClosed:
@@ -677,7 +677,7 @@ class Orchestrator:
             contributors_start = time.time()
             contributors = await self.storage.get_top_contributors(10)
             logger.debug(
-                f"Contributors retrieved in {(time.time() - contributors_start)*1000:.1f}ms"
+                f"Contributors retrieved in {(time.time() - contributors_start) * 1000:.1f}ms"
             )
 
             # Get worker counts in thread pool
@@ -690,7 +690,7 @@ class Orchestrator:
                 ),
             )
             logger.debug(
-                f"Worker counts retrieved in {(time.time() - worker_counts_start)*1000:.1f}ms"
+                f"Worker counts retrieved in {(time.time() - worker_counts_start) * 1000:.1f}ms"
             )
 
             # Build enhanced contributors list
@@ -707,7 +707,9 @@ class Orchestrator:
                     ),
                 }
                 enhanced_contributors.append(contrib_dict)
-            logger.debug(f"Enhanced contributors built in {(time.time() - build_start)*1000:.1f}ms")
+            logger.debug(
+                f"Enhanced contributors built in {(time.time() - build_start) * 1000:.1f}ms"
+            )
 
             # Cache for future monitors
             self._cached_leaderboard = enhanced_contributors
@@ -719,11 +721,11 @@ class Orchestrator:
                     safe_json_dumps({"type": "leaderboard", "data": enhanced_contributors})
                 )
                 logger.debug(
-                    f"Leaderboard sent to monitor in {(time.time() - send_start)*1000:.1f}ms"
+                    f"Leaderboard sent to monitor in {(time.time() - send_start) * 1000:.1f}ms"
                 )
 
             logger.debug(
-                f"Leaderboard send to monitor completed in {(time.time() - total_start)*1000:.1f}ms"
+                f"Leaderboard send to monitor completed in {(time.time() - total_start) * 1000:.1f}ms"
             )
 
         except websockets.exceptions.ConnectionClosed:
@@ -779,7 +781,7 @@ class Orchestrator:
             contributors_start = time.time()
             contributors = await self.storage.get_top_contributors(10)
             logger.debug(
-                f"Contributors retrieved for broadcast in {(time.time() - contributors_start)*1000:.1f}ms"
+                f"Contributors retrieved for broadcast in {(time.time() - contributors_start) * 1000:.1f}ms"
             )
 
             # Get worker counts
@@ -792,7 +794,7 @@ class Orchestrator:
                 ),
             )
             logger.debug(
-                f"Worker counts retrieved for broadcast in {(time.time() - worker_counts_start)*1000:.1f}ms"
+                f"Worker counts retrieved for broadcast in {(time.time() - worker_counts_start) * 1000:.1f}ms"
             )
 
             # Build enhanced contributors list
@@ -810,7 +812,7 @@ class Orchestrator:
                 }
                 enhanced_contributors.append(contrib_dict)
             logger.debug(
-                f"Enhanced contributors built for broadcast in {(time.time() - build_start)*1000:.1f}ms"
+                f"Enhanced contributors built for broadcast in {(time.time() - build_start) * 1000:.1f}ms"
             )
 
             # Cache it
@@ -822,7 +824,7 @@ class Orchestrator:
                 {"type": "leaderboard", "data": enhanced_contributors}
             )
             logger.debug(
-                f"Leaderboard message created in {(time.time() - message_create_start)*1000:.1f}ms"
+                f"Leaderboard message created in {(time.time() - message_create_start) * 1000:.1f}ms"
             )
 
             # Send to all monitors in parallel
@@ -849,10 +851,10 @@ class Orchestrator:
             self.monitors -= disconnected
 
             logger.debug(
-                f"Leaderboard sent to {len(monitors_copy)} monitors in {(time.time() - send_start)*1000:.1f}ms"
+                f"Leaderboard sent to {len(monitors_copy)} monitors in {(time.time() - send_start) * 1000:.1f}ms"
             )
             logger.debug(
-                f"Leaderboard broadcast completed in {(time.time() - total_start)*1000:.1f}ms"
+                f"Leaderboard broadcast completed in {(time.time() - total_start) * 1000:.1f}ms"
             )
 
         except Exception as e:

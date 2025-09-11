@@ -221,9 +221,9 @@ class TestHuggingFaceRanges:
             # Verify chunk was created with correct start_index
             assert expected_chunk_id in processor.chunk_tracker.chunks
             chunk_state = processor.chunk_tracker.chunks[expected_chunk_id]
-            assert (
-                chunk_state.start_index == expected_start_index
-            ), f"Chunk {expected_chunk_id} should have start_index {expected_start_index}, got {chunk_state.start_index}"
+            assert chunk_state.start_index == expected_start_index, (
+                f"Chunk {expected_chunk_id} should have start_index {expected_start_index}, got {chunk_state.start_index}"
+            )
 
     def test_malformed_job_ids(self, tmp_path):
         """Test handling of malformed job IDs that could cause crashes."""
@@ -499,6 +499,6 @@ class TestHuggingFaceRanges:
             # Verify the chunk was created with correct start_index
             chunk_state = processor.chunk_tracker.chunks[unit_id]
             expected_start_index = expected_chunk_idx * processor.chunk_size
-            assert (
-                chunk_state.start_index == expected_start_index
-            ), f"Chunk {expected_chunk_idx} should have start_index {expected_start_index}, got {chunk_state.start_index}"
+            assert chunk_state.start_index == expected_start_index, (
+                f"Chunk {expected_chunk_idx} should have start_index {expected_start_index}, got {chunk_state.start_index}"
+            )

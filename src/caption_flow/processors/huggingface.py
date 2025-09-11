@@ -38,7 +38,7 @@ def log_memory(location: str):
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info()
     logger.info(
-        f"Memory at {location}: RSS={mem_info.rss/1024/1024:.1f}MB, VMS={mem_info.vms/1024/1024:.1f}MB"
+        f"Memory at {location}: RSS={mem_info.rss / 1024 / 1024:.1f}MB, VMS={mem_info.vms / 1024 / 1024:.1f}MB"
     )
     # Force garbage collection
     gc.collect()

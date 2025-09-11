@@ -156,12 +156,15 @@ class TestWebDatasetProcessors(ProcessorTestBase):
             mock_discover.return_value = mock_webshart_dataset
 
             orchestrator = WebDatasetOrchestratorProcessor()
-            orchestrator.initialize(orchestrator_config, storage_manager)
+            try:
+                orchestrator.initialize(orchestrator_config, storage_manager)
 
-            assert orchestrator.dataset is not None
-            assert orchestrator.chunk_tracker is not None
-            assert orchestrator.chunk_size == 100
-            assert orchestrator.dataset.num_shards == 2
+                assert orchestrator.dataset is not None
+                assert orchestrator.chunk_tracker is not None
+                assert orchestrator.chunk_size == 100
+                assert orchestrator.dataset.num_shards == 2
+            finally:
+                orchestrator.cleanup()
 
     def test_worker_initialization(self, worker_config):
         """Test WebDataset worker initialization."""
@@ -184,22 +187,25 @@ class TestWebDatasetProcessors(ProcessorTestBase):
             mock_discover.return_value = mock_webshart_dataset
 
             orchestrator = WebDatasetOrchestratorProcessor()
-            orchestrator.initialize(orchestrator_config, storage_manager)
+            try:
+                orchestrator.initialize(orchestrator_config, storage_manager)
 
-            # Let background thread create some units
-            import time
+                # Let background thread create some units
+                import time
 
-            time.sleep(0.1)
+                time.sleep(0.1)
 
-            # Request work units
-            units = orchestrator.get_work_units(2, "worker1")
+                # Request work units
+                units = orchestrator.get_work_units(2, "worker1")
 
-            assert len(units) <= 2
-            for unit in units:
-                assert unit.unit_id.startswith("shard_")
-                assert unit.source_id.startswith("shard_")
-                assert "unprocessed_ranges" in unit.data
-                assert unit.unit_size > 0
+                assert len(units) <= 2
+                for unit in units:
+                    assert unit.unit_id.startswith("shard_")
+                    assert unit.source_id.startswith("shard_")
+                    assert "unprocessed_ranges" in unit.data
+                    assert unit.unit_size > 0
+            finally:
+                orchestrator.cleanup()
 
     def test_chunk_tracking_integration(
         self, orchestrator_config, storage_manager, mock_webshart_dataset, chunk_tracker

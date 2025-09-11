@@ -196,9 +196,9 @@ class TestHuggingFaceJobIdUniqueness:
             # Check continuity
             if sample_indices:
                 expected = list(range(sample_indices[0], sample_indices[-1] + 1))
-                assert (
-                    sample_indices == expected
-                ), f"Non-continuous sample indices in chunk {chunk_id}: {sample_indices[:10]}..."
+                assert sample_indices == expected, (
+                    f"Non-continuous sample indices in chunk {chunk_id}: {sample_indices[:10]}..."
+                )
 
 
 @pytest.mark.asyncio
@@ -278,9 +278,9 @@ async def test_job_id_uniqueness_with_worker_disconnections(
     )
 
     # The released units should now be in pending
-    assert (
-        stats_after_disconnect["pending_units"] > initial_stats["pending_units"]
-    ), "Pending units should increase after worker disconnections"
+    assert stats_after_disconnect["pending_units"] > initial_stats["pending_units"], (
+        "Pending units should increase after worker disconnections"
+    )
 
     # Phase 3: Reassign work to new workers
     print("\nPhase 3: Reassigning work to new workers")
@@ -353,17 +353,17 @@ async def test_job_id_uniqueness_with_worker_disconnections(
         for dup in duplicate_job_ids[:10]:
             print(f"  {dup}")
 
-    assert (
-        len(duplicate_job_ids) == 0
-    ), f"Found {len(duplicate_job_ids)} problematic job IDs during reassignment"
+    assert len(duplicate_job_ids) == 0, (
+        f"Found {len(duplicate_job_ids)} problematic job IDs during reassignment"
+    )
 
     # Verify reassigned job IDs match expected pattern
     # They should have exactly 2 entries in their history (original + reassignment)
     for job_id in reassigned_job_ids:
         history = job_id_assignment_history[job_id]
-        assert (
-            len(history) >= 2
-        ), f"Reassigned job ID {job_id} should have at least 2 assignment records, has {len(history)}"
+        assert len(history) >= 2, (
+            f"Reassigned job ID {job_id} should have at least 2 assignment records, has {len(history)}"
+        )
 
     # Stop background thread
     processor.stop_creation.set()
@@ -387,9 +387,9 @@ async def _verify_chunk_state_consistency(processor, released_unit_ids):
             # Shouldn't be assigned to disconnected workers
             if chunk_state.assigned_to and chunk_state.assigned_to.startswith("worker_"):
                 worker_num = int(chunk_state.assigned_to.split("_")[1])
-                assert (
-                    worker_num >= 3
-                ), f"Chunk {unit_id} still assigned to disconnected {chunk_state.assigned_to}"
+                assert worker_num >= 3, (
+                    f"Chunk {unit_id} still assigned to disconnected {chunk_state.assigned_to}"
+                )
 
     print("  ✓ Chunk state consistency verified")
 
@@ -466,9 +466,9 @@ async def test_rapid_worker_churning(orchestrator_config, temp_checkpoint_dir):
 
     # This is the critical assertion - job IDs should be deterministic
     # The same sample should always get the same job ID
-    assert (
-        max_count <= 5
-    ), f"Job ID appeared too many times ({max_count}), suggests non-deterministic assignment"
+    assert max_count <= 5, (
+        f"Job ID appeared too many times ({max_count}), suggests non-deterministic assignment"
+    )
 
     processor.stop_creation.set()
 
@@ -662,9 +662,9 @@ async def test_duplicate_job_ids_with_same_token_multiple_workers(
             print(f"  {job_id}: concurrent saves by {contributors}")
 
     # The assertion - we should not have duplicate job_id assignments
-    assert (
-        len(duplicate_assignments) == 0
-    ), f"Found {len(duplicate_assignments)} job IDs assigned to multiple workers"
+    assert len(duplicate_assignments) == 0, (
+        f"Found {len(duplicate_assignments)} job IDs assigned to multiple workers"
+    )
 
     # Also check that saves didn't create duplicates
     assert len(duplicate_saves) == 0, f"Found {len(duplicate_saves)} job IDs saved multiple times"
@@ -799,9 +799,9 @@ async def test_chunk_boundary_job_id_assignment(orchestrator_config, temp_checkp
                 f"  Gap of {gap['gap_size']} samples between {gap['after_index']} and {gap['before_index']}"
             )
 
-    assert (
-        len(boundary_issues) == 0
-    ), f"Found {len(boundary_issues)} boundary issues in job ID assignment"
+    assert len(boundary_issues) == 0, (
+        f"Found {len(boundary_issues)} boundary issues in job ID assignment"
+    )
 
     processor.stop_creation.set()
 
@@ -874,9 +874,9 @@ async def test_job_id_persistence_across_restarts(orchestrator_config, temp_chec
     print(f"Second run job IDs: {len(second_run_job_ids)}")
     print(f"Overlapping IDs: {len(overlapping_ids)}")
 
-    assert (
-        len(overlapping_ids) == 0
-    ), f"Found {len(overlapping_ids)} duplicate job IDs across restarts"
+    assert len(overlapping_ids) == 0, (
+        f"Found {len(overlapping_ids)} duplicate job IDs across restarts"
+    )
 
 
 import threading
@@ -1090,9 +1090,9 @@ class TestHuggingFaceWithRealStorage:
         await storage.close()
 
         # Assertions
-        assert (
-            len(duplicate_job_ids) == 0
-        ), f"Found {len(duplicate_job_ids)} duplicate job IDs in storage"
+        assert len(duplicate_job_ids) == 0, (
+            f"Found {len(duplicate_job_ids)} duplicate job IDs in storage"
+        )
 
     @pytest.mark.asyncio
     async def test_chunk_tracker_race_conditions(self, temp_checkpoint_dir):
@@ -1171,9 +1171,9 @@ class TestHuggingFaceWithRealStorage:
         new_tracker = ChunkTracker(checkpoint_path)
         reloaded_state = new_tracker.chunks["shard1:chunk:0"]
 
-        assert (
-            reloaded_state.processed_count == chunk_state.processed_count
-        ), "Processed count changed after save/reload"
+        assert reloaded_state.processed_count == chunk_state.processed_count, (
+            "Processed count changed after save/reload"
+        )
 
 
 @pytest.mark.asyncio
@@ -1396,9 +1396,9 @@ async def test_relative_absolute_index_misalignments(temp_checkpoint_dir):
                 print(f"    Size: {size}")
 
                 # Verify correct calculation
-                assert (
-                    start == expected_start
-                ), f"Incorrect start index for chunk {chunk_idx}: got {start}, expected {expected_start}"
+                assert start == expected_start, (
+                    f"Incorrect start index for chunk {chunk_idx}: got {start}, expected {expected_start}"
+                )
 
     # Cleanup
     processor.stop_creation.set()
@@ -1462,9 +1462,9 @@ async def test_job_id_calculation_consistency(temp_checkpoint_dir):
         print(f"  Method 2 (string): {job_id_2.get_sample_str()}")
         print(f"  Method 3 (dict):   {job_id_3.get_sample_str()}")
 
-        assert (
-            job_id_str_1 == job_id_2.get_sample_str() == job_id_3.get_sample_str()
-        ), "Job ID strings don't match across creation methods"
+        assert job_id_str_1 == job_id_2.get_sample_str() == job_id_3.get_sample_str(), (
+            "Job ID strings don't match across creation methods"
+        )
 
         # Verify chunk calculation from sample index
         calculated_chunk_idx = test["sample_idx"] // test["chunk_size"]
@@ -1590,7 +1590,7 @@ async def test_huggingface_chunk_start_index_bug(temp_checkpoint_dir):
     if duplicates:
         print("\n❌ DUPLICATE JOB IDs FOUND:")
         for i, dup in enumerate(duplicates[:10]):
-            print(f"\n  Duplicate #{i+1}:")
+            print(f"\n  Duplicate #{i + 1}:")
             print(f"    Job ID: {dup['job_id']}")
             print(f"    Worker: {dup['worker']}")
             print(f"    Unit: {dup['unit']}")
