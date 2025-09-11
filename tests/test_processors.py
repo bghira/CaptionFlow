@@ -633,45 +633,50 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
     def test_http_server_integration(self, orchestrator_config, storage_manager):
         """Test HTTP server setup for image serving."""
         orchestrator = LocalFilesystemOrchestratorProcessor()
+        try:
+            with patch("uvicorn.Config"):
+                with patch("uvicorn.Server"):
+                    with patch(
+                        "caption_flow.processors.local_filesystem.threading.Thread"
+                    ) as mock_thread:
+                        # Mock the threading to prevent actual thread creation
+                        mock_thread.return_value.start = Mock()
 
-        with patch("uvicorn.Config"):
-            with patch("uvicorn.Server"):
-                with patch(
-                    "caption_flow.processors.local_filesystem.threading.Thread"
-                ) as mock_thread:
-                    # Mock the threading to prevent actual thread creation
-                    mock_thread.return_value.start = Mock()
+                        orchestrator.initialize(orchestrator_config, storage_manager)
 
-                    orchestrator.initialize(orchestrator_config, storage_manager)
+                        # Check HTTP app was created
+                        assert orchestrator.http_app is not None
 
-                    # Check HTTP app was created
-                    assert orchestrator.http_app is not None
-
-                    # Check server config
-                    assert orchestrator.http_bind_address == "127.0.0.1"
-                    assert orchestrator.http_port == 8767
+                        # Check server config
+                        assert orchestrator.http_bind_address == "127.0.0.1"
+                        assert orchestrator.http_port == 8767
+        finally:
+            orchestrator.cleanup()
 
     def test_chunk_creation_with_ranges(self, orchestrator_config, storage_manager):
         """Test chunk creation with proper range management."""
         orchestrator = LocalFilesystemOrchestratorProcessor()
-        orchestrator._start_http_server = Mock()
-        orchestrator.initialize(orchestrator_config, storage_manager)
+        try:
+            orchestrator._start_http_server = Mock()
+            orchestrator.initialize(orchestrator_config, storage_manager)
 
-        # Let background thread create units
-        import time
+            # Let background thread create units
+            import time
 
-        time.sleep(0.1)
+            time.sleep(0.1)
 
-        # Get work units
-        units = orchestrator.get_work_units(3, "worker1")
+            # Get work units
+            units = orchestrator.get_work_units(3, "worker1")
 
-        assert len(units) > 0
-        for unit in units:
-            assert "start_index" in unit.data
-            assert "chunk_size" in unit.data
-            assert "unprocessed_ranges" in unit.data
-            assert "http_url" in unit.data
-            assert "filenames" in unit.data
+            assert len(units) > 0
+            for unit in units:
+                assert "start_index" in unit.data
+                assert "chunk_size" in unit.data
+                assert "unprocessed_ranges" in unit.data
+                assert "http_url" in unit.data
+                assert "filenames" in unit.data
+        finally:
+            orchestrator.cleanup()
 
     def test_worker_local_vs_http_access(self, worker_config):
         """Test worker with local storage access vs HTTP fallback."""
@@ -719,40 +724,46 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
         """Test chunk tracker persistence and restoration."""
         # Create first orchestrator instance
         orch1 = LocalFilesystemOrchestratorProcessor()
-        orch1._start_http_server = Mock()
-        orch1.initialize(orchestrator_config, storage_manager)
+        orch2 = None
+        try:
+            orch1._start_http_server = Mock()
+            orch1.initialize(orchestrator_config, storage_manager)
 
-        # Wait for unit creation
-        import time
+            # Wait for unit creation
+            import time
 
-        time.sleep(0.2)
+            time.sleep(0.2)
 
-        # Get and complete some units
-        units = orch1.get_work_units(1, "worker1")
-        if units:
-            unit = units[0]
-            orch1.mark_completed(unit.unit_id, "worker1")
-
-        # Save checkpoint
-        if orch1.chunk_tracker:
-            orch1.chunk_tracker.save()
-            saved_path = orch1.chunk_tracker.checkpoint_path
-
-            # Create second orchestrator instance with new chunk tracker
-            orch2 = LocalFilesystemOrchestratorProcessor()
-            orch2._start_http_server = Mock()
-
-            # Load from same checkpoint file
-            orch2.chunk_tracker = ChunkTracker(saved_path)
-
-            # Should have restored chunks
-            assert len(orch2.chunk_tracker.chunks) > 0
-
-            # If unit was completed, check its status
+            # Get and complete some units
+            units = orch1.get_work_units(1, "worker1")
             if units:
-                chunk_state = orch2.chunk_tracker.chunks.get(unit.unit_id)
-                if chunk_state:
-                    assert chunk_state.status == "completed"
+                unit = units[0]
+                orch1.mark_completed(unit.unit_id, "worker1")
+
+            # Save checkpoint
+            if orch1.chunk_tracker:
+                orch1.chunk_tracker.save()
+                saved_path = orch1.chunk_tracker.checkpoint_path
+
+                # Create second orchestrator instance with new chunk tracker
+                orch2 = LocalFilesystemOrchestratorProcessor()
+                orch2._start_http_server = Mock()
+
+                # Load from same checkpoint file
+                orch2.chunk_tracker = ChunkTracker(saved_path)
+
+                # Should have restored chunks
+                assert len(orch2.chunk_tracker.chunks) > 0
+
+                # If unit was completed, check its status
+                if units:
+                    chunk_state = orch2.chunk_tracker.chunks.get(unit.unit_id)
+                    if chunk_state:
+                        assert chunk_state.status == "completed"
+        finally:
+            orch1.cleanup()
+            if orch2:
+                orch2.cleanup()
 
 
 # ============= Cross-Processor Compatibility Tests =============
@@ -1029,42 +1040,45 @@ class TestProcessorIntegration(ProcessorTestBase):
             (temp_dir / f"image_{i}.jpg").touch()
 
         orchestrator = LocalFilesystemOrchestratorProcessor()
-        orchestrator._start_http_server = Mock()
-        orchestrator.initialize(config, storage)
+        try:
+            orchestrator._start_http_server = Mock()
+            orchestrator.initialize(config, storage)
 
-        # Wait for background thread to create units
-        import time
+            # Wait for background thread to create units
+            import time
 
-        time.sleep(0.5)  # Give more time for unit creation
+            time.sleep(0.5)  # Give more time for unit creation
 
-        # Simulate work assignment
-        units = orchestrator.get_work_units(2, "worker1")
-
-        # Check that we got units before proceeding
-        if not units:
-            # If still no units, manually trigger unit creation
-            with orchestrator.lock:
-                orchestrator.current_index = 0
-            time.sleep(0.5)
+            # Simulate work assignment
             units = orchestrator.get_work_units(2, "worker1")
 
-        assert len(units) > 0, "No work units were created"
-        unit_ids = [u.unit_id for u in units]
+            # Check that we got units before proceeding
+            if not units:
+                # If still no units, manually trigger unit creation
+                with orchestrator.lock:
+                    orchestrator.current_index = 0
+                time.sleep(0.5)
+                units = orchestrator.get_work_units(2, "worker1")
 
-        # Simulate worker failure
-        orchestrator.mark_failed(unit_ids[0], "worker1", "Worker crashed")
+            assert len(units) > 0, "No work units were created"
+            unit_ids = [u.unit_id for u in units]
 
-        # Unit should be available again
-        new_units = orchestrator.get_work_units(1, "worker2")
-        assert any(u.unit_id == unit_ids[0] for u in new_units)
+            # Simulate worker failure
+            orchestrator.mark_failed(unit_ids[0], "worker1", "Worker crashed")
 
-        # Simulate worker disconnect
-        orchestrator.release_assignments("worker1")
+            # Unit should be available again
+            new_units = orchestrator.get_work_units(1, "worker2")
+            assert any(u.unit_id == unit_ids[0] for u in new_units)
 
-        # Remaining units should be available
-        available_units = orchestrator.get_work_units(10, "worker3")
-        available_ids = [u.unit_id for u in available_units]
-        assert any(uid in available_ids for uid in unit_ids[1:])
+            # Simulate worker disconnect
+            orchestrator.release_assignments("worker1")
+
+            # Remaining units should be available
+            available_units = orchestrator.get_work_units(10, "worker3")
+            available_ids = [u.unit_id for u in available_units]
+            assert any(uid in available_ids for uid in unit_ids[1:])
+        finally:
+            orchestrator.cleanup()
 
 
 class TestHuggingFaceURLValidation:

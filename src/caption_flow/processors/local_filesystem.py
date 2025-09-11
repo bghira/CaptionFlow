@@ -536,6 +536,16 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         if self.unit_creation_thread:
             self.unit_creation_thread.join(timeout=5)
 
+        # Clean up HTTP server task if it exists
+        if hasattr(self, "http_server_task") and self.http_server_task:
+            try:
+                # Try to cancel the task - this should work across event loops
+                if not self.http_server_task.done():
+                    self.http_server_task.cancel()
+                    logger.info("Cancelled HTTP server task")
+            except Exception as e:
+                logger.debug(f"Error cleaning up HTTP server task: {e}")
+
         # Flush final checkpoint on cleanup
         if self.chunk_tracker:
             self.chunk_tracker.flush()
