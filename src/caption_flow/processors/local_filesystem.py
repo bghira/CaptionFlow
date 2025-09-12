@@ -388,6 +388,22 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                 unit = self.work_units.get(unit_id)
 
                 if unit:
+                    # Update the unit's unprocessed_ranges based on current chunk tracker state
+                    # This is important for units that were marked as failed after partial success
+                    if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
+                        chunk_state = self.chunk_tracker.chunks[unit_id]
+                        relative_unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+
+                        # Convert relative ranges to absolute ranges
+                        unprocessed_ranges = []
+                        for start, end in relative_unprocessed_ranges:
+                            abs_start = chunk_state.start_index + start
+                            abs_end = chunk_state.start_index + end
+                            unprocessed_ranges.append((abs_start, abs_end))
+
+                        # Update the work unit with current unprocessed ranges
+                        unit.data["unprocessed_ranges"] = unprocessed_ranges
+
                     self.assigned_units[worker_id].add(unit_id)
                     assigned.append(unit)
                     logger.debug("Assigning unit %s to worker %s", unit_id, worker_id)
@@ -416,8 +432,11 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                 self.assigned_units[worker_id].discard(unit_id)
                 self.pending_units.append(unit_id)
 
-                if self.chunk_tracker:
-                    self.chunk_tracker.mark_failed(unit_id)
+                # NOTE: We don't call chunk_tracker.mark_failed() here because that would
+                # reset the entire chunk to unprocessed, losing any partial progress that
+                # was already recorded via handle_result(). The chunk tracker should retain
+                # the processed ranges and only make the remaining unprocessed items available
+                # for retry when the unit is reassigned.
 
     def release_assignments(self, worker_id: str) -> None:
         """Release all assignments for a disconnected worker."""
