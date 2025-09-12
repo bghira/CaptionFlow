@@ -1281,12 +1281,14 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
 
             # Report partial success to orchestrator (only successful indices)
             successful_indices = [item["item_index"] for item in successful_items]
+            # Create caption outputs matching the number of successful items to avoid defensive filtering
+            successful_captions = [f"Caption for item {idx}" for idx in successful_indices]
             result = WorkResult(
                 unit_id=unit.unit_id,
                 source_id=unit.source_id,
                 chunk_id=unit.chunk_id,
                 sample_id="batch",
-                outputs={"captions": [f"Processed {len(successful_items)} of {len(items)} items"]},
+                outputs={"captions": successful_captions},
                 metadata={"item_indices": successful_indices},  # Only successful items
             )
             orchestrator.handle_result(result)
@@ -1442,6 +1444,186 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
             assert len(retry_captions) == expected_retry_count, (
                 f"Expected {expected_retry_count} retry captions, got {len(retry_captions)}"
             )
+
+        finally:
+            orchestrator.cleanup()
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_worker_incorrect_reporting_defensive_handling(self, temp_dir):
+        """Test that orchestrator handles workers that incorrectly report failed items as processed."""
+        # Create directory with 3 test images
+        images_dir = temp_dir / "incorrect_reporting_images"
+        images_dir.mkdir()
+
+        for i in range(3):
+            color = (i * 80, (i * 90) % 255, (i * 100) % 255)
+            img = Image.new("RGB", (100, 100), color=color)
+            img.save(images_dir / f"defensive_img_{i:02d}.jpg")
+
+        # Setup storage manager
+        storage = StorageManager(temp_dir, caption_buffer_size=2)
+        await storage.initialize()
+
+        orchestrator_config = ProcessorConfig(
+            processor_type="local_filesystem",
+            config={
+                "dataset": {
+                    "dataset_path": str(images_dir),
+                    "recursive": True,
+                    "http_bind_address": "127.0.0.1",
+                    "http_port": 8772,
+                    "public_address": "localhost",
+                },
+                "chunk_size": 3,
+                "checkpoint_dir": str(temp_dir / "checkpoints"),
+            },
+        )
+
+        orchestrator = LocalFilesystemOrchestratorProcessor()
+
+        try:
+            # Mock HTTP server
+            orchestrator._start_http_server = Mock()
+
+            # Initialize orchestrator
+            orchestrator.initialize(orchestrator_config, storage)
+
+            # Let background thread create work units
+            import time
+
+            time.sleep(0.3)
+
+            # Get a work unit
+            worker_id = "defensive_test_worker"
+            units = orchestrator.get_work_units(1, worker_id)
+            assert len(units) == 1
+
+            unit = units[0]
+
+            # Simulate worker incorrectly reporting:
+            # - Items 0, 2 succeeded
+            # - Item 1 failed, but worker incorrectly includes it in item_indices
+
+            # Test case 1: Worker reports all items as processed but provides error info
+            result_with_errors = WorkResult(
+                unit_id=unit.unit_id,
+                source_id=unit.source_id,
+                chunk_id=unit.chunk_id,
+                sample_id="batch",
+                outputs={
+                    "captions": ["Caption for 0", "Caption for 2"],
+                    "errors": [{"item_index": 1, "error": "Processing failed"}],  # Item 1 failed
+                },
+                metadata={
+                    "item_indices": [0, 1, 2]
+                },  # Worker incorrectly reports item 1 as processed
+            )
+
+            # Process the result - orchestrator should filter out item 1
+            orchestrator.handle_result(result_with_errors)
+
+            # Check chunk tracker state - item 1 should NOT be marked as processed
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+
+                # Should have unprocessed range for item 1 (relative index 1)
+                assert len(unprocessed_ranges) > 0, "Should have unprocessed ranges for failed item"
+
+                # Convert to absolute ranges to check
+                abs_unprocessed = []
+                for start, end in unprocessed_ranges:
+                    abs_start = chunk_state.start_index + start
+                    abs_end = chunk_state.start_index + end
+                    abs_unprocessed.extend(range(abs_start, abs_end + 1))
+
+                assert 1 in abs_unprocessed, (
+                    f"Item 1 should be unprocessed, but unprocessed items are {abs_unprocessed}"
+                )
+                assert 0 not in abs_unprocessed, (
+                    f"Item 0 should be processed, but unprocessed items are {abs_unprocessed}"
+                )
+                assert 2 not in abs_unprocessed, (
+                    f"Item 2 should be processed, but unprocessed items are {abs_unprocessed}"
+                )
+
+            # Test case 2: Worker provides explicit successful_items metadata
+            # Reset chunk tracker for clean test
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                chunk_state.processed_ranges = []  # Reset
+
+            result_with_successful_items = WorkResult(
+                unit_id=unit.unit_id,
+                source_id=unit.source_id,
+                chunk_id=unit.chunk_id,
+                sample_id="batch",
+                outputs={"captions": ["Caption for 0", "Caption for 2"]},
+                metadata={
+                    "item_indices": [0, 1, 2],  # Worker reports all
+                    "successful_items": [0, 2],  # But explicitly says only 0, 2 succeeded
+                },
+            )
+
+            # Process the result
+            orchestrator.handle_result(result_with_successful_items)
+
+            # Check chunk tracker state again
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+
+                # Should still have unprocessed range for item 1
+                abs_unprocessed = []
+                for start, end in unprocessed_ranges:
+                    abs_start = chunk_state.start_index + start
+                    abs_end = chunk_state.start_index + end
+                    abs_unprocessed.extend(range(abs_start, abs_end + 1))
+
+                assert 1 in abs_unprocessed, (
+                    f"Item 1 should still be unprocessed, but unprocessed items are {abs_unprocessed}"
+                )
+
+            # Test case 3: Worker reports all items but provides fewer outputs than indices (real-world scenario)
+            # Reset chunk tracker for clean test
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                chunk_state.processed_ranges = []  # Reset
+
+            result_with_fewer_outputs = WorkResult(
+                unit_id=unit.unit_id,
+                source_id=unit.source_id,
+                chunk_id=unit.chunk_id,
+                sample_id="batch",
+                outputs={"captions": ["Caption for 0", "Caption for 1"]},  # Only 2 captions
+                metadata={"item_indices": [0, 1, 2]},  # But reports 3 items processed
+            )
+
+            # Process the result - should only mark first 2 items as successful
+            orchestrator.handle_result(result_with_fewer_outputs)
+
+            # Check chunk tracker state
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+
+                abs_unprocessed = []
+                for start, end in unprocessed_ranges:
+                    abs_start = chunk_state.start_index + start
+                    abs_end = chunk_state.start_index + end
+                    abs_unprocessed.extend(range(abs_start, abs_end + 1))
+
+                # Only item 2 should be unprocessed (items 0,1 had captions)
+                assert 2 in abs_unprocessed, (
+                    f"Item 2 should be unprocessed (no caption), but unprocessed items are {abs_unprocessed}"
+                )
+                assert 0 not in abs_unprocessed, (
+                    f"Item 0 should be processed (has caption), but unprocessed items are {abs_unprocessed}"
+                )
+                assert 1 not in abs_unprocessed, (
+                    f"Item 1 should be processed (has caption), but unprocessed items are {abs_unprocessed}"
+                )
 
         finally:
             orchestrator.cleanup()

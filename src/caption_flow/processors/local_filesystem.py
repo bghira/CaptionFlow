@@ -538,17 +538,33 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                     successful_indices = reported_indices
 
                     # If outputs indicate some items failed, try to filter them out
-                    if isinstance(result.outputs, dict) and "errors" in result.outputs:
-                        errors = result.outputs["errors"]
-                        if isinstance(errors, list):
-                            failed_indices = []
-                            for error in errors:
-                                if isinstance(error, dict) and "item_index" in error:
-                                    failed_indices.append(error["item_index"])
-                            # Remove failed indices
-                            successful_indices = [
-                                idx for idx in reported_indices if idx not in failed_indices
-                            ]
+                    if isinstance(result.outputs, dict):
+                        # Check for structured errors
+                        if "errors" in result.outputs:
+                            errors = result.outputs["errors"]
+                            if isinstance(errors, list):
+                                failed_indices = []
+                                for error in errors:
+                                    if isinstance(error, dict) and "item_index" in error:
+                                        failed_indices.append(error["item_index"])
+                                # Remove failed indices
+                                successful_indices = [
+                                    idx for idx in reported_indices if idx not in failed_indices
+                                ]
+
+                        # Also check if the number of successful outputs doesn't match reported indices
+                        # This handles cases where errors are logged but not structured in outputs
+                        elif "captions" in result.outputs:
+                            captions = result.outputs["captions"]
+                            if isinstance(captions, list):
+                                # If we have fewer captions than reported indices, some items failed
+                                num_captions = len(
+                                    [c for c in captions if c is not None and c != ""]
+                                )
+                                if num_captions < len(reported_indices):
+                                    # Conservative approach: only mark the first N items as successful
+                                    # where N = number of actual successful outputs
+                                    successful_indices = reported_indices[:num_captions]
 
             if successful_indices:
                 successful_indices.sort()
