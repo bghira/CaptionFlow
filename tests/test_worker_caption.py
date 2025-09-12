@@ -1279,11 +1279,15 @@ class TestWhenFinishedFunctionality:
         worker.when_finished = WhenFinished.POST_EXEC_HOOK
         worker.post_exec_hook = None  # Missing hook path
 
+        # Store initial state
+        initial_running_state = worker.running
+
         # Should log error and return without crashing
         await worker._handle_work_completion()
 
-        # Should not shutdown when hook is missing
-        assert worker.running is True
+        # Should not change running state when hook path is missing
+        assert worker.running == initial_running_state
+        assert worker.should_stop_processing.is_set() is False
 
     @pytest.mark.asyncio
     async def test_execute_post_hook_nonexistent_file(self, tmp_path):

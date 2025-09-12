@@ -862,7 +862,7 @@ class TestWhenFinishedCLI:
 
     def test_worker_command_when_finished_validation_success(self, runner):
         """Test successful worker command with when_finished parameters."""
-        with patch("caption_flow.cli.CaptionWorker") as mock_worker:
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
             mock_worker_instance = Mock()
             mock_worker.return_value = mock_worker_instance
             mock_worker_instance.start = AsyncMock()
@@ -886,7 +886,7 @@ class TestWhenFinishedCLI:
 
     def test_worker_command_when_finished_shutdown(self, runner):
         """Test worker command with shutdown option."""
-        with patch("caption_flow.cli.CaptionWorker") as mock_worker:
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
             mock_worker_instance = Mock()
             mock_worker.return_value = mock_worker_instance
             mock_worker_instance.start = AsyncMock()
@@ -932,7 +932,7 @@ class TestWhenFinishedCLI:
         hook_script.write_text("#!/bin/bash\necho 'test'")
         hook_script.chmod(0o755)
 
-        with patch("caption_flow.cli.CaptionWorker") as mock_worker:
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
             mock_worker_instance = Mock()
             mock_worker.return_value = mock_worker_instance
             mock_worker_instance.start = AsyncMock()
@@ -957,7 +957,7 @@ class TestWhenFinishedCLI:
 
     def test_worker_command_when_finished_default(self, runner):
         """Test worker command uses default when_finished value."""
-        with patch("caption_flow.cli.CaptionWorker") as mock_worker:
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
             mock_worker_instance = Mock()
             mock_worker.return_value = mock_worker_instance
             mock_worker_instance.start = AsyncMock()
