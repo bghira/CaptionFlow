@@ -90,9 +90,10 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         logger.info(f"Root path: {self.dataset_path}, recursive: {self.recursive}")
 
         # Initialize chunk tracking
-        checkpoint_dir = Path(cfg.get("checkpoint_dir", "./checkpoints"))
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.chunk_tracker = ChunkTracker(checkpoint_dir / "chunks.json")
+        storage_cfg = cfg.get("storage", {})
+        self.checkpoint_dir = Path(storage_cfg.get("checkpoint_dir", "./checkpoints"))
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.chunk_tracker = ChunkTracker(self.checkpoint_dir / "chunks.json")
 
         # Discover images
         self._discover_images()
@@ -388,6 +389,30 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                 unit = self.work_units.get(unit_id)
 
                 if unit:
+                    # Update the unit's unprocessed_ranges based on current chunk tracker state
+                    # This is important for units that were marked as failed after partial success
+                    if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
+                        chunk_state = self.chunk_tracker.chunks[unit_id]
+                        relative_unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+
+                        # Convert relative ranges to absolute ranges
+                        unprocessed_ranges = []
+                        for start, end in relative_unprocessed_ranges:
+                            abs_start = chunk_state.start_index + start
+                            abs_end = chunk_state.start_index + end
+                            unprocessed_ranges.append((abs_start, abs_end))
+
+                        # If no unprocessed ranges, skip this unit (it's already complete)
+                        if not unprocessed_ranges:
+                            logger.debug(
+                                "Skipping unit %s - no unprocessed ranges (already complete)",
+                                unit_id,
+                            )
+                            continue
+
+                        # Update the work unit with current unprocessed ranges
+                        unit.data["unprocessed_ranges"] = unprocessed_ranges
+
                     self.assigned_units[worker_id].add(unit_id)
                     assigned.append(unit)
                     logger.debug("Assigning unit %s to worker %s", unit_id, worker_id)
@@ -416,8 +441,11 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                 self.assigned_units[worker_id].discard(unit_id)
                 self.pending_units.append(unit_id)
 
-                if self.chunk_tracker:
-                    self.chunk_tracker.mark_failed(unit_id)
+                # NOTE: We don't call chunk_tracker.mark_failed() here because that would
+                # reset the entire chunk to unprocessed, losing any partial progress that
+                # was already recorded via handle_result(). The chunk tracker should retain
+                # the processed ranges and only make the remaining unprocessed items available
+                # for retry when the unit is reassigned.
 
     def release_assignments(self, worker_id: str) -> None:
         """Release all assignments for a disconnected worker."""
@@ -500,25 +528,66 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         """Handle result processing."""
         base_result = super().handle_result(result)
 
-        # Track processed items
+        # Track processed items - but only items that actually produced successful outputs
         if self.chunk_tracker:
             if "item_indices" not in result.metadata:
                 result.metadata["item_indices"] = [result.metadata.get("_item_index")]
-            indices = result.metadata["item_indices"]
+            reported_indices = result.metadata["item_indices"]
 
-            if indices:
-                indices.sort()
+            # Filter indices to only include items that actually have outputs/succeeded
+            # This is a workaround for workers that incorrectly report failed items as processed
+            successful_indices = []
+            if reported_indices and result.outputs:
+                # Check if we have per-item success information
+                if "successful_items" in result.metadata:
+                    successful_indices = result.metadata["successful_items"]
+                else:
+                    # Fallback: assume all reported indices were successful
+                    # unless we can detect failures from the outputs
+                    successful_indices = reported_indices
+
+                    # If outputs indicate some items failed, try to filter them out
+                    if isinstance(result.outputs, dict):
+                        # Check for structured errors
+                        if "errors" in result.outputs:
+                            errors = result.outputs["errors"]
+                            if isinstance(errors, list):
+                                failed_indices = []
+                                for error in errors:
+                                    if isinstance(error, dict) and "item_index" in error:
+                                        failed_indices.append(error["item_index"])
+                                # Remove failed indices
+                                successful_indices = [
+                                    idx for idx in reported_indices if idx not in failed_indices
+                                ]
+
+                        # Also check if the number of successful outputs doesn't match reported indices
+                        # This handles cases where errors are logged but not structured in outputs
+                        elif "captions" in result.outputs:
+                            captions = result.outputs["captions"]
+                            if isinstance(captions, list):
+                                # If we have fewer captions than reported indices, some items failed
+                                num_captions = len(
+                                    [c for c in captions if c is not None and c != ""]
+                                )
+                                if num_captions < len(reported_indices):
+                                    # Conservative approach: only mark the first N items as successful
+                                    # where N = number of actual successful outputs
+                                    successful_indices = reported_indices[:num_captions]
+
+            if successful_indices:
+                successful_indices.sort()
                 ranges = []
-                start = indices[0]
-                end = indices[0]
+                start = successful_indices[0]
+                end = successful_indices[0]
 
-                for i in range(1, len(indices)):
-                    if indices[i] == end + 1:
-                        end = indices[i]
+                for i in range(1, len(successful_indices)):
+                    if successful_indices[i] == end + 1:
+                        end = successful_indices[i]
                     else:
                         ranges.append((start, end))
-                        start = indices[i]
-                        end = indices[i]
+                        start = successful_indices[i]
+                        end = successful_indices[i]
 
                 ranges.append((start, end))
 

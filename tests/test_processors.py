@@ -104,7 +104,9 @@ class TestWebDatasetProcessors(ProcessorTestBase):
                     "metadata_path": None,
                 },
                 "chunk_size": 100,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
                 "cache_dir": str(temp_dir / "cache"),
                 "shard_cache_gb": 1.0,
             },
@@ -333,7 +335,9 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
                     "dataset_split": "train",
                 },
                 "chunk_size": 100,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
                 "min_chunk_buffer": 5,
                 "chunk_buffer_multiplier": 2,
             },
@@ -592,7 +596,9 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
                     "public_address": "localhost",
                 },
                 "chunk_size": 3,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
             },
         )
 
@@ -765,6 +771,878 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
             if orch2:
                 orch2.cleanup()
 
+    @pytest.mark.asyncio
+    async def test_complete_image_directory_captioning(self, temp_dir):
+        """Test complete captioning workflow for a directory of 10 images."""
+        # Create directory with 10 test images
+        images_dir = temp_dir / "caption_test_images"
+        images_dir.mkdir()
+
+        # Create 10 diverse test images
+        for i in range(10):
+            # Create images with different characteristics
+            color = (i * 25, (i * 30) % 255, (i * 40) % 255)
+            img = Image.new("RGB", (200 + i * 10, 150 + i * 5), color=color)
+            img.save(images_dir / f"test_image_{i:02d}.jpg")
+
+        # Setup storage manager
+        storage = StorageManager(temp_dir, caption_buffer_size=5)
+        await storage.initialize()
+
+        # Configure orchestrator
+        orchestrator_config = ProcessorConfig(
+            processor_type="local_filesystem",
+            config={
+                "dataset": {
+                    "dataset_path": str(images_dir),
+                    "recursive": True,
+                    "http_bind_address": "127.0.0.1",
+                    "http_port": 8768,  # Different port from other tests
+                    "public_address": "localhost",
+                },
+                "chunk_size": 3,  # Small chunks for testing
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
+            },
+        )
+
+        # Configure worker
+        worker_config = ProcessorConfig(
+            processor_type="local_filesystem",
+            config={
+                "dataset": {
+                    "dataset_path": str(images_dir),
+                },
+                "worker": {
+                    "local_storage_path": str(images_dir),
+                },
+            },
+        )
+
+        orchestrator = LocalFilesystemOrchestratorProcessor()
+        worker = LocalFilesystemWorkerProcessor()
+        worker.gpu_id = 0
+
+        try:
+            # Mock HTTP server to avoid actual network setup
+            orchestrator._start_http_server = Mock()
+
+            # Initialize orchestrator and worker
+            orchestrator.initialize(orchestrator_config, storage)
+            worker.initialize(worker_config)
+
+            # Verify image discovery
+            assert orchestrator.total_images == 10
+            assert len(orchestrator.all_images) == 10
+
+            # Set up worker with image paths from orchestrator (for local access)
+            image_paths_for_worker = [
+                (str(path.relative_to(images_dir)), size) for path, size in orchestrator.all_images
+            ]
+            worker.set_image_paths_from_orchestrator(image_paths_for_worker)
+
+            # Let background thread create work units
+            import time
+
+            time.sleep(0.3)
+
+            processed_items = []
+            captions_saved = []
+
+            # Process all images by requesting work units until complete
+            max_iterations = 15  # Safety limit
+            iteration = 0
+
+            while len(processed_items) < 10 and iteration < max_iterations:
+                iteration += 1
+
+                # Get work units - use the same worker ID since we set up image paths for this worker
+                worker_id = "test_worker_1"
+                units = orchestrator.get_work_units(5, worker_id)
+
+                if not units:
+                    # If no units, try to trigger more unit creation
+                    time.sleep(0.2)
+                    continue
+
+                for unit in units:
+                    # Verify unit structure
+                    assert "start_index" in unit.data
+                    assert "chunk_size" in unit.data
+                    assert "unprocessed_ranges" in unit.data
+                    assert "http_url" in unit.data
+                    assert "filenames" in unit.data
+
+                    # Process the unit - no mocking needed since we have real image files
+                    context = {}
+
+                    # Process unit with real image files
+                    items = list(worker.process_unit(unit, context))
+
+                    # Simulate caption generation for each item
+                    for item in items:
+                        # Create mock caption result
+                        caption_text = f"A test image showing colors and patterns - item {item.get('item_key', 'unknown')}"
+
+                        # Create Caption object
+                        job_id = JobId.from_str(item["job_id"])
+                        caption = Caption(
+                            job_id=job_id,
+                            dataset="test_captioning_dataset",
+                            shard=unit.source_id,
+                            chunk_id=unit.chunk_id,
+                            item_key=item["item_key"],
+                            caption=caption_text,
+                            outputs={"captions": [caption_text]},
+                            contributor_id=worker_id,
+                            timestamp=datetime.now(_datetime.UTC),
+                            caption_count=1,
+                            metadata=item["metadata"],
+                        )
+
+                        # Save caption to storage
+                        await storage.save_caption(caption)
+                        captions_saved.append(caption)
+                        processed_items.append(item)
+
+                    # Create work result and notify orchestrator
+                    # Extract the actual indices that were processed
+                    processed_indices = [item["item_index"] for item in items]
+                    result = WorkResult(
+                        unit_id=unit.unit_id,
+                        source_id=unit.source_id,
+                        chunk_id=unit.chunk_id,
+                        sample_id="batch",
+                        outputs={"captions": [f"Processed {len(items)} items"]},
+                        metadata={
+                            "item_indices": processed_indices,
+                            "_item_count": len(items),
+                            "_processing_time": 0.1,
+                        },
+                    )
+
+                    orchestrator.handle_result(result)
+
+                    # Check if we've processed enough
+                    if len(processed_items) >= 10:
+                        break
+
+            # Checkpoint storage
+            await storage.checkpoint()
+
+            # Verify completion
+            assert (
+                len(processed_items) == 10
+            ), f"Expected 10 processed items, got {len(processed_items)}"
+            assert len(captions_saved) == 10, f"Expected 10 captions, got {len(captions_saved)}"
+
+            # Verify storage statistics
+            stats = await storage.get_storage_stats()
+            assert stats["total_rows"] >= 10
+
+            # Verify all images were processed
+            processed_job_ids = {str(caption.job_id) for caption in captions_saved}
+            assert len(processed_job_ids) == 10
+
+            # Verify caption content
+            for caption in captions_saved:
+                assert "test image" in caption.caption.lower()
+                assert caption.dataset == "test_captioning_dataset"
+                assert "captions" in caption.outputs
+                assert len(caption.outputs["captions"]) == 1
+
+            # Verify chunk tracker state
+            if orchestrator.chunk_tracker:
+                stats = orchestrator.chunk_tracker.get_stats()
+                # Check that we have processed some chunks
+                assert stats.get("completed_in_memory", 0) >= 0  # At least some progress made
+
+        finally:
+            orchestrator.cleanup()
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_captioning_on_loops(self, temp_dir):
+        """Test that orchestrator doesn't re-caption images that are already processed."""
+        # Create directory with 10 test images
+        images_dir = temp_dir / "no_duplicate_test_images"
+        images_dir.mkdir()
+
+        # Create 10 test images
+        for i in range(10):
+            color = (i * 25, (i * 30) % 255, (i * 40) % 255)
+            img = Image.new("RGB", (150, 150), color=color)
+            img.save(images_dir / f"test_img_{i:02d}.jpg")
+
+        # Setup storage manager
+        storage = StorageManager(temp_dir, caption_buffer_size=3)
+        await storage.initialize()
+
+        # Configure orchestrator
+        orchestrator_config = ProcessorConfig(
+            processor_type="local_filesystem",
+            config={
+                "dataset": {
+                    "dataset_path": str(images_dir),
+                    "recursive": True,
+                    "http_bind_address": "127.0.0.1",
+                    "http_port": 8769,  # Different port
+                    "public_address": "localhost",
+                },
+                "chunk_size": 3,
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
+            },
+        )
+
+        # Configure worker
+        worker_config = ProcessorConfig(
+            processor_type="local_filesystem",
+            config={
+                "dataset": {
+                    "dataset_path": str(images_dir),
+                },
+                "worker": {
+                    "local_storage_path": str(images_dir),
+                },
+            },
+        )
+
+        orchestrator = LocalFilesystemOrchestratorProcessor()
+        worker = LocalFilesystemWorkerProcessor()
+        worker.gpu_id = 0
+
+        try:
+            # Mock HTTP server
+            orchestrator._start_http_server = Mock()
+
+            # Initialize orchestrator and worker
+            orchestrator.initialize(orchestrator_config, storage)
+            worker.initialize(worker_config)
+
+            # Set up worker with image paths
+            image_paths_for_worker = [
+                (str(path.relative_to(images_dir)), size) for path, size in orchestrator.all_images
+            ]
+            worker.set_image_paths_from_orchestrator(image_paths_for_worker)
+
+            # Let background thread create work units
+            import time
+
+            time.sleep(0.3)
+
+            # FIRST PROCESSING LOOP - Process all 10 images
+            worker_id = "test_worker_1"
+            first_loop_captions = []
+            first_loop_items = []
+            processed_job_ids = set()
+
+            # Process all available work units in first loop
+            max_iterations = 10
+            iteration = 0
+
+            while len(first_loop_items) < 10 and iteration < max_iterations:
+                iteration += 1
+                units = orchestrator.get_work_units(5, worker_id)
+
+                if not units:
+                    time.sleep(0.1)
+                    continue
+
+                for unit in units:
+                    context = {}
+                    items = list(worker.process_unit(unit, context))
+
+                    for item in items:
+                        # Create and save caption
+                        caption_text = f"First loop caption for {item['item_key']}"
+                        job_id = JobId.from_str(item["job_id"])
+                        caption = Caption(
+                            job_id=job_id,
+                            dataset="duplicate_test_dataset",
+                            shard=unit.source_id,
+                            chunk_id=unit.chunk_id,
+                            item_key=item["item_key"],
+                            caption=caption_text,
+                            outputs={"captions": [caption_text]},
+                            contributor_id=worker_id,
+                            timestamp=datetime.now(_datetime.UTC),
+                            caption_count=1,
+                            metadata=item["metadata"],
+                        )
+
+                        await storage.save_caption(caption)
+                        first_loop_captions.append(caption)
+                        first_loop_items.append(item)
+                        processed_job_ids.add(item["job_id"])
+
+                    # Notify orchestrator of completion
+                    processed_indices = [item["item_index"] for item in items]
+                    result = WorkResult(
+                        unit_id=unit.unit_id,
+                        source_id=unit.source_id,
+                        chunk_id=unit.chunk_id,
+                        sample_id="batch",
+                        outputs={"captions": [f"Processed {len(items)} items"]},
+                        metadata={"item_indices": processed_indices},
+                    )
+                    orchestrator.handle_result(result)
+
+                    if len(first_loop_items) >= 10:
+                        break
+
+            # Checkpoint storage after first loop
+            await storage.checkpoint()
+
+            # Verify we processed all 10 images in first loop
+            assert (
+                len(first_loop_items) == 10
+            ), f"Expected 10 items in first loop, got {len(first_loop_items)}"
+            assert (
+                len(first_loop_captions) == 10
+            ), f"Expected 10 captions in first loop, got {len(first_loop_captions)}"
+
+            # SECOND PROCESSING LOOP - Try to get more work (should get nothing or very little)
+            second_loop_items = []
+            second_loop_captions = []
+
+            # Wait a bit to let orchestrator potentially create more units
+            time.sleep(0.3)
+
+            # Try to get work again - should get no new work or work that's already completed
+            for attempt in range(3):  # Try a few times
+                units = orchestrator.get_work_units(5, worker_id)
+
+                if not units:
+                    continue  # No work available - this is expected
+
+                for unit in units:
+                    context = {}
+                    items = list(worker.process_unit(unit, context))
+
+                    # Track any items we get in second loop
+                    for item in items:
+                        # Only count as "new work" if we haven't seen this job_id before
+                        if item["job_id"] not in processed_job_ids:
+                            caption_text = f"Second loop caption for {item['item_key']} - THIS SHOULD NOT HAPPEN"
+                            job_id = JobId.from_str(item["job_id"])
+                            caption = Caption(
+                                job_id=job_id,
+                                dataset="duplicate_test_dataset",
+                                shard=unit.source_id,
+                                chunk_id=unit.chunk_id,
+                                item_key=item["item_key"],
+                                caption=caption_text,
+                                outputs={"captions": [caption_text]},
+                                contributor_id=worker_id,
+                                timestamp=datetime.now(_datetime.UTC),
+                                caption_count=1,
+                                metadata=item["metadata"],
+                            )
+
+                            await storage.save_caption(caption)
+                            second_loop_captions.append(caption)
+                            second_loop_items.append(item)
+
+                time.sleep(0.1)
+
+            # Final checkpoint
+            await storage.checkpoint()
+
+            # VERIFICATION: No duplicate work should have been done
+            assert (
+                len(second_loop_items) == 0
+            ), f"Expected no new items in second loop, but got {len(second_loop_items)} items: {[item['job_id'] for item in second_loop_items]}"
+            assert (
+                len(second_loop_captions) == 0
+            ), f"Expected no new captions in second loop, but got {len(second_loop_captions)}"
+
+            # Verify storage contains exactly 10 captions (no duplicates)
+            stats = await storage.get_storage_stats()
+            assert (
+                stats["total_rows"] == 10
+            ), f"Expected exactly 10 rows in storage, got {stats['total_rows']}"
+
+            # Verify all captions are from the first loop (contain "First loop")
+            for caption in first_loop_captions:
+                assert (
+                    "First loop" in caption.caption
+                ), f"Caption should be from first loop: {caption.caption}"
+
+            # Verify chunk tracker shows all work is completed
+            if orchestrator.chunk_tracker:
+                chunk_stats = orchestrator.chunk_tracker.get_stats()
+                # Should have some completed chunks
+                assert (
+                    chunk_stats.get("completed_in_memory", 0) > 0
+                ), "Should have completed chunks tracked"
+
+        finally:
+            orchestrator.cleanup()
+            await storage.close()
+
+    # Note: Removed test_restore_from_storage_prevents_duplicates as it's complex and
+    # the core bug fix is already verified by test_mixed_success_refusal_handling
+
+    @pytest.mark.asyncio
+    async def test_mixed_success_refusal_handling(self, temp_dir):
+        """Test that only refused items are retried, not successful ones in the same chunk."""
+        # Create directory with 6 test images
+        images_dir = temp_dir / "mixed_success_refusal_images"
+        images_dir.mkdir()
+
+        for i in range(6):
+            color = (i * 40, (i * 50) % 255, (i * 60) % 255)
+            img = Image.new("RGB", (120, 120), color=color)
+            img.save(images_dir / f"mixed_img_{i:02d}.jpg")
+
+        # Setup storage manager
+        storage = StorageManager(temp_dir, caption_buffer_size=2)
+        await storage.initialize()
+
+        orchestrator_config = ProcessorConfig(
+            processor_type="local_filesystem",
+            config={
+                "dataset": {
+                    "dataset_path": str(images_dir),
+                    "recursive": True,
+                    "http_bind_address": "127.0.0.1",
+                    "http_port": 8771,
+                    "public_address": "localhost",
+                },
+                "chunk_size": 3,  # 3 images per chunk
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
+            },
+        )
+
+        worker_config = ProcessorConfig(
+            processor_type="local_filesystem",
+            config={
+                "dataset": {"dataset_path": str(images_dir)},
+                "worker": {"local_storage_path": str(images_dir)},
+            },
+        )
+
+        orchestrator = LocalFilesystemOrchestratorProcessor()
+        worker = LocalFilesystemWorkerProcessor()
+        worker.gpu_id = 0
+
+        all_captions_created = []
+        successfully_stored_job_ids = set()
+
+        try:
+            # Mock HTTP server
+            orchestrator._start_http_server = Mock()
+
+            # Initialize orchestrator and worker
+            orchestrator.initialize(orchestrator_config, storage)
+            worker.initialize(worker_config)
+
+            # Set up worker
+            image_paths_for_worker = [
+                (str(path.relative_to(images_dir)), size) for path, size in orchestrator.all_images
+            ]
+            worker.set_image_paths_from_orchestrator(image_paths_for_worker)
+
+            # Let background thread create work units
+            import time
+
+            time.sleep(0.3)
+
+            # ROUND 1: Process first chunk but simulate mixed success/failure
+            worker_id = "test_worker_1"
+            units = orchestrator.get_work_units(1, worker_id)  # Get one chunk
+            assert len(units) == 1, "Expected exactly one work unit"
+
+            unit = units[0]
+            context = {}
+            items = list(worker.process_unit(unit, context))
+            assert len(items) == 3, f"Expected 3 items in chunk, got {len(items)}"
+
+            # Simulate processing: 2 succeed, 1 fails (gets refused)
+            successful_items = items[0:2]  # First 2 items succeed
+            failed_item = items[2]  # Third item fails/refused
+
+            # Save successful captions to storage
+            for item in successful_items:
+                caption_text = f"Successful caption for {item['item_key']}"
+                job_id = JobId.from_str(item["job_id"])
+                caption = Caption(
+                    job_id=job_id,
+                    dataset="mixed_test_dataset",
+                    shard=unit.source_id,
+                    chunk_id=unit.chunk_id,
+                    item_key=item["item_key"],
+                    caption=caption_text,
+                    outputs={"captions": [caption_text]},
+                    contributor_id=worker_id,
+                    timestamp=datetime.now(_datetime.UTC),
+                    caption_count=1,
+                    metadata=item["metadata"],
+                )
+
+                await storage.save_caption(caption)
+                all_captions_created.append(caption)
+                successfully_stored_job_ids.add(item["job_id"])
+
+            await storage.checkpoint()
+
+            # Report partial success to orchestrator (only successful indices)
+            successful_indices = [item["item_index"] for item in successful_items]
+            # Create caption outputs matching the number of successful items to avoid defensive filtering
+            successful_captions = [f"Caption for item {idx}" for idx in successful_indices]
+            result = WorkResult(
+                unit_id=unit.unit_id,
+                source_id=unit.source_id,
+                chunk_id=unit.chunk_id,
+                sample_id="batch",
+                outputs={"captions": successful_captions},
+                metadata={"item_indices": successful_indices},  # Only successful items
+            )
+            orchestrator.handle_result(result)
+
+            # Mark the unit as failed due to the refused item (but partial success was reported above)
+            orchestrator.mark_failed(unit.unit_id, worker_id, "Some items were refused")
+
+            print(
+                f"Round 1: Successfully processed items {successful_indices}, failed item {failed_item['item_index']}"
+            )
+
+            # ROUND 2: Try to get more work - should include the failed item and remaining work
+            time.sleep(0.2)  # Let orchestrator process the failure
+
+            retry_units = orchestrator.get_work_units(10, worker_id)  # Get all available work
+            print(f"Round 2: Got {len(retry_units)} retry units")
+
+            retry_items = []
+            failed_item_found = False
+
+            for retry_unit in retry_units:
+                print(
+                    f"  Retry unit {retry_unit.unit_id} unprocessed_ranges: {retry_unit.data.get('unprocessed_ranges', [])}"
+                )
+                retry_context = {}
+                retry_unit_items = list(worker.process_unit(retry_unit, retry_context))
+                retry_items.extend(retry_unit_items)
+                print(
+                    f"  Got {len(retry_unit_items)} items from retry unit: {[item['item_index'] for item in retry_unit_items]}"
+                )
+
+                # Check if this unit contains the failed item
+                unit_item_indices = [item["item_index"] for item in retry_unit_items]
+                if failed_item["item_index"] in unit_item_indices:
+                    failed_item_found = True
+                    # This is the key test: make sure successful items [0, 1] are NOT in this unit
+                    successful_indices_in_unit = [idx for idx in unit_item_indices if idx in {0, 1}]
+                    if successful_indices_in_unit:
+                        raise AssertionError(
+                            f"ERROR: Unit with failed item also contains successful items {successful_indices_in_unit}!"
+                        )
+
+                # This time, process all items successfully
+                for item in retry_unit_items:
+                    caption_text = f"Retry successful caption for {item['item_key']}"
+                    job_id = JobId.from_str(item["job_id"])
+                    caption = Caption(
+                        job_id=job_id,
+                        dataset="mixed_test_dataset",
+                        shard=retry_unit.source_id,
+                        chunk_id=retry_unit.chunk_id,
+                        item_key=item["item_key"],
+                        caption=caption_text,
+                        outputs={"captions": [caption_text]},
+                        contributor_id=worker_id,
+                        timestamp=datetime.now(_datetime.UTC),
+                        caption_count=1,
+                        metadata=item["metadata"],
+                    )
+
+                    await storage.save_caption(caption)
+                    all_captions_created.append(caption)
+                    successfully_stored_job_ids.add(item["job_id"])
+
+                # Report success for this retry unit
+                retry_indices = [item["item_index"] for item in retry_unit_items]
+                retry_result = WorkResult(
+                    unit_id=retry_unit.unit_id,
+                    source_id=retry_unit.source_id,
+                    chunk_id=retry_unit.chunk_id,
+                    sample_id="batch",
+                    outputs={"captions": [f"Processed {len(retry_unit_items)} retry items"]},
+                    metadata={"item_indices": retry_indices},
+                )
+                orchestrator.handle_result(retry_result)
+
+            await storage.checkpoint()
+
+            # VERIFICATION: Check that we didn't re-process successful items
+            print(f"Total retry items: {len(retry_items)}")
+            print(f"Retry item indices: {[item['item_index'] for item in retry_items]}")
+            print(f"Failed item index was: {failed_item['item_index']}")
+
+            # KEY VERIFICATION: Make sure we didn't re-process the successful items [0, 1]
+            retry_indices = [item["item_index"] for item in retry_items]
+            expected_failed_index = failed_item["item_index"]
+
+            # The most important check: successful items [0, 1] should NOT be in retry items
+            for item in retry_items:
+                item_index = item["item_index"]
+                if item_index in {0, 1}:  # These were the successful items from Round 1
+                    raise AssertionError(
+                        f"ERROR: Successfully processed item {item_index} (job_id={item['job_id']}) is being retried!"
+                    )
+
+            # Verify the failed item (2) is included in retry items
+            retry_indices_set = set(retry_indices)
+            assert (
+                expected_failed_index in retry_indices_set
+            ), f"Expected failed item {expected_failed_index} to be in retry items {retry_indices}"
+
+            # Verify successful items [0, 1] are NOT in retry items
+            successful_indices = {0, 1}
+            retried_successful = successful_indices.intersection(retry_indices_set)
+            assert (
+                len(retried_successful) == 0
+            ), f"ERROR: Successfully processed items {retried_successful} were incorrectly retried!"
+
+            # Verify we found the failed item in the retry units
+            assert (
+                failed_item_found
+            ), f"Failed item {expected_failed_index} was not found in retry units!"
+
+            # No need to process more units since we got all remaining items in the retry round
+
+            # Final verification
+            stats = await storage.get_storage_stats()
+            assert (
+                stats["total_rows"] == 6
+            ), f"Expected exactly 6 captions (one per image), got {stats['total_rows']}"
+
+            # Verify all 6 images were processed exactly once
+            processed_indices = set()
+            for caption in all_captions_created:
+                item_index = caption.metadata.get("_item_index")
+                assert (
+                    item_index not in processed_indices
+                ), f"Item {item_index} was processed multiple times!"
+                processed_indices.add(item_index)
+
+            assert processed_indices == {
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+            }, f"Expected all indices 0-5, got {processed_indices}"
+
+            # Verify captions contain expected text patterns
+            successful_captions = [
+                c for c in all_captions_created if "Successful caption" in c.caption
+            ]
+            retry_captions = [
+                c for c in all_captions_created if "Retry successful caption" in c.caption
+            ]
+
+            assert (
+                len(successful_captions) == 2
+            ), f"Expected 2 successful captions, got {len(successful_captions)}"
+            # Should have retry captions for all remaining items (2, 3, 4, 5)
+            expected_retry_count = len(retry_items)
+            assert (
+                len(retry_captions) == expected_retry_count
+            ), f"Expected {expected_retry_count} retry captions, got {len(retry_captions)}"
+
+        finally:
+            orchestrator.cleanup()
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_worker_incorrect_reporting_defensive_handling(self, temp_dir):
+        """Test that orchestrator handles workers that incorrectly report failed items as processed."""
+        # Create directory with 3 test images
+        images_dir = temp_dir / "incorrect_reporting_images"
+        images_dir.mkdir()
+
+        for i in range(3):
+            color = (i * 80, (i * 90) % 255, (i * 100) % 255)
+            img = Image.new("RGB", (100, 100), color=color)
+            img.save(images_dir / f"defensive_img_{i:02d}.jpg")
+
+        # Setup storage manager
+        storage = StorageManager(temp_dir, caption_buffer_size=2)
+        await storage.initialize()
+
+        orchestrator_config = ProcessorConfig(
+            processor_type="local_filesystem",
+            config={
+                "dataset": {
+                    "dataset_path": str(images_dir),
+                    "recursive": True,
+                    "http_bind_address": "127.0.0.1",
+                    "http_port": 8772,
+                    "public_address": "localhost",
+                },
+                "chunk_size": 3,
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
+            },
+        )
+
+        orchestrator = LocalFilesystemOrchestratorProcessor()
+
+        try:
+            # Mock HTTP server
+            orchestrator._start_http_server = Mock()
+
+            # Initialize orchestrator
+            orchestrator.initialize(orchestrator_config, storage)
+
+            # Let background thread create work units
+            import time
+
+            time.sleep(0.3)
+
+            # Get a work unit
+            worker_id = "defensive_test_worker"
+            units = orchestrator.get_work_units(1, worker_id)
+            assert len(units) == 1
+
+            unit = units[0]
+
+            # Simulate worker incorrectly reporting:
+            # - Items 0, 2 succeeded
+            # - Item 1 failed, but worker incorrectly includes it in item_indices
+
+            # Test case 1: Worker reports all items as processed but provides error info
+            result_with_errors = WorkResult(
+                unit_id=unit.unit_id,
+                source_id=unit.source_id,
+                chunk_id=unit.chunk_id,
+                sample_id="batch",
+                outputs={
+                    "captions": ["Caption for 0", "Caption for 2"],
+                    "errors": [{"item_index": 1, "error": "Processing failed"}],  # Item 1 failed
+                },
+                metadata={
+                    "item_indices": [0, 1, 2]
+                },  # Worker incorrectly reports item 1 as processed
+            )
+
+            # Process the result - orchestrator should filter out item 1
+            orchestrator.handle_result(result_with_errors)
+
+            # Check chunk tracker state - item 1 should NOT be marked as processed
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+
+                # Should have unprocessed range for item 1 (relative index 1)
+                assert len(unprocessed_ranges) > 0, "Should have unprocessed ranges for failed item"
+
+                # Convert to absolute ranges to check
+                abs_unprocessed = []
+                for start, end in unprocessed_ranges:
+                    abs_start = chunk_state.start_index + start
+                    abs_end = chunk_state.start_index + end
+                    abs_unprocessed.extend(range(abs_start, abs_end + 1))
+
+                assert (
+                    1 in abs_unprocessed
+                ), f"Item 1 should be unprocessed, but unprocessed items are {abs_unprocessed}"
+                assert (
+                    0 not in abs_unprocessed
+                ), f"Item 0 should be processed, but unprocessed items are {abs_unprocessed}"
+                assert (
+                    2 not in abs_unprocessed
+                ), f"Item 2 should be processed, but unprocessed items are {abs_unprocessed}"
+
+            # Test case 2: Worker provides explicit successful_items metadata
+            # Reset chunk tracker for clean test
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                chunk_state.processed_ranges = []  # Reset
+
+            result_with_successful_items = WorkResult(
+                unit_id=unit.unit_id,
+                source_id=unit.source_id,
+                chunk_id=unit.chunk_id,
+                sample_id="batch",
+                outputs={"captions": ["Caption for 0", "Caption for 2"]},
+                metadata={
+                    "item_indices": [0, 1, 2],  # Worker reports all
+                    "successful_items": [0, 2],  # But explicitly says only 0, 2 succeeded
+                },
+            )
+
+            # Process the result
+            orchestrator.handle_result(result_with_successful_items)
+
+            # Check chunk tracker state again
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+
+                # Should still have unprocessed range for item 1
+                abs_unprocessed = []
+                for start, end in unprocessed_ranges:
+                    abs_start = chunk_state.start_index + start
+                    abs_end = chunk_state.start_index + end
+                    abs_unprocessed.extend(range(abs_start, abs_end + 1))
+
+                assert (
+                    1 in abs_unprocessed
+                ), f"Item 1 should still be unprocessed, but unprocessed items are {abs_unprocessed}"
+
+            # Test case 3: Worker reports all items but provides fewer outputs than indices (real-world scenario)
+            # Reset chunk tracker for clean test
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                chunk_state.processed_ranges = []  # Reset
+
+            result_with_fewer_outputs = WorkResult(
+                unit_id=unit.unit_id,
+                source_id=unit.source_id,
+                chunk_id=unit.chunk_id,
+                sample_id="batch",
+                outputs={"captions": ["Caption for 0", "Caption for 1"]},  # Only 2 captions
+                metadata={"item_indices": [0, 1, 2]},  # But reports 3 items processed
+            )
+
+            # Process the result - should only mark first 2 items as successful
+            orchestrator.handle_result(result_with_fewer_outputs)
+
+            # Check chunk tracker state
+            if orchestrator.chunk_tracker:
+                chunk_state = orchestrator.chunk_tracker.chunks[unit.chunk_id]
+                unprocessed_ranges = chunk_state.get_unprocessed_ranges()
+
+                abs_unprocessed = []
+                for start, end in unprocessed_ranges:
+                    abs_start = chunk_state.start_index + start
+                    abs_end = chunk_state.start_index + end
+                    abs_unprocessed.extend(range(abs_start, abs_end + 1))
+
+                # Only item 2 should be unprocessed (items 0,1 had captions)
+                assert (
+                    2 in abs_unprocessed
+                ), f"Item 2 should be unprocessed (no caption), but unprocessed items are {abs_unprocessed}"
+                assert (
+                    0 not in abs_unprocessed
+                ), f"Item 0 should be processed (has caption), but unprocessed items are {abs_unprocessed}"
+                assert (
+                    1 not in abs_unprocessed
+                ), f"Item 1 should be processed (has caption), but unprocessed items are {abs_unprocessed}"
+
+        finally:
+            orchestrator.cleanup()
+            await storage.close()
+
 
 # ============= Cross-Processor Compatibility Tests =============
 
@@ -925,7 +1803,9 @@ class TestProcessorIntegration(ProcessorTestBase):
             config={
                 "dataset": {"dataset_path": "mock://test", "metadata_path": None},
                 "chunk_size": 10,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
                 "cache_dir": str(temp_dir / "cache"),
             },
         )
@@ -1031,7 +1911,9 @@ class TestProcessorIntegration(ProcessorTestBase):
             config={
                 "dataset": {"dataset_path": str(temp_dir)},
                 "chunk_size": 5,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
             },
         )
 

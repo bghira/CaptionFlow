@@ -147,6 +147,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         # Store storage reference for chunk state synchronization
         self.storage = storage
+        storage_cfg = cfg.get("storage", {})
 
         # Dataset configuration
         dataset_cfg = cfg.get("dataset", {})
@@ -172,7 +173,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         self.buffer_multiplier = cfg.get("chunk_buffer_multiplier", 3)
 
         # Initialize chunk tracking
-        self.checkpoint_dir = Path(cfg.get("checkpoint_dir", "./checkpoints"))
+        self.checkpoint_dir = Path(storage_cfg.get("checkpoint_dir", "./checkpoints"))
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.chunk_tracker = ChunkTracker(self.checkpoint_dir / "chunks.json")
 
@@ -792,8 +793,11 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             self.assigned_units[worker_id].discard(unit_id)
             self.pending_units.append(unit_id)
 
-            if self.chunk_tracker:
-                self.chunk_tracker.mark_failed(unit_id)
+            # NOTE: We don't call chunk_tracker.mark_failed() here because that would
+            # reset the entire chunk to unprocessed, losing any partial progress that
+            # was already recorded via handle_result(). The chunk tracker should retain
+            # the processed ranges and only make the remaining unprocessed items available
+            # for retry when the unit is reassigned.
 
     def release_assignments(self, worker_id: str) -> None:
         """Release all assignments for a disconnected worker."""

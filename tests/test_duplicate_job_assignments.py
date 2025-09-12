@@ -40,7 +40,9 @@ def orchestrator_config(temp_checkpoint_dir):
             "dataset_config": None,  # Will auto-detect
             "dataset_split": None,  # Will auto-detect
         },
-        "checkpoint_dir": str(temp_checkpoint_dir),
+        "storage": {
+            "checkpoint_dir": str(temp_checkpoint_dir),
+        },
         "chunk_size": 1000,  # Small chunks for testing
         "min_chunk_buffer": 5,
         "chunk_buffer_multiplier": 2,
@@ -910,7 +912,9 @@ class TestHuggingFaceWithRealStorage:
                 "dataset_config": None,
                 "dataset_split": None,
             },
-            "checkpoint_dir": str(temp_checkpoint_dir / "checkpoints"),
+            "storage": {
+                "checkpoint_dir": str(temp_checkpoint_dir / "checkpoints"),
+            },
             "chunk_size": 100,  # Small chunks
             "min_chunk_buffer": 10,
             "chunk_buffer_multiplier": 2,
@@ -1321,7 +1325,9 @@ async def test_relative_absolute_index_misalignments(temp_checkpoint_dir):
             "processor_type": "huggingface_datasets",
             "dataset_path": "terminusresearch/pexels-metadata-1.71M",
         },
-        "checkpoint_dir": str(temp_checkpoint_dir / "checkpoints2"),
+        "storage": {
+            "checkpoint_dir": str(temp_checkpoint_dir / "checkpoints2"),
+        },
         "chunk_size": 100,
     }
 
@@ -1494,7 +1500,9 @@ async def test_huggingface_chunk_start_index_bug(temp_checkpoint_dir):
             "processor_type": "huggingface_datasets",
             "dataset_path": "terminusresearch/pexels-metadata-1.71M",
         },
-        "checkpoint_dir": str(temp_checkpoint_dir / "checkpoints"),
+        "storage": {
+            "checkpoint_dir": str(temp_checkpoint_dir / "checkpoints"),
+        },
         "chunk_size": 100,
     }
 
