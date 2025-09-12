@@ -214,6 +214,7 @@ def validate_orchestrator_auth_config(
 
     Raises:
         ValueError: If no auth configuration is found
+
     """
     # Check if auth is already in the orchestrator section
     if "auth" in config_data:
@@ -277,7 +278,7 @@ def validate_orchestrator_auth_config(
             "[yellow]Warning: No admin tokens configured - admin operations will be unavailable[/yellow]"
         )
 
-    console.print(f"[green]✓ Auth validation passed[/green]")
+    console.print("[green]✓ Auth validation passed[/green]")
     return config_data
 
 
@@ -363,6 +364,13 @@ def orchestrator(ctx, config: Optional[str], **kwargs):
 @click.option("--gpu-id", type=int, help="GPU device ID (for vLLM)")
 @click.option("--precision", help="Model precision (for vLLM)")
 @click.option("--model", help="Model name (for vLLM)")
+@click.option(
+    "--when_finished",
+    type=click.Choice(["stay_connected", "shutdown", "post_exec_hook"]),
+    default="stay_connected",
+    help="Action when all captions are complete (default: stay_connected)",
+)
+@click.option("--post_exec_hook", help="Path to executable for post_exec_hook action")
 @click.pass_context
 def worker(ctx, config: Optional[str], **kwargs):
     """Start a worker node."""
@@ -376,7 +384,18 @@ def worker(ctx, config: Optional[str], **kwargs):
         config_data = base_config
 
     # Apply CLI overrides (only non-None values)
-    for key in ["server", "token", "name", "batch_size", "gpu_id", "precision", "model"]:
+    cli_overrides = [
+        "server",
+        "token",
+        "name",
+        "batch_size",
+        "gpu_id",
+        "precision",
+        "model",
+        "when_finished",
+        "post_exec_hook",
+    ]
+    for key in cli_overrides:
         if kwargs.get(key) is not None:
             config_data[key] = kwargs[key]
 
@@ -389,6 +408,14 @@ def worker(ctx, config: Optional[str], **kwargs):
         sys.exit(1)
     if not config_data.get("token"):
         console.print("[red]Error: --token required (or set in config)[/red]")
+        sys.exit(1)
+
+    # Validate when_finished logic
+    when_finished = config_data.get("when_finished", "stay_connected")
+    if when_finished == "post_exec_hook" and not config_data.get("post_exec_hook"):
+        console.print(
+            "[red]Error: --post_exec_hook required when --when_finished=post_exec_hook[/red]"
+        )
         sys.exit(1)
 
     # Choose worker type
@@ -853,7 +880,7 @@ def add(ctx, role: str, name: str, token_value: str, no_reload: bool):
             console.print("[yellow]No admin token specified, skipping orchestrator reload[/yellow]")
             console.print("[dim]Use --token to reload orchestrator config[/dim]")
         else:
-            console.print(f"[cyan]Reloading orchestrator config...[/cyan]")
+            console.print("[cyan]Reloading orchestrator config...[/cyan]")
             success = asyncio.run(
                 _reload_orchestrator_config(server, admin_token, config_data, no_verify_ssl)
             )
@@ -923,7 +950,7 @@ def remove(ctx, role: str, identifier: str, no_reload: bool):
         elif not admin_token:
             console.print("[yellow]No admin token specified, skipping orchestrator reload[/yellow]")
         else:
-            console.print(f"[cyan]Reloading orchestrator config...[/cyan]")
+            console.print("[cyan]Reloading orchestrator config...[/cyan]")
             success = asyncio.run(
                 _reload_orchestrator_config(server, admin_token, config_data, no_verify_ssl)
             )
@@ -1008,7 +1035,7 @@ def reload_config(
         sys.exit(1)
 
     # Validate and normalize auth configuration for reload
-    console.print(f"[cyan]Validating configuration...[/cyan]")
+    console.print("[cyan]Validating configuration...[/cyan]")
     if "orchestrator" in new_cfg:
         orchestrator_config = new_cfg["orchestrator"]
         try:

@@ -18,7 +18,7 @@ import websockets
 from huggingface_hub import get_token
 from PIL import Image
 
-from ..models import ProcessingStage, StageResult
+from ..models import ProcessingStage, StageResult, WhenFinished
 from ..processors import (
     HuggingFaceDatasetWorkerProcessor,
     LocalFilesystemWorkerProcessor,
@@ -217,6 +217,15 @@ class CaptionWorker(BaseWorker):
         # Processing control
         self.should_stop_processing = Event()
 
+        # When finished behavior
+        when_finished_str = config.get("when_finished", "stay_connected")
+        self.when_finished = WhenFinished(when_finished_str)
+        self.post_exec_hook = config.get("post_exec_hook")
+
+        # Track consecutive no work responses to detect completion
+        self.consecutive_no_work = 0
+        self.no_work_threshold = 3  # Consider work complete after 3 consecutive no_work responses
+
     def _init_metrics(self):
         """Initialize worker metrics."""
         self.items_processed = 0
@@ -347,12 +356,104 @@ class CaptionWorker(BaseWorker):
                     self.assigned_units.append(unit)
             logger.info(f"Received {len(assignment.units)} work units")
 
+            # Reset no work counter since we got work
+            self.consecutive_no_work = 0
+
         elif msg_type == "no_work":
             logger.info("No work available")
+            self.consecutive_no_work += 1
+
+            # Check if all work appears to be complete
+            if self.consecutive_no_work >= self.no_work_threshold:
+                logger.info(
+                    f"Received {self.consecutive_no_work} consecutive 'no work' responses, "
+                    "assuming all captions are complete"
+                )
+                await self._handle_work_completion()
+                return
+
             await asyncio.sleep(10)
 
             if self.websocket and self.connected.is_set():
                 await self.websocket.send(json.dumps({"type": "get_work_units", "count": 2}))
+
+    async def _handle_work_completion(self):
+        """Handle when all captions are complete based on when_finished setting."""
+        logger.info(f"Handling work completion with action: {self.when_finished}")
+
+        if self.when_finished == WhenFinished.STAY_CONNECTED:
+            logger.info("Staying connected and continuing to poll for work")
+            return
+
+        elif self.when_finished == WhenFinished.SHUTDOWN:
+            logger.info("All captions complete, shutting down worker")
+            await self._shutdown_worker()
+
+        elif self.when_finished == WhenFinished.POST_EXEC_HOOK:
+            if not self.post_exec_hook:
+                logger.error("post_exec_hook action specified but no hook path provided")
+                return
+
+            logger.info(f"All captions complete, executing hook: {self.post_exec_hook}")
+            await self._execute_post_hook()
+
+    async def _shutdown_worker(self):
+        """Clean up and shut down the worker."""
+        logger.info("Shutting down worker...")
+
+        # Stop processing
+        self.should_stop_processing.set()
+
+        # Set running to False to exit the main loop
+        self.running = False
+
+        # Disconnect gracefully
+        if self.websocket:
+            try:
+                await self.websocket.close()
+            except Exception as e:
+                logger.warning(f"Error closing websocket: {e}")
+
+    async def _execute_post_hook(self):
+        """Execute the post-execution hook."""
+        import os
+        from pathlib import Path
+
+        hook_path = Path(self.post_exec_hook)
+
+        if not hook_path.exists():
+            logger.error(f"Post-exec hook not found: {hook_path}")
+            return
+
+        if not os.access(hook_path, os.X_OK):
+            logger.error(f"Post-exec hook is not executable: {hook_path}")
+            return
+
+        try:
+            logger.info(f"Executing post-exec hook: {hook_path}")
+
+            # Execute the hook
+            process = await asyncio.create_subprocess_exec(
+                str(hook_path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await process.communicate()
+
+            if process.returncode == 0:
+                logger.info("Post-exec hook completed successfully")
+                if stdout:
+                    logger.info(f"Hook output: {stdout.decode()}")
+            else:
+                logger.error(f"Post-exec hook failed with return code {process.returncode}")
+                if stderr:
+                    logger.error(f"Hook error: {stderr.decode()}")
+
+        except Exception as e:
+            logger.error(f"Error executing post-exec hook: {e}")
+
+        finally:
+            # Shut down after executing hook
+            await self._shutdown_worker()
 
     def _parse_stages_config(self, vllm_config: Dict[str, Any]) -> List[ProcessingStage]:
         """Parse stages configuration from vLLM config."""

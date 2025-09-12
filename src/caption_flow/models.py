@@ -253,6 +253,20 @@ class StorageContents:
                     logger.warning(f"Row missing columns: {missing_cols}")
 
 
+class WhenFinished(Enum):
+    """Actions to take when caption worker finishes all work."""
+
+    STAY_CONNECTED = "stay_connected"
+    SHUTDOWN = "shutdown"
+    POST_EXEC_HOOK = "post_exec_hook"
+
+    def __str__(self):
+        return self.value
+
+    def to_json(self):
+        return self.value
+
+
 class ExportError(Exception):
     """Base exception for export-related errors."""
 
