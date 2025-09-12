@@ -146,9 +146,9 @@ class TestWebDatasetOrchestratorProcessor:
         chunk_state = orchestrator_processor.chunk_tracker.chunks[chunk_id]
         unprocessed_ranges = chunk_state.get_unprocessed_ranges()
         expected_unprocessed = [(10, 20), (50, 99)]
-        assert unprocessed_ranges == expected_unprocessed, (
-            f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
-        )
+        assert (
+            unprocessed_ranges == expected_unprocessed
+        ), f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
 
         orchestrator_processor._restore_state(mock_storage)
 
@@ -543,6 +543,111 @@ class TestWebDatasetOrchestratorProcessor:
 
         # Should flush checkpoint
         orchestrator_processor.chunk_tracker.flush.assert_called_once()
+
+    def test_storage_config_path_handling(self, temp_dir, mock_storage, mock_dataset):
+        """Test that storage config section is properly accessed for checkpoint_dir."""
+        # Test config with storage section
+        config_with_storage = {
+            "dataset": {
+                "dataset_path": "test_path",
+                "mock_results": True,
+            },
+            "storage": {
+                "checkpoint_dir": str(temp_dir / "custom_checkpoints"),
+            },
+        }
+        processor_config = ProcessorConfig(processor_type="webdataset", config=config_with_storage)
+
+        processor = WebDatasetOrchestratorProcessor()
+        with patch(
+            "caption_flow.processors.webdataset.webshart.discover_dataset",
+            return_value=mock_dataset,
+        ):
+            processor.initialize(processor_config, mock_storage)
+
+        # Verify the custom checkpoint directory was used
+        expected_path = temp_dir / "custom_checkpoints" / "chunks.json"
+        assert processor.chunk_tracker.checkpoint_path == expected_path
+
+    def test_storage_config_fallback_to_default(self, temp_dir, mock_storage, mock_dataset):
+        """Test fallback to default checkpoint_dir when storage section is missing."""
+        # Test config without storage section
+        config_without_storage = {
+            "dataset": {
+                "dataset_path": "test_path",
+                "mock_results": True,
+            },
+        }
+        processor_config = ProcessorConfig(
+            processor_type="webdataset", config=config_without_storage
+        )
+
+        processor = WebDatasetOrchestratorProcessor()
+        with patch(
+            "caption_flow.processors.webdataset.webshart.discover_dataset",
+            return_value=mock_dataset,
+        ):
+            processor.initialize(processor_config, mock_storage)
+
+        # Verify the default checkpoint directory was used
+        expected_path = Path("./checkpoints") / "chunks.json"
+        assert processor.chunk_tracker.checkpoint_path == expected_path
+
+    def test_mark_failed_preserves_partial_progress(self, orchestrator_processor):
+        """Test that mark_failed preserves partial progress and doesn't reset entire chunk."""
+        # Setup: Create a work unit and simulate partial processing
+        worker_id = "test_worker"
+        unit_id = "shard_0:chunk:0"
+        chunk_id = "shard_0:chunk:0"
+
+        # First add the chunk to the tracker
+        orchestrator_processor.chunk_tracker.add_chunk(
+            chunk_id, shard_name="shard_0", shard_url="shard_0.tar", start_index=0, chunk_size=100
+        )
+
+        # Add the work unit
+        from caption_flow.processors.base import WorkUnit
+
+        work_unit = WorkUnit(
+            unit_id=unit_id,
+            chunk_id=chunk_id,
+            source_id="shard_0",
+            unit_size=100,
+            data={"shard_name": "shard_0", "unprocessed_ranges": [(0, 99)]},
+            metadata={"chunk_index": 0},
+        )
+        orchestrator_processor.work_units[unit_id] = work_unit
+
+        # Assign the unit
+        orchestrator_processor.assigned_units[worker_id] = {unit_id}
+
+        # Simulate partial progress by marking some items as processed
+        work_result = WorkResult(
+            unit_id=unit_id,
+            source_id="shard_0",
+            chunk_id=chunk_id,
+            sample_id="50",
+            outputs={"captions": ["test caption"]},
+            metadata={"_item_index": 50},
+            processing_time_ms=100.0,
+        )
+        orchestrator_processor.handle_result(work_result)
+
+        # Verify partial progress exists
+        chunk_state = orchestrator_processor.chunk_tracker.chunks[chunk_id]
+        initial_processed = chunk_state.processed_ranges.copy()
+        assert len(initial_processed) > 0, "Should have some processed items"
+
+        # Call mark_failed - this should NOT reset the chunk's processed ranges
+        orchestrator_processor.mark_failed(unit_id, worker_id, "test error")
+
+        # Verify the unit was moved back to pending
+        assert unit_id in orchestrator_processor.pending_units
+        assert unit_id not in orchestrator_processor.assigned_units[worker_id]
+
+        # Verify chunk tracker still retains the processed ranges (not reset)
+        final_processed = chunk_state.processed_ranges
+        assert final_processed == initial_processed, "Processed ranges should be preserved"
 
 
 class TestWebDatasetWorkerProcessor:
@@ -978,9 +1083,9 @@ class TestWebDatasetIntegration:
         for i, expected in enumerate(expected_chunks):
             actual = created_chunks[i]
             assert actual["chunk_id"] == expected["chunk_id"]
-            assert actual["start_index"] == expected["start_index"], (
-                f"Chunk {i} start_index mismatch"
-            )
+            assert (
+                actual["start_index"] == expected["start_index"]
+            ), f"Chunk {i} start_index mismatch"
             assert actual["chunk_size"] == expected["chunk_size"]
             assert actual["expected_chunk_index"] == expected["expected_chunk_index"]
 
@@ -1054,9 +1159,9 @@ class TestWebDatasetIntegration:
         chunk_state = chunk_tracker.chunks[chunk_id]
         unprocessed_ranges = chunk_state.get_unprocessed_ranges()
         expected_unprocessed = [(5, 9), (13, 19)]  # The gaps
-        assert unprocessed_ranges == expected_unprocessed, (
-            f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
-        )
+        assert (
+            unprocessed_ranges == expected_unprocessed
+        ), f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
 
         # Create work unit simulating orchestrator assignment
         unit = WorkUnit(
