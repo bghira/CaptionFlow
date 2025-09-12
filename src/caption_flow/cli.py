@@ -1087,7 +1087,7 @@ def _display_abandoned_chunks(abandoned_chunks, fix, tracker):
     if fix:
         console.print("\n[yellow]Resetting abandoned chunks to pending...[/yellow]")
         for chunk_id, _, _ in abandoned_chunks:
-            tracker.mark_failed(chunk_id)
+            tracker.mark_pending(chunk_id)
         console.print(f"[green]✓ Reset {len(abandoned_chunks)} chunks[/green]")
 
 
@@ -1165,7 +1165,7 @@ def _cross_check_storage(storage, tracker, fix):
             if fix:
                 console.print("[yellow]Resetting these chunks to pending...[/yellow]")
                 for chunk_id in missing_in_storage:
-                    tracker.mark_failed(chunk_id)
+                    tracker.mark_pending(chunk_id)
                 console.print(f"[green]✓ Reset {len(missing_in_storage)} chunks[/green]")
 
         if missing_in_tracker:
@@ -1180,10 +1180,16 @@ def _cross_check_storage(storage, tracker, fix):
 @main.command()
 @click.option("--data-dir", default="./caption_data", help="Storage directory")
 @click.option("--checkpoint-dir", default="./checkpoints", help="Checkpoint directory")
-@click.option("--fix", is_flag=True, help="Fix issues by resetting abandoned chunks")
+@click.option(
+    "--fix", is_flag=True, help="Fix issues by resetting abandoned chunks (STOP ORCHESTRATOR FIRST)"
+)
 @click.option("--verbose", is_flag=True, help="Show detailed information")
 def scan_chunks(data_dir: str, checkpoint_dir: str, fix: bool, verbose: bool):
-    """Scan for sparse or abandoned chunks and optionally fix them."""
+    """Scan for sparse or abandoned chunks and optionally fix them.
+
+    WARNING: If using --fix, stop the orchestrator first to avoid conflicts.
+    The --fix option preserves partial progress but requires orchestrator restart.
+    """
     from .storage import StorageManager
     from .utils.chunk_tracker import ChunkTracker
 

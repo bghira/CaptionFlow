@@ -54,6 +54,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         cfg = config.config
         dataset_cfg = cfg.get("dataset", {})
+        storage_cfg = cfg.get("storage", {})
         self.dataset_path = dataset_cfg.get("dataset_path")
         metadata_path = dataset_cfg.get("metadata_path", None)
 
@@ -83,7 +84,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
             logger.info(f"Dataset discovered: {self.dataset.num_shards} shards")
 
             # Initialize chunk tracker
-            checkpoint_dir = Path(cfg.get("checkpoint_dir", "./checkpoints"))
+            checkpoint_dir = Path(storage_cfg.get("checkpoint_dir", "./checkpoints"))
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             self.chunk_tracker = ChunkTracker(checkpoint_dir / "chunks.json")
 
@@ -378,8 +379,11 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 self.assigned_units[worker_id].discard(unit_id)
                 self.pending_units.append(unit_id)
 
-                if self.chunk_tracker:
-                    self.chunk_tracker.mark_failed(unit_id)
+                # NOTE: We don't call chunk_tracker.mark_failed() here because that would
+                # reset the entire chunk to unprocessed, losing any partial progress that
+                # was already recorded via handle_result(). The chunk tracker should retain
+                # the processed ranges and only make the remaining unprocessed items available
+                # for retry when the unit is reassigned.
 
     def release_assignments(self, worker_id: str) -> None:
         """Release all assignments for a disconnected worker."""

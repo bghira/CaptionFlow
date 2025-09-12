@@ -90,9 +90,10 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         logger.info(f"Root path: {self.dataset_path}, recursive: {self.recursive}")
 
         # Initialize chunk tracking
-        checkpoint_dir = Path(cfg.get("checkpoint_dir", "./checkpoints"))
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.chunk_tracker = ChunkTracker(checkpoint_dir / "chunks.json")
+        storage_cfg = cfg.get("storage", {})
+        self.checkpoint_dir = Path(storage_cfg.get("checkpoint_dir", "./checkpoints"))
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.chunk_tracker = ChunkTracker(self.checkpoint_dir / "chunks.json")
 
         # Discover images
         self._discover_images()
@@ -400,6 +401,14 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                             abs_start = chunk_state.start_index + start
                             abs_end = chunk_state.start_index + end
                             unprocessed_ranges.append((abs_start, abs_end))
+
+                        # If no unprocessed ranges, skip this unit (it's already complete)
+                        if not unprocessed_ranges:
+                            logger.debug(
+                                "Skipping unit %s - no unprocessed ranges (already complete)",
+                                unit_id,
+                            )
+                            continue
 
                         # Update the work unit with current unprocessed ranges
                         unit.data["unprocessed_ranges"] = unprocessed_ranges

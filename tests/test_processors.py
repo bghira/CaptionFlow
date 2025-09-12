@@ -104,7 +104,9 @@ class TestWebDatasetProcessors(ProcessorTestBase):
                     "metadata_path": None,
                 },
                 "chunk_size": 100,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
                 "cache_dir": str(temp_dir / "cache"),
                 "shard_cache_gb": 1.0,
             },
@@ -333,7 +335,9 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
                     "dataset_split": "train",
                 },
                 "chunk_size": 100,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
                 "min_chunk_buffer": 5,
                 "chunk_buffer_multiplier": 2,
             },
@@ -592,7 +596,9 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
                     "public_address": "localhost",
                 },
                 "chunk_size": 3,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
             },
         )
 
@@ -795,7 +801,9 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
                     "public_address": "localhost",
                 },
                 "chunk_size": 3,  # Small chunks for testing
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
             },
         )
 
@@ -983,7 +991,9 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
                     "public_address": "localhost",
                 },
                 "chunk_size": 3,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
             },
         )
 
@@ -1203,7 +1213,9 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
                     "public_address": "localhost",
                 },
                 "chunk_size": 3,  # 3 images per chunk
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
             },
         )
 
@@ -1476,7 +1488,9 @@ class TestLocalFilesystemProcessors(ProcessorTestBase):
                     "public_address": "localhost",
                 },
                 "chunk_size": 3,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
             },
         )
 
@@ -1789,7 +1803,9 @@ class TestProcessorIntegration(ProcessorTestBase):
             config={
                 "dataset": {"dataset_path": "mock://test", "metadata_path": None},
                 "chunk_size": 10,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
                 "cache_dir": str(temp_dir / "cache"),
             },
         )
@@ -1895,7 +1911,9 @@ class TestProcessorIntegration(ProcessorTestBase):
             config={
                 "dataset": {"dataset_path": str(temp_dir)},
                 "chunk_size": 5,
-                "checkpoint_dir": str(temp_dir / "checkpoints"),
+                "storage": {
+                    "checkpoint_dir": str(temp_dir / "checkpoints"),
+                },
             },
         )
 
