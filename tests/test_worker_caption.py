@@ -12,7 +12,7 @@ from PIL import Image
 # Import pytest-asyncio
 pytest_plugins = ("pytest_asyncio",)
 import pytest_asyncio
-from caption_flow.models import Caption, JobId, ProcessingStage
+from caption_flow.models import Caption, JobId, ProcessingStage, WhenFinished
 from caption_flow.processors import WorkAssignment, WorkUnit
 from caption_flow.storage import StorageManager
 
@@ -859,9 +859,9 @@ class TestCaptionWorker:
                 work_failed_call = sent_data
                 break
 
-        assert (
-            work_failed_call is not None
-        ), "work_failed message should have been sent for incomplete unit"
+        assert work_failed_call is not None, (
+            "work_failed message should have been sent for incomplete unit"
+        )
         assert work_failed_call["unit_id"] == "unit1"
         assert "Processing incomplete" in work_failed_call["error"]
         assert "1/3 items processed" in work_failed_call["error"]
@@ -1117,6 +1117,217 @@ class TestCaptionWorkerConfigReload:
         # Should return empty results and increment failed items
         assert result == []
         assert worker.items_failed == 1
+
+
+class TestWhenFinishedFunctionality:
+    """Test suite for when_finished functionality."""
+
+    @pytest.fixture
+    def worker_config_stay_connected(self):
+        """Create test worker config with stay_connected behavior."""
+        return {
+            "name": "test_worker",
+            "token": "test_token",
+            "server": "ws://localhost:8765",
+            "server_url": "ws://localhost:8765",
+            "gpu_id": 0,
+            "batch_image_processing": True,
+            "when_finished": "stay_connected",
+        }
+
+    @pytest.fixture
+    def worker_config_shutdown(self):
+        """Create test worker config with shutdown behavior."""
+        return {
+            "name": "test_worker",
+            "token": "test_token",
+            "server": "ws://localhost:8765",
+            "server_url": "ws://localhost:8765",
+            "gpu_id": 0,
+            "batch_image_processing": True,
+            "when_finished": "shutdown",
+        }
+
+    @pytest.fixture
+    def worker_config_post_hook(self, tmp_path):
+        """Create test worker config with post_exec_hook behavior."""
+        hook_script = tmp_path / "test_hook.sh"
+        hook_script.write_text("#!/bin/bash\necho 'Hook executed'\nexit 0")
+        hook_script.chmod(0o755)
+
+        return {
+            "name": "test_worker",
+            "token": "test_token",
+            "server": "ws://localhost:8765",
+            "server_url": "ws://localhost:8765",
+            "gpu_id": 0,
+            "batch_image_processing": True,
+            "when_finished": "post_exec_hook",
+            "post_exec_hook": str(hook_script),
+        }
+
+    def test_when_finished_initialization_stay_connected(self, worker_config_stay_connected):
+        """Test worker initialization with stay_connected setting."""
+        worker = create_fast_caption_worker(worker_config_stay_connected)
+
+        assert worker.when_finished == WhenFinished.STAY_CONNECTED
+        assert worker.post_exec_hook is None
+        assert worker.consecutive_no_work == 0
+        assert worker.no_work_threshold == 3
+
+    def test_when_finished_initialization_shutdown(self, worker_config_shutdown):
+        """Test worker initialization with shutdown setting."""
+        worker = create_fast_caption_worker(worker_config_shutdown)
+
+        assert worker.when_finished == WhenFinished.SHUTDOWN
+        assert worker.post_exec_hook is None
+
+    def test_when_finished_initialization_post_hook(self, worker_config_post_hook):
+        """Test worker initialization with post_exec_hook setting."""
+        worker = create_fast_caption_worker(worker_config_post_hook)
+
+        assert worker.when_finished == WhenFinished.POST_EXEC_HOOK
+        assert worker.post_exec_hook is not None
+        assert "test_hook.sh" in worker.post_exec_hook
+
+    @pytest.mark.asyncio
+    async def test_consecutive_no_work_counter(self, worker_config_stay_connected):
+        """Test consecutive no_work counter logic."""
+        worker = create_fast_caption_worker(worker_config_stay_connected)
+
+        # Mock websocket
+        mock_websocket = AsyncMock()
+        worker.websocket = mock_websocket
+        worker.connected.set()
+
+        # Simulate receiving work assignment - should reset counter
+        assignment_data = {
+            "type": "work_assignment",
+            "assignment": {
+                "assignment_id": "test_assignment",
+                "worker_id": "test_worker",
+                "units": [],
+                "assigned_at": datetime.now().isoformat(),
+            },
+        }
+
+        worker.consecutive_no_work = 2
+        await worker._handle_message(assignment_data)
+        assert worker.consecutive_no_work == 0
+
+        # Simulate receiving no_work messages
+        no_work_data = {"type": "no_work"}
+
+        # First no_work - should increment counter but not trigger completion
+        await worker._handle_message(no_work_data)
+        assert worker.consecutive_no_work == 1
+
+        # Second no_work - should increment counter but not trigger completion
+        await worker._handle_message(no_work_data)
+        assert worker.consecutive_no_work == 2
+
+        # Mock the completion handler to avoid actual shutdown
+        with patch.object(worker, "_handle_work_completion") as mock_completion:
+            # Third no_work - should trigger completion
+            await worker._handle_message(no_work_data)
+            assert worker.consecutive_no_work == 3
+            mock_completion.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_handle_work_completion_stay_connected(self, worker_config_stay_connected):
+        """Test work completion handling with stay_connected action."""
+        worker = create_fast_caption_worker(worker_config_stay_connected)
+
+        # Should just log and return
+        await worker._handle_work_completion()
+        # No assertions needed - just verify it doesn't crash
+
+    @pytest.mark.asyncio
+    async def test_handle_work_completion_shutdown(self, worker_config_shutdown):
+        """Test work completion handling with shutdown action."""
+        worker = create_fast_caption_worker(worker_config_shutdown)
+
+        # Mock websocket
+        mock_websocket = AsyncMock()
+        worker.websocket = mock_websocket
+
+        await worker._handle_work_completion()
+
+        # Should set running to False and stop processing
+        assert worker.running is False
+        assert worker.should_stop_processing.is_set()
+
+    @pytest.mark.asyncio
+    async def test_handle_work_completion_post_hook_success(self, worker_config_post_hook):
+        """Test work completion handling with successful post_exec_hook."""
+        worker = create_fast_caption_worker(worker_config_post_hook)
+
+        # Mock websocket
+        mock_websocket = AsyncMock()
+        worker.websocket = mock_websocket
+
+        await worker._handle_work_completion()
+
+        # Should execute hook and then shutdown
+        assert worker.running is False
+        assert worker.should_stop_processing.is_set()
+
+    @pytest.mark.asyncio
+    async def test_handle_work_completion_post_hook_missing_path(self, worker_config_shutdown):
+        """Test work completion handling when post_exec_hook path is missing."""
+        worker = create_fast_caption_worker(worker_config_shutdown)
+        worker.when_finished = WhenFinished.POST_EXEC_HOOK
+        worker.post_exec_hook = None  # Missing hook path
+
+        # Store initial state
+        initial_running_state = worker.running
+
+        # Should log error and return without crashing
+        await worker._handle_work_completion()
+
+        # Should not change running state when hook path is missing
+        assert worker.running == initial_running_state
+        assert worker.should_stop_processing.is_set() is False
+
+    @pytest.mark.asyncio
+    async def test_execute_post_hook_nonexistent_file(self, tmp_path):
+        """Test post-exec hook with nonexistent file."""
+        config = {
+            "name": "test_worker",
+            "token": "test_token",
+            "server": "ws://localhost:8765",
+            "server_url": "ws://localhost:8765",
+            "gpu_id": 0,
+            "when_finished": "post_exec_hook",
+            "post_exec_hook": str(tmp_path / "nonexistent.sh"),
+        }
+
+        worker = create_fast_caption_worker(config)
+
+        # Should handle missing file gracefully
+        await worker._execute_post_hook()
+
+    @pytest.mark.asyncio
+    async def test_execute_post_hook_not_executable(self, tmp_path):
+        """Test post-exec hook with non-executable file."""
+        hook_script = tmp_path / "non_executable.sh"
+        hook_script.write_text("#!/bin/bash\necho 'test'")
+        # Don't make it executable
+
+        config = {
+            "name": "test_worker",
+            "token": "test_token",
+            "server": "ws://localhost:8765",
+            "server_url": "ws://localhost:8765",
+            "gpu_id": 0,
+            "when_finished": "post_exec_hook",
+            "post_exec_hook": str(hook_script),
+        }
+
+        worker = create_fast_caption_worker(config)
+
+        # Should handle non-executable file gracefully
+        await worker._execute_post_hook()
 
 
 if __name__ == "__main__":

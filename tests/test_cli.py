@@ -857,5 +857,126 @@ class TestReloadConfigCommand:
         assert "✓ Auth validation passed" in result.output
 
 
+class TestWhenFinishedCLI:
+    """Test CLI validation for when_finished parameters."""
+
+    def test_worker_command_when_finished_validation_success(self, runner):
+        """Test successful worker command with when_finished parameters."""
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
+            mock_worker_instance = Mock()
+            mock_worker.return_value = mock_worker_instance
+            mock_worker_instance.start = AsyncMock()
+
+            # Test valid combinations
+            result = runner.invoke(
+                main,
+                [
+                    "worker",
+                    "--server",
+                    "ws://localhost:8765",
+                    "--token",
+                    "test-token",
+                    "--vllm",
+                    "--when_finished",
+                    "stay_connected",
+                ],
+            )
+            # This will fail due to async mocking, but should pass validation
+            assert "--post_exec_hook required" not in result.output
+
+    def test_worker_command_when_finished_shutdown(self, runner):
+        """Test worker command with shutdown option."""
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
+            mock_worker_instance = Mock()
+            mock_worker.return_value = mock_worker_instance
+            mock_worker_instance.start = AsyncMock()
+
+            result = runner.invoke(
+                main,
+                [
+                    "worker",
+                    "--server",
+                    "ws://localhost:8765",
+                    "--token",
+                    "test-token",
+                    "--vllm",
+                    "--when_finished",
+                    "shutdown",
+                ],
+            )
+            assert "--post_exec_hook required" not in result.output
+
+    def test_worker_command_when_finished_post_hook_missing(self, runner):
+        """Test worker command fails when post_exec_hook is missing."""
+        result = runner.invoke(
+            main,
+            [
+                "worker",
+                "--server",
+                "ws://localhost:8765",
+                "--token",
+                "test-token",
+                "--vllm",
+                "--when_finished",
+                "post_exec_hook",
+                # Missing --post_exec_hook
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "--post_exec_hook required when --when_finished=post_exec_hook" in result.output
+
+    def test_worker_command_when_finished_post_hook_valid(self, runner, tmp_path):
+        """Test worker command with valid post_exec_hook."""
+        hook_script = tmp_path / "test_hook.sh"
+        hook_script.write_text("#!/bin/bash\necho 'test'")
+        hook_script.chmod(0o755)
+
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
+            mock_worker_instance = Mock()
+            mock_worker.return_value = mock_worker_instance
+            mock_worker_instance.start = AsyncMock()
+
+            result = runner.invoke(
+                main,
+                [
+                    "worker",
+                    "--server",
+                    "ws://localhost:8765",
+                    "--token",
+                    "test-token",
+                    "--vllm",
+                    "--when_finished",
+                    "post_exec_hook",
+                    "--post_exec_hook",
+                    str(hook_script),
+                ],
+            )
+            # Should pass validation
+            assert "--post_exec_hook required" not in result.output
+
+    def test_worker_command_when_finished_default(self, runner):
+        """Test worker command uses default when_finished value."""
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
+            mock_worker_instance = Mock()
+            mock_worker.return_value = mock_worker_instance
+            mock_worker_instance.start = AsyncMock()
+
+            result = runner.invoke(
+                main,
+                [
+                    "worker",
+                    "--server",
+                    "ws://localhost:8765",
+                    "--token",
+                    "test-token",
+                    "--vllm",
+                    # No when_finished specified, should default to stay_connected
+                ],
+            )
+            # Should work without errors
+            assert "--post_exec_hook required" not in result.output
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
