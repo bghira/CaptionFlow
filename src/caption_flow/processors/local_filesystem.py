@@ -519,25 +519,50 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         """Handle result processing."""
         base_result = super().handle_result(result)
 
-        # Track processed items
+        # Track processed items - but only items that actually produced successful outputs
         if self.chunk_tracker:
             if "item_indices" not in result.metadata:
                 result.metadata["item_indices"] = [result.metadata.get("_item_index")]
-            indices = result.metadata["item_indices"]
+            reported_indices = result.metadata["item_indices"]
 
-            if indices:
-                indices.sort()
+            # Filter indices to only include items that actually have outputs/succeeded
+            # This is a workaround for workers that incorrectly report failed items as processed
+            successful_indices = []
+            if reported_indices and result.outputs:
+                # Check if we have per-item success information
+                if "successful_items" in result.metadata:
+                    successful_indices = result.metadata["successful_items"]
+                else:
+                    # Fallback: assume all reported indices were successful
+                    # unless we can detect failures from the outputs
+                    successful_indices = reported_indices
+
+                    # If outputs indicate some items failed, try to filter them out
+                    if isinstance(result.outputs, dict) and "errors" in result.outputs:
+                        errors = result.outputs["errors"]
+                        if isinstance(errors, list):
+                            failed_indices = []
+                            for error in errors:
+                                if isinstance(error, dict) and "item_index" in error:
+                                    failed_indices.append(error["item_index"])
+                            # Remove failed indices
+                            successful_indices = [
+                                idx for idx in reported_indices if idx not in failed_indices
+                            ]
+
+            if successful_indices:
+                successful_indices.sort()
                 ranges = []
-                start = indices[0]
-                end = indices[0]
+                start = successful_indices[0]
+                end = successful_indices[0]
 
-                for i in range(1, len(indices)):
-                    if indices[i] == end + 1:
-                        end = indices[i]
+                for i in range(1, len(successful_indices)):
+                    if successful_indices[i] == end + 1:
+                        end = successful_indices[i]
                     else:
                         ranges.append((start, end))
-                        start = indices[i]
-                        end = indices[i]
+                        start = successful_indices[i]
+                        end = successful_indices[i]
 
                 ranges.append((start, end))
 
