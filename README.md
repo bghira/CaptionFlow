@@ -16,13 +16,12 @@ a fast websocket-based orchestrator paired with lightweight gpu workers achieves
 
 ---
 
-## install
+## install from pypi
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # windows: .venv\Scripts\activate
-pip install --upgrade pip
-pip install -e .  # installs the `caption-flow` command
+pip install caption-flow
 ```
 
 ## quickstart (single box)
