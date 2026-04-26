@@ -1,6 +1,6 @@
 """CaptionFlow - Distributed community captioning system."""
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 from .monitor import Monitor
 from .orchestrator import Orchestrator
