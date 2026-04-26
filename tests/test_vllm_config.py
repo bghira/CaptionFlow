@@ -268,6 +268,22 @@ class TestVLLMConfigManagerInitParams:
 
         assert params == expected
 
+    def test_get_vllm_init_params_new_mm_cache_config(self):
+        """Test getting vLLM init params with current multimodal cache config."""
+        manager = VLLMConfigManager()
+        vllm_config = {
+            "model": "custom-model",
+            "mm_processor_cache_gb": 8,
+            "mm_processor_cache_type": "shm",
+            "mm_shm_cache_max_object_size_mb": 256,
+        }
+
+        params = manager.get_vllm_init_params(vllm_config)
+
+        assert params["mm_processor_cache_gb"] == 8
+        assert params["mm_processor_cache_type"] == "shm"
+        assert params["mm_shm_cache_max_object_size_mb"] == 256
+
 
 class TestVLLMConfigManagerTokenizerReload:
     """Test VLLMConfigManager tokenizer reload checking."""

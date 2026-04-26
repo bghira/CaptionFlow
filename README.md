@@ -21,7 +21,7 @@ a fast websocket-based orchestrator paired with lightweight gpu workers achieves
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # windows: .venv\Scripts\activate
-pip install caption-flow
+pip install "caption-flow[vllm]"
 ```
 
 ## quickstart (single box)
@@ -185,7 +185,7 @@ PRs welcome. keep it simple and fast.
 
 To contribute compute to a cluster:
 
-1. Install caption-flow: `pip install caption-flow`
+1. Install caption-flow: `pip install "caption-flow[vllm]"`
 2. Get a worker token from the project maintainer
 3. Run: `caption-flow worker --server wss://project.domain.com:8765 --token YOUR_TOKEN`
 
