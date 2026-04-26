@@ -19,6 +19,7 @@ from caption_flow.storage import StorageManager
 # Import the modules to test
 from caption_flow.workers.caption import (
     CaptionWorker,
+    MultiStageVLLMManager,
     ProcessingItem,
 )
 
@@ -35,6 +36,96 @@ def create_fast_caption_worker(worker_config):
                         # Don't create or assign event loops in tests - let pytest-asyncio handle it
                         worker.main_loop = None
                         return worker
+
+
+class TestMultiStageVLLMManager:
+    """Test vLLM manager compatibility helpers."""
+
+    def test_filter_engine_args_maps_removed_mm_cache_flag(self):
+        """Test newer vLLM EngineArgs compatibility for removed cache flag."""
+
+        class EngineArgs:
+            def __init__(
+                self,
+                model,
+                trust_remote_code=False,
+                limit_mm_per_prompt=None,
+                mm_processor_cache_gb=4,
+            ):
+                pass
+
+        params = {
+            "model": "test-model",
+            "trust_remote_code": True,
+            "limit_mm_per_prompt": {"image": 1},
+            "disable_mm_preprocessor_cache": True,
+            "unsupported": "drop-me",
+        }
+
+        filtered = MultiStageVLLMManager._filter_engine_args(params, EngineArgs)
+
+        assert filtered == {
+            "model": "test-model",
+            "trust_remote_code": True,
+            "limit_mm_per_prompt": {"image": 1},
+            "mm_processor_cache_gb": 0,
+        }
+
+    def test_filter_engine_args_preserves_explicit_mm_cache_size(self):
+        """Test explicit newer vLLM cache config takes precedence over legacy alias."""
+
+        class EngineArgs:
+            def __init__(
+                self,
+                model,
+                trust_remote_code=False,
+                mm_processor_cache_gb=4,
+                mm_processor_cache_type="lru",
+            ):
+                pass
+
+        params = {
+            "model": "test-model",
+            "trust_remote_code": True,
+            "disable_mm_preprocessor_cache": True,
+            "mm_processor_cache_gb": 8,
+            "mm_processor_cache_type": "shm",
+        }
+
+        filtered = MultiStageVLLMManager._filter_engine_args(params, EngineArgs)
+
+        assert filtered == {
+            "model": "test-model",
+            "trust_remote_code": True,
+            "mm_processor_cache_gb": 8,
+            "mm_processor_cache_type": "shm",
+        }
+
+    def test_filter_engine_args_preserves_supported_mm_cache_flag(self):
+        """Test older vLLM EngineArgs compatibility for the legacy cache flag."""
+
+        class EngineArgs:
+            def __init__(
+                self,
+                model,
+                trust_remote_code=False,
+                disable_mm_preprocessor_cache=True,
+            ):
+                pass
+
+        params = {
+            "model": "test-model",
+            "trust_remote_code": True,
+            "disable_mm_preprocessor_cache": False,
+        }
+
+        filtered = MultiStageVLLMManager._filter_engine_args(params, EngineArgs)
+
+        assert filtered == {
+            "model": "test-model",
+            "trust_remote_code": True,
+            "disable_mm_preprocessor_cache": False,
+        }
 
 
 class TestCaptionWorker:

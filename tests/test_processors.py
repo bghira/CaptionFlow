@@ -455,6 +455,42 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
                 finally:
                     orchestrator.cleanup()
 
+    def test_raw_image_file_discovery(self, orchestrator_config, storage_manager, temp_dir):
+        """Test Hugging Face repos that expose raw image files instead of parquet shards."""
+        image_paths = []
+        data_files = []
+        for i in range(3):
+            image_path = temp_dir / f"image-{i}.jpg"
+            Image.new("RGB", (10, 10), color=(i, i, i)).save(image_path)
+            image_paths.append(str(image_path))
+            data_files.append(f"image-{i}.jpg")
+
+        with patch(
+            "caption_flow.processors.huggingface.HuggingFaceDatasetOrchestratorProcessor._get_data_files_from_builder",
+            return_value=data_files,
+        ):
+            with patch(
+                "caption_flow.processors.huggingface.hf_hub_download",
+                side_effect=image_paths,
+            ):
+                orchestrator = HuggingFaceDatasetOrchestratorProcessor()
+                try:
+                    orchestrator.initialize(orchestrator_config, storage_manager)
+
+                    assert orchestrator.total_items == 3
+                    assert len(orchestrator.shard_info) == 3
+                    assert all(
+                        shard["file_type"] == "image"
+                        for shard in orchestrator.shard_info.values()
+                    )
+
+                    unit = orchestrator._create_work_unit(0)
+                    assert unit is not None
+                    assert unit.unit_size == 3
+                    assert unit.data["shard_ids"] == [0, 1, 2]
+                finally:
+                    orchestrator.cleanup()
+
     # For test_worker_processing_with_ranges, replace with:
     def test_worker_processing_with_ranges(self, worker_config, temp_dir):
         """Test worker processing with specific unprocessed ranges."""
@@ -516,6 +552,68 @@ class TestHuggingFaceDatasetProcessors(ProcessorTestBase):
             # Check processed indices
             processed_indices = context.get("_processed_indices", [])
             assert len(processed_indices) == 20
+
+    def test_worker_processing_raw_image_files(self, worker_config, temp_dir):
+        """Test worker processing for raw image files from Hugging Face repos."""
+        worker = HuggingFaceDatasetWorkerProcessor()
+        worker.gpu_id = 0
+
+        image_paths = []
+        for i in range(2):
+            image_path = temp_dir / f"raw-{i}.webp"
+            Image.new("RGB", (10, 10), color=(i, i, i)).save(image_path)
+            image_paths.append(str(image_path))
+
+        with patch(
+            "caption_flow.processors.huggingface.hf_hub_download",
+            side_effect=image_paths,
+        ):
+            worker.initialize(worker_config)
+
+            unit = WorkUnit(
+                unit_id="raw-0:chunk:0",
+                chunk_id="raw-0:chunk:0",
+                source_id="raw-0",
+                unit_size=2,
+                data={
+                    "dataset_name": "test/dataset",
+                    "config": "default",
+                    "split": "train",
+                    "start_index": 0,
+                    "chunk_size": 2,
+                    "unprocessed_ranges": [(0, 1)],
+                    "shard_ids": [0, 1],
+                    "data_files": ["raw-0.webp", "raw-1.webp"],
+                    "shard_info": {
+                        0: {
+                            "filename": "raw-0.webp",
+                            "file_type": "image",
+                            "start_offset": 0,
+                            "end_offset": 0,
+                            "size": 1,
+                        },
+                        1: {
+                            "filename": "raw-1.webp",
+                            "file_type": "image",
+                            "start_offset": 1,
+                            "end_offset": 1,
+                            "size": 1,
+                        },
+                    },
+                },
+                metadata={"chunk_index": 0, "shard_name": "raw-0"},
+            )
+
+            context = {}
+            items = list(worker.process_unit(unit, context))
+
+            assert len(items) == 2
+            assert [item["item_index"] for item in items] == [0, 1]
+            assert [item["job_id"] for item in items] == [
+                "raw-0:chunk:0:idx:0",
+                "raw-1:chunk:0:idx:1",
+            ]
+            assert context["_processed_indices"] == [0, 1]
 
     @pytest.mark.asyncio
     async def test_storage_update_flow(self, orchestrator_config, storage_manager, temp_dir):

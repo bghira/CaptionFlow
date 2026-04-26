@@ -5,6 +5,7 @@ import os
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -66,6 +67,39 @@ class MultiStageVLLMManager:
         self.tokenizers: Dict[str, Any] = {}  # model_name -> tokenizer
         self.sampling_params: Dict[str, Any] = {}  # stage_name -> SamplingParams
 
+    @staticmethod
+    def _filter_engine_args(params: Dict[str, Any], engine_args_cls: Any) -> Dict[str, Any]:
+        """Filter vLLM init kwargs to those supported by the installed EngineArgs."""
+        signature = inspect.signature(engine_args_cls)
+        supported_params = set(signature.parameters)
+        filtered = params.copy()
+
+        disable_mm_cache = filtered.pop("disable_mm_preprocessor_cache", None)
+        if (
+            disable_mm_cache is True
+            and "disable_mm_preprocessor_cache" not in supported_params
+            and "mm_processor_cache_gb" in supported_params
+            and "mm_processor_cache_gb" not in filtered
+        ):
+            filtered["mm_processor_cache_gb"] = 0
+            logger.info(
+                "Mapped disable_mm_preprocessor_cache=True to mm_processor_cache_gb=0 "
+                "for this vLLM version"
+            )
+        elif "disable_mm_preprocessor_cache" in supported_params and disable_mm_cache is not None:
+            filtered["disable_mm_preprocessor_cache"] = disable_mm_cache
+
+        unsupported = sorted(key for key in filtered if key not in supported_params)
+        if unsupported:
+            logger.warning(
+                "Dropping unsupported vLLM initialization parameter(s): %s",
+                ", ".join(unsupported),
+            )
+            for key in unsupported:
+                filtered.pop(key, None)
+
+        return filtered
+
     def load_model(self, model_name: str, stage: ProcessingStage, base_config: Dict[str, Any]):
         """Load a model if not already loaded."""
         if model_name in self.models:
@@ -74,6 +108,7 @@ class MultiStageVLLMManager:
 
         from transformers import AutoProcessor, AutoTokenizer
         from vllm import LLM
+        from vllm.engine.arg_utils import EngineArgs
 
         logger.info(f"Loading model {model_name} for stage {stage.name}")
 
@@ -113,8 +148,15 @@ class MultiStageVLLMManager:
                 "disable_mm_preprocessor_cache", True
             ),
         }
+        for optional_key in (
+            "mm_processor_cache_gb",
+            "mm_processor_cache_type",
+            "mm_shm_cache_max_object_size_mb",
+        ):
+            if model_config.get(optional_key) is not None:
+                vllm_params[optional_key] = model_config[optional_key]
 
-        self.models[model_name] = LLM(**vllm_params)
+        self.models[model_name] = LLM(**self._filter_engine_args(vllm_params, EngineArgs))
         logger.info(f"Model {model_name} loaded successfully")
 
     def create_sampling_params(self, stage: ProcessingStage, base_sampling: Dict[str, Any]):
@@ -544,6 +586,11 @@ class CaptionWorker(BaseWorker):
                 "disable_mm_preprocessor_cache", True
             ),
             "limit_mm_per_prompt": self.vllm_config.get("limit_mm_per_prompt", {"image": 1}),
+            "mm_processor_cache_gb": self.vllm_config.get("mm_processor_cache_gb"),
+            "mm_processor_cache_type": self.vllm_config.get("mm_processor_cache_type"),
+            "mm_shm_cache_max_object_size_mb": self.vllm_config.get(
+                "mm_shm_cache_max_object_size_mb"
+            ),
         }
 
         base_sampling = self.vllm_config.get("sampling", {})
