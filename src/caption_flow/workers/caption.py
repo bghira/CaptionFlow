@@ -93,9 +93,11 @@ class MultiStageVLLMManager:
 
         # Load tokenizer and processor
         self.tokenizers[model_name] = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True, use_fast=True
+            model_name, trust_remote_code=True
         )
-        self.processors[model_name] = AutoProcessor.from_pretrained(model_name)
+        self.processors[model_name] = AutoProcessor.from_pretrained(
+            model_name, trust_remote_code=True
+        )
 
         # Initialize LLM
         vllm_params = {
