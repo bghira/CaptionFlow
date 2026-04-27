@@ -47,7 +47,7 @@ class LanceStorageExporter:
         Args:
         ----
             shard_name: Name of the shard to export
-            format: Export format ('jsonl', 'json', 'csv', 'parquet', 'txt')
+            format: Export format ('jsonl', 'json', 'csv', 'parquet', 'txt', 'webshart')
             output_path: Output file or directory path
             columns: Specific columns to export
             limit: Maximum number of rows to export
@@ -80,6 +80,20 @@ class LanceStorageExporter:
                 )
             else:
                 output_file = output_path / f"{shard_name}.{format}"
+        elif format == "webshart":
+            # webshart metadata must be shard-specific to avoid multiple shards
+            # reusing the same JSON file when called repeatedly.
+            if output_path.suffix.lower() == ".json" and not output_path.is_dir():
+                if output_path.stem == shard_name:
+                    output_file = output_path
+                else:
+                    raise ExportError(
+                        "Invalid webshart output path "
+                        f"'{output_path}': explicit JSON output files must be named "
+                        f"'{shard_name}.json' for shard '{shard_name}'."
+                    )
+            else:
+                output_file = output_path / f"{shard_name}.json"
         else:
             # Directory-based formats
             output_file = output_path / shard_name
@@ -95,6 +109,12 @@ class LanceStorageExporter:
             return await self.export_shard_to_parquet(shard_name, output_file, columns, limit)
         elif format == "txt":
             return exporter.to_txt(
+                output_file,
+                kwargs.get("filename_column", "filename"),
+                kwargs.get("export_column", "captions"),
+            )
+        elif format == "webshart":
+            return exporter.to_webshart_metadata(
                 output_file,
                 kwargs.get("filename_column", "filename"),
                 kwargs.get("export_column", "captions"),
@@ -629,3 +649,89 @@ class StorageExporter:
 
         logger.info(f"Created {files_created} text files in: {output_dir}")
         return files_created
+
+    def _normalize_webshart_captions(self, value: Any, export_column: str) -> List[str]:
+        """Normalize a caption export value to webshart's plural captions list."""
+        if isinstance(value, str):
+            return [value] if value else []
+        if isinstance(value, (list, tuple)):
+            captions = []
+            for item in value:
+                if item is None:
+                    continue
+                text = item if isinstance(item, str) else str(self._serialize_value(item))
+                if text:
+                    captions.append(text)
+            return captions
+        raise ExportError(
+            f"Column '{export_column}' must contain a string or list of strings "
+            "for webshart metadata export"
+        )
+
+    def to_webshart_metadata(
+        self,
+        metadata_path: Union[str, Path],
+        filename_column: str = "filename",
+        export_column: str = "captions",
+    ) -> int:
+        """Store captions in an existing webshart metadata JSON file."""
+        if export_column not in self.contents.columns:
+            if export_column not in self.contents.output_fields:
+                raise ExportError(f"Column '{export_column}' not found in data")
+
+        captions_by_sample = {}
+        skipped_no_filename = 0
+        skipped_no_content = 0
+
+        for row in self.contents.rows:
+            filename = self._get_filename_from_row(row, filename_column) or row.get("item_key")
+            if not filename:
+                skipped_no_filename += 1
+                continue
+
+            content = row.get(export_column)
+            if content is None:
+                skipped_no_content += 1
+                continue
+
+            captions = self._normalize_webshart_captions(content, export_column)
+            if not captions:
+                skipped_no_content += 1
+                continue
+
+            captions_by_sample[str(filename)] = captions
+
+        if skipped_no_filename > 0:
+            logger.warning(f"Skipped {skipped_no_filename} rows with no extractable filename")
+        if skipped_no_content > 0:
+            logger.warning(f"Skipped {skipped_no_content} rows with no {export_column} content")
+
+        if not captions_by_sample:
+            return 0
+
+        metadata_path = Path(metadata_path)
+        if not metadata_path.exists():
+            raise ExportError(
+                f"Webshart metadata file does not exist: {metadata_path}. "
+                "Expected an existing metadata JSON file to update."
+            )
+        if not metadata_path.is_file():
+            raise ExportError(
+                f"Webshart metadata path is not a file: {metadata_path}. "
+                "Expected an existing metadata JSON file to update."
+            )
+
+        try:
+            import webshart
+        except ImportError as exc:
+            raise ExportError("webshart is required for webshart metadata export") from exc
+
+        if not hasattr(webshart, "write_captions_to_metadata"):
+            raise ExportError(
+                "Installed webshart does not support write_captions_to_metadata; "
+                "upgrade webshart to export captions into metadata listings."
+            )
+
+        updated = webshart.write_captions_to_metadata(metadata_path, captions_by_sample)
+        logger.info(f"Updated {updated} captions in webshart metadata: {metadata_path}")
+        return updated

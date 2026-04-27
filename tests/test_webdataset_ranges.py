@@ -849,13 +849,16 @@ class TestWebDatasetWorkerProcessor:
         mock_entry.data = b"fake_image_data"
         mock_entry.path = "image_005.jpg"
         mock_entry.size = 1024
+        mock_entry.metadata = {
+            "captions": "existing caption",
+            "json_path": "image_005.json",
+            "json_metadata": {"caption": "existing caption"},
+            "_filename": "wrong.jpg",
+            "_job_id": "wrong_job",
+        }
 
         # Mock the loader methods
-        worker_processor_real.loader.shard = Mock()
-
-        # Create a simple iterator that returns our mock entry
-        def mock_next_with_cache_wait(loader):
-            return mock_entry
+        worker_processor_real.loader.load_sample = Mock(side_effect=[mock_entry] * 3)
 
         unit = WorkUnit(
             unit_id="shard_0:chunk:0",
@@ -874,21 +877,17 @@ class TestWebDatasetWorkerProcessor:
         # Mock the image decoding
         test_image = Image.new("RGB", (100, 100), color="red")
 
-        with patch(
-            "caption_flow.processors.webdataset.webshart.next_with_cache_wait",
-            side_effect=[mock_entry] * 3,
-        ):
-            with patch("caption_flow.processors.webdataset.cv2.imdecode") as mock_decode:
-                with patch("caption_flow.processors.webdataset.cv2.cvtColor") as mock_convert:
-                    with patch(
-                        "caption_flow.processors.webdataset.Image.fromarray",
-                        return_value=test_image,
-                    ):
-                        # Mock cv2 processing chain
-                        mock_decode.return_value = "fake_cv2_image"
-                        mock_convert.return_value = "fake_rgb_array"
+        with patch("caption_flow.processors.webdataset.cv2.imdecode") as mock_decode:
+            with patch("caption_flow.processors.webdataset.cv2.cvtColor") as mock_convert:
+                with patch(
+                    "caption_flow.processors.webdataset.Image.fromarray",
+                    return_value=test_image,
+                ):
+                    # Mock cv2 processing chain
+                    mock_decode.return_value = "fake_cv2_image"
+                    mock_convert.return_value = "fake_rgb_array"
 
-                        results = list(worker_processor_real.process_unit(unit, {}))
+                    results = list(worker_processor_real.process_unit(unit, {}))
 
         assert len(results) == 3
 
@@ -899,11 +898,17 @@ class TestWebDatasetWorkerProcessor:
         assert result["image"] == test_image
         assert result["image_data"] == b"fake_image_data"
         assert result["metadata"]["_filename"] == "image_005.jpg"
+        assert result["metadata"]["_job_id"] == result["job_id"]
         assert result["metadata"]["_file_size"] == 1024
+        assert result["metadata"]["captions"] == "existing caption"
+        assert result["metadata"]["json_metadata"] == {"caption": "existing caption"}
+        assert result["metadata"]["_json_path"] == "image_005.json"
+        assert "json_path" not in result["metadata"]
+        assert result["metadata"]["_filename"] != "wrong.jpg"
         assert not result["metadata"].get("_mock", False)  # Should not have mock flag
 
         # Verify loader was called correctly
-        worker_processor_real.loader.shard.assert_called_once_with(shard_idx=0, cursor_idx=5)
+        worker_processor_real.loader.load_sample.assert_any_call(0, 5)
 
     def test_process_unit_real_mode_shard_by_name(self, worker_processor_real):
         """Test processing when shard_idx is None (fallback to name lookup)."""
