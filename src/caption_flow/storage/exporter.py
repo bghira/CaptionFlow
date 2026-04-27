@@ -87,7 +87,11 @@ class LanceStorageExporter:
                 if output_path.stem == shard_name:
                     output_file = output_path
                 else:
-                    output_file = output_path.parent / f"{shard_name}.json"
+                    raise ExportError(
+                        "Invalid webshart output path "
+                        f"'{output_path}': explicit JSON output files must be named "
+                        f"'{shard_name}.json' for shard '{shard_name}'."
+                    )
             else:
                 output_file = output_path / f"{shard_name}.json"
         else:
@@ -646,6 +650,24 @@ class StorageExporter:
         logger.info(f"Created {files_created} text files in: {output_dir}")
         return files_created
 
+    def _normalize_webshart_captions(self, value: Any, export_column: str) -> List[str]:
+        """Normalize a caption export value to webshart's plural captions list."""
+        if isinstance(value, str):
+            return [value] if value else []
+        if isinstance(value, (list, tuple)):
+            captions = []
+            for item in value:
+                if item is None:
+                    continue
+                text = item if isinstance(item, str) else str(self._serialize_value(item))
+                if text:
+                    captions.append(text)
+            return captions
+        raise ExportError(
+            f"Column '{export_column}' must contain a string or list of strings "
+            "for webshart metadata export"
+        )
+
     def to_webshart_metadata(
         self,
         metadata_path: Union[str, Path],
@@ -672,7 +694,12 @@ class StorageExporter:
                 skipped_no_content += 1
                 continue
 
-            captions_by_sample[str(filename)] = content
+            captions = self._normalize_webshart_captions(content, export_column)
+            if not captions:
+                skipped_no_content += 1
+                continue
+
+            captions_by_sample[str(filename)] = captions
 
         if skipped_no_filename > 0:
             logger.warning(f"Skipped {skipped_no_filename} rows with no extractable filename")

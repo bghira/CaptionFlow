@@ -853,6 +853,8 @@ class TestWebDatasetWorkerProcessor:
             "captions": "existing caption",
             "json_path": "image_005.json",
             "json_metadata": {"caption": "existing caption"},
+            "_filename": "wrong.jpg",
+            "_job_id": "wrong_job",
         }
 
         # Mock the loader methods
@@ -896,11 +898,13 @@ class TestWebDatasetWorkerProcessor:
         assert result["image"] == test_image
         assert result["image_data"] == b"fake_image_data"
         assert result["metadata"]["_filename"] == "image_005.jpg"
+        assert result["metadata"]["_job_id"] == result["job_id"]
         assert result["metadata"]["_file_size"] == 1024
         assert result["metadata"]["captions"] == "existing caption"
         assert result["metadata"]["json_metadata"] == {"caption": "existing caption"}
         assert result["metadata"]["_json_path"] == "image_005.json"
         assert "json_path" not in result["metadata"]
+        assert result["metadata"]["_filename"] != "wrong.jpg"
         assert not result["metadata"].get("_mock", False)  # Should not have mock flag
 
         # Verify loader was called correctly

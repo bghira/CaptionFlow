@@ -731,6 +731,21 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                             entry_metadata = getattr(entry, "metadata", {}) or {}
                             if not isinstance(entry_metadata, dict):
                                 entry_metadata = {}
+                            filtered_entry_metadata = {
+                                k: v
+                                for k, v in entry_metadata.items()
+                                if not k.startswith("_")
+                                and k
+                                not in {
+                                    "path",
+                                    "offset",
+                                    "size",
+                                    "width",
+                                    "height",
+                                    "aspect",
+                                    "json_path",
+                                }
+                            }
 
                             yield {
                                 "image": image,
@@ -738,6 +753,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                                 "item_key": Path(entry.path).stem,
                                 "item_index": idx,
                                 "metadata": {
+                                    **filtered_entry_metadata,
                                     "_item_index": idx,
                                     "_chunk_relative_index": idx - unit.data["start_index"],
                                     "_job_id": job_id_str,
@@ -745,20 +761,6 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                                     "_file_size": entry.size,
                                     "_json_path": entry_metadata.get("json_path"),
                                     "_processed_indices": processed_indices,
-                                    **{
-                                        k: v
-                                        for k, v in entry_metadata.items()
-                                        if k
-                                        not in {
-                                            "path",
-                                            "offset",
-                                            "size",
-                                            "width",
-                                            "height",
-                                            "aspect",
-                                            "json_path",
-                                        }
-                                    },
                                 },
                                 "job_id": job_id_str,
                             }
