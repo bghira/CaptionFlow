@@ -227,7 +227,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                     continue
 
                 shard_name = shard_info["name"]
-                shard_files = shard_info["num_files"]
+                shard_files = shard_info.get("num_samples", shard_info["num_files"])
 
                 # Check if we need to move to next shard
                 if current_file_idx >= shard_files:
@@ -681,17 +681,18 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             # Use webshart to process unprocessed ranges
             for start_idx, end_idx in unprocessed_ranges:
                 try:
-                    # Jump to shard and starting position
-                    if shard_idx is not None:
-                        self.loader.shard(shard_idx=shard_idx, cursor_idx=start_idx)
-                    else:
-                        # Try to find shard by name
-                        self.loader.shard(filename=shard_name, cursor_idx=start_idx)
-
                     # Iterate through the range
                     for idx in range(start_idx, end_idx + 1):
                         try:
-                            entry = webshart.next_with_cache_wait(self.loader)
+                            if shard_idx is not None and hasattr(self.loader, "load_sample"):
+                                entry = self.loader.load_sample(shard_idx, idx)
+                            else:
+                                # Fallback for older webshart versions.
+                                if shard_idx is not None:
+                                    self.loader.shard(shard_idx=shard_idx, cursor_idx=idx)
+                                else:
+                                    self.loader.shard(filename=shard_name, cursor_idx=idx)
+                                entry = webshart.next_with_cache_wait(self.loader)
 
                             # Decode image
                             image = None
@@ -723,6 +724,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                                 shard_id=shard_name, chunk_id=str(chunk_index), sample_id=str(idx)
                             )
                             job_id_str = job_id.get_sample_str()
+                            entry_metadata = getattr(entry, "metadata", {}) or {}
 
                             yield {
                                 "image": image,
@@ -735,7 +737,21 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                                     "_job_id": job_id_str,
                                     "_filename": entry.path,
                                     "_file_size": entry.size,
+                                    "_json_path": entry_metadata.get("json_path"),
                                     "_processed_indices": processed_indices,
+                                    **{
+                                        k: v
+                                        for k, v in entry_metadata.items()
+                                        if k
+                                        not in {
+                                            "path",
+                                            "offset",
+                                            "size",
+                                            "width",
+                                            "height",
+                                            "aspect",
+                                        }
+                                    },
                                 },
                                 "job_id": job_id_str,
                             }

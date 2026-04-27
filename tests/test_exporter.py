@@ -3,7 +3,9 @@
 import csv
 import json
 import logging
+import sys
 import tempfile
+import types
 from datetime import datetime
 from pathlib import Path
 
@@ -437,6 +439,38 @@ class TestStorageExporter:
             rows = list(reader)
             assert len(rows) == 2
             assert "job_id" in rows[0]
+
+    def test_to_webshart_metadata_uses_webshart_api(
+        self, sample_storage_contents, temp_storage_dir, monkeypatch
+    ):
+        """Test webshart export delegates metadata writes to the webshart API."""
+        calls = []
+
+        def write_captions_to_metadata(metadata_path, captions_by_sample):
+            calls.append((Path(metadata_path), captions_by_sample))
+            return len(captions_by_sample)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "webshart",
+            types.SimpleNamespace(write_captions_to_metadata=write_captions_to_metadata),
+        )
+
+        exporter = StorageExporter(sample_storage_contents)
+        metadata_path = temp_storage_dir / "shard-0000.json"
+
+        count = exporter.to_webshart_metadata(metadata_path)
+
+        assert count == 2
+        assert calls == [
+            (
+                metadata_path,
+                {
+                    "image1.jpg": ["Test caption 1", "Test caption 2"],
+                    "image2.png": ["Another test caption"],
+                },
+            )
+        ]
 
     def test_empty_contents_handling(self):
         """Test handling of empty storage contents."""

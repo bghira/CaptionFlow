@@ -76,13 +76,14 @@ Usage: caption-flow export [OPTIONS]
   Export caption data to various formats.
 
 Options:
-  --format [jsonl|json|csv|txt|huggingface_hub|all] Export format (default: jsonl)
+  --format [jsonl|json|csv|txt|parquet|webshart|lance|huggingface_hub|all] Export format (default: jsonl)
 ```
 
 * **jsonl**: create JSON line file in the specified `--output` path
 * **csv**: exports CSV-compatible data columns to the `--output` path containing incomplete metadata
 * **json**: creates a `.json` file for each sample inside the `--output` subdirectory containing **complete** metadata; useful for webdatasets
 * **txt**: creates `.txt` file for each sample inside the `--output` subdirectory containing ONLY captions
+* **webshart**: writes captions into existing webshart shard metadata JSON files under the plural `captions` key
 * **huggingface_hub**: creates a dataset on Hugging Face Hub, possibly `--private` and `--nsfw` where necessary
 * **all**: creates all export formats in a specified `--output` directory
 
