@@ -8,6 +8,8 @@ scalable, fault-tolerant **vLLM-powered image captioning**.
 
 a fast websocket-based orchestrator paired with lightweight gpu workers achieves exceptional performance for batched requests through vLLM.
 
+CaptionFlow is also integrated in [bghira/SimpleTuner](https://github.com/bghira/SimpleTuner), where it powers an end-to-end caption-to-training workflow through the SimpleTuner WebUI. Use CaptionFlow directly when you want a standalone distributed captioning system, or use it through SimpleTuner when you want dataset captioning, caption review/export, and model training managed as one suite.
+
 * **orchestrator**: hands out work in chunked shards, collects captions, checkpoints progress, and keeps simple stats.
 * **workers (vLLM)**: connect to the orchestrator, stream in image samples, batch them, and generate 1..N captions per image using prompts supplied by the orchestrator.
 * **config-driven**: all components read YAML config; flags can override.
@@ -25,6 +27,8 @@ pip install "caption-flow[vllm]"
 ```
 
 ## quickstart (single box)
+
+for a full caption-to-training workflow with a web interface, use the SimpleTuner WebUI integration. the standalone flow below is best when you want to run CaptionFlow directly, contribute workers to a cluster, or export captions for your own downstream training pipeline.
 
 1. copy + edit the sample configs
 
@@ -107,6 +111,7 @@ Options:
 ## dataset formats
 
 * huggingface hub or local based URL list datasets that are compatible with the datasets library
+* huggingface hub datasets that are simple containers of raw image files
 * webdatasets shards containing full image data; also can be hosted on the hub
 * local folder filled with images; orchestrator will serve the data to workers
 
