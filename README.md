@@ -83,9 +83,11 @@ Options:
 * **csv**: exports CSV-compatible data columns to the `--output` path containing incomplete metadata
 * **json**: creates a `.json` file for each sample inside the `--output` subdirectory containing **complete** metadata; useful for webdatasets
 * **txt**: creates `.txt` file for each sample inside the `--output` subdirectory containing ONLY captions
-* **webshart**: writes captions into existing webshart shard metadata JSON files under the plural `captions` key
+* **webshart**: updates an **existing per-shard metadata `.json` file** by writing captions under the plural `captions` key. for this format, pass `--output` as the path to the existing shard metadata JSON file when exporting one shard. if you export multiple shards, pass `--output` as a directory containing one existing `{shard_name}.json` file per shard.
 * **huggingface_hub**: creates a dataset on Hugging Face Hub, possibly `--private` and `--nsfw` where necessary
-* **all**: creates all export formats in a specified `--output` directory
+* **all**: creates the directory/file-generating export formats in a specified `--output` directory. prefer a directory here; `webshart` is a special case that expects existing per-shard metadata `.json` files rather than creating new metadata files.
+
+> note: `--output` paths ending in `.json` are treated specially for `webshart`. use a directory for normal multi-format exports and an existing shard metadata JSON file only when intentionally updating a `webshart` shard.
 
 ---
 

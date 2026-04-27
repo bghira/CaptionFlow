@@ -681,17 +681,21 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             # Use webshart to process unprocessed ranges
             for start_idx, end_idx in unprocessed_ranges:
                 try:
+                    use_sample_loader = shard_idx is not None and hasattr(self.loader, "load_sample")
+                    if not use_sample_loader:
+                        # Fallback for older webshart versions. Seek once per contiguous range,
+                        # then advance with next_with_cache_wait for each item.
+                        if shard_idx is not None:
+                            self.loader.shard(shard_idx=shard_idx, cursor_idx=start_idx)
+                        else:
+                            self.loader.shard(filename=shard_name, cursor_idx=start_idx)
+
                     # Iterate through the range
                     for idx in range(start_idx, end_idx + 1):
                         try:
-                            if shard_idx is not None and hasattr(self.loader, "load_sample"):
+                            if use_sample_loader:
                                 entry = self.loader.load_sample(shard_idx, idx)
                             else:
-                                # Fallback for older webshart versions.
-                                if shard_idx is not None:
-                                    self.loader.shard(shard_idx=shard_idx, cursor_idx=idx)
-                                else:
-                                    self.loader.shard(filename=shard_name, cursor_idx=idx)
                                 entry = webshart.next_with_cache_wait(self.loader)
 
                             # Decode image
@@ -725,6 +729,8 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                             )
                             job_id_str = job_id.get_sample_str()
                             entry_metadata = getattr(entry, "metadata", {}) or {}
+                            if not isinstance(entry_metadata, dict):
+                                entry_metadata = {}
 
                             yield {
                                 "image": image,
@@ -750,6 +756,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                                             "width",
                                             "height",
                                             "aspect",
+                                            "json_path",
                                         }
                                     },
                                 },

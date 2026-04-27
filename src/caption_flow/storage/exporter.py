@@ -81,9 +81,13 @@ class LanceStorageExporter:
             else:
                 output_file = output_path / f"{shard_name}.{format}"
         elif format == "webshart":
-            # webshart format updates the existing shard metadata JSON.
+            # webshart metadata must be shard-specific to avoid multiple shards
+            # reusing the same JSON file when called repeatedly.
             if output_path.suffix.lower() == ".json" and not output_path.is_dir():
-                output_file = output_path
+                if output_path.stem == shard_name:
+                    output_file = output_path
+                else:
+                    output_file = output_path.parent / f"{shard_name}.json"
             else:
                 output_file = output_path / f"{shard_name}.json"
         else:
@@ -678,6 +682,18 @@ class StorageExporter:
         if not captions_by_sample:
             return 0
 
+        metadata_path = Path(metadata_path)
+        if not metadata_path.exists():
+            raise ExportError(
+                f"Webshart metadata file does not exist: {metadata_path}. "
+                "Expected an existing metadata JSON file to update."
+            )
+        if not metadata_path.is_file():
+            raise ExportError(
+                f"Webshart metadata path is not a file: {metadata_path}. "
+                "Expected an existing metadata JSON file to update."
+            )
+
         try:
             import webshart
         except ImportError as exc:
@@ -689,7 +705,6 @@ class StorageExporter:
                 "upgrade webshart to export captions into metadata listings."
             )
 
-        metadata_path = Path(metadata_path)
         updated = webshart.write_captions_to_metadata(metadata_path, captions_by_sample)
         logger.info(f"Updated {updated} captions in webshart metadata: {metadata_path}")
         return updated

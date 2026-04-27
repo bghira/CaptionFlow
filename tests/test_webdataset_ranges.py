@@ -900,6 +900,7 @@ class TestWebDatasetWorkerProcessor:
         assert result["metadata"]["captions"] == "existing caption"
         assert result["metadata"]["json_metadata"] == {"caption": "existing caption"}
         assert result["metadata"]["_json_path"] == "image_005.json"
+        assert "json_path" not in result["metadata"]
         assert not result["metadata"].get("_mock", False)  # Should not have mock flag
 
         # Verify loader was called correctly

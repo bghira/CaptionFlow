@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio
 from caption_flow.models import Caption, StorageContents
 from caption_flow.storage import StorageManager
-from caption_flow.storage.exporter import LanceStorageExporter, StorageExporter
+from caption_flow.storage.exporter import ExportError, LanceStorageExporter, StorageExporter
 
 # Set up logging to avoid logger not defined errors
 logging.basicConfig(level=logging.INFO)
@@ -458,6 +458,7 @@ class TestStorageExporter:
 
         exporter = StorageExporter(sample_storage_contents)
         metadata_path = temp_storage_dir / "shard-0000.json"
+        metadata_path.write_text('{"files": {}}', encoding="utf-8")
 
         count = exporter.to_webshart_metadata(metadata_path)
 
@@ -471,6 +472,16 @@ class TestStorageExporter:
                 },
             )
         ]
+
+    def test_to_webshart_metadata_requires_existing_file(
+        self, sample_storage_contents, temp_storage_dir
+    ):
+        """Test webshart export fails clearly when metadata JSON is missing."""
+        exporter = StorageExporter(sample_storage_contents)
+        metadata_path = temp_storage_dir / "missing.json"
+
+        with pytest.raises(ExportError, match="does not exist"):
+            exporter.to_webshart_metadata(metadata_path)
 
     def test_empty_contents_handling(self):
         """Test handling of empty storage contents."""
