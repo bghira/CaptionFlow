@@ -8,13 +8,12 @@ dynamic = ["version", "dependencies", "optional-dependencies"]
 description = "Self-contained distributed community captioning system"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "bghira", email = "bghira@users.github.com" }]
 keywords = ["captioning", "distributed", "vllm", "dataset", "community"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -22,6 +21,10 @@ classifiers = [
 
 [project.scripts]
 caption-flow = "caption_flow.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/bghira/CaptionFlow"
+Repository = "https://github.com/bghira/CaptionFlow"
 
 [tool.setuptools.packages.find]
 where = ["src"]

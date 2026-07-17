@@ -42,6 +42,7 @@ base_deps = [
     "duckdb>=1.5.0,<2.0.0",
     "aiohttp>=3.13.3,<4.0.0",
     "fastapi>=0.133.0,<0.137.0",
+    "uvicorn>=0.35.0,<1.0.0",
     "huggingface-hub>=1.5.0,<2.0.0",
     "opencv-python-headless>=4.13.0,<6.0.0",
     "psutil>=7.0.0,<8.0.0",
@@ -85,7 +86,6 @@ setup(
     long_description_content_type="text/markdown",
     author="bghira",
     author_email="bghira@users.github.com",
-    license="MIT",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     include_package_data=True,
@@ -96,7 +96,6 @@ setup(
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
-        "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
