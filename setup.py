@@ -63,9 +63,28 @@ vllm_deps = [
     "qwen-vl-utils>=0.0.14,<0.1.0",
 ]
 
+PYTORCH_DEPENDENCIES = [
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "torchaudio>=2.11.0",
+]
+
+APPLE_PYTORCH_DEPENDENCIES = [
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    "torchaudio>=2.11.0",
+    # vLLM Metal publishes Apple Silicon wheels for Python 3.12+.
+    "vllm-metal==0.1.0; platform_system == 'Darwin' and platform_machine == 'arm64' and python_version >= '3.12'",
+]
+
 extras_require = {
     "vllm": vllm_deps,
     "captioning": vllm_deps,
+    "cpu": PYTORCH_DEPENDENCIES,
+    "cuda": PYTORCH_DEPENDENCIES,
+    "cuda13": PYTORCH_DEPENDENCIES,
+    "rocm": PYTORCH_DEPENDENCIES,
+    "apple": APPLE_PYTORCH_DEPENDENCIES,
     "dev": [
         "pytest>=8.0.0,<9.0.0",
         "pytest-asyncio>=1.1.0,<2.0.0",

@@ -22,13 +22,37 @@ a fast websocket-based orchestrator paired with lightweight gpu workers achieves
 python -m venv .venv
 source .venv/bin/activate  # windows: .venv\Scripts\activate
 pip install --upgrade pip
-pip install -e ".[vllm]"  # installs the command and GPU worker dependencies
+pip install -e ".[vllm]"  # NVIDIA/Linux: command and vLLM worker dependencies
 ```
 
 For an orchestrator or monitor-only install, use `pip install -e .`.
 `.[captioning]` is an alias for `.[vllm]` for integrations such as
 SimpleTuner. Terminal image previews remain optional because the current
 `term-image` release requires an older Pillow major than CaptionFlow uses.
+
+On Apple Silicon, install the MPS-compatible PyTorch chain and pinned Metal
+plugin with:
+
+```bash
+pip install -e ".[apple]"
+```
+
+CaptionFlow can use vLLM on Apple Silicon too, but the normal Linux `vllm`
+wheel is not the Apple install path. The pinned `vllm-metal` dependency is
+selected automatically on native arm64 Python 3.12+. For a ready-to-run
+Metal worker, use the upstream installer, which also builds/installs the
+Apple-specific vLLM core:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+source ~/.venv-vllm-metal/bin/activate
+pip install -e .
+```
+
+Do not combine `.[apple]` with the Linux `.[vllm]` extra.
+
+For native macOS CPU vLLM instead, follow the
+[official source-build instructions](https://docs.vllm.ai/en/stable/getting_started/installation/cpu/?device=apple).
 
 ## quickstart (single box)
 
