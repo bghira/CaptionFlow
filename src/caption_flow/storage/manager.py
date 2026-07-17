@@ -742,7 +742,7 @@ class StorageManager:
 
             logger.debug(f"Executing DuckDB query: {query}")
             # Execute query and fetch data
-            table = con.execute(query).fetch_arrow_table()
+            table = con.execute(query).to_arrow_table()
             logger.debug(f"Query executed successfully, got {table.num_rows} rows")
             rows = table.to_pylist()
             actual_columns = table.schema.names

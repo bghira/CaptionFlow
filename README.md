@@ -22,8 +22,13 @@ a fast websocket-based orchestrator paired with lightweight gpu workers achieves
 python -m venv .venv
 source .venv/bin/activate  # windows: .venv\Scripts\activate
 pip install --upgrade pip
-pip install -e .  # installs the `caption-flow` command
+pip install -e ".[vllm]"  # installs the command and GPU worker dependencies
 ```
+
+For an orchestrator or monitor-only install, use `pip install -e .`.
+`.[captioning]` is an alias for `.[vllm]` for integrations such as
+SimpleTuner. Terminal image previews remain optional because the current
+`term-image` release requires an older Pillow major than CaptionFlow uses.
 
 ## quickstart (single box)
 

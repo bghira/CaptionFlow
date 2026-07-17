@@ -367,8 +367,8 @@ def orchestrator(ctx, config: Optional[str], **kwargs):
 @click.option(
     "--when_finished",
     type=click.Choice(["stay_connected", "shutdown", "post_exec_hook"]),
-    default="stay_connected",
-    help="Action when all captions are complete (default: stay_connected)",
+    default=None,
+    help="Action when all captions are complete (default: config value or stay_connected)",
 )
 @click.option("--post_exec_hook", help="Path to executable for post_exec_hook action")
 @click.pass_context
