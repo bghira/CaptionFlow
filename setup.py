@@ -108,7 +108,7 @@ setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     include_package_data=True,
-    python_requires=">=3.11,<3.13",
+    python_requires=">=3.11,<3.14",
     install_requires=base_deps,
     extras_require=extras_require,
     entry_points={"console_scripts": ["caption-flow=caption_flow.cli:main"]},
@@ -118,6 +118,7 @@ setup(
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
     ],
     keywords=["captioning", "distributed", "vllm", "dataset", "community"],
     project_urls={

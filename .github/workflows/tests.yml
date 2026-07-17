@@ -1,4 +1,4 @@
-# .github/workflows/test.yml
+# .github/workflows/tests.yml
 name: Tests
 
 on:
@@ -8,21 +8,21 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'pyproject.toml'
-      - '.github/workflows/test.yml'
+      - '.github/workflows/tests.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'src/**'
       - 'tests/**'
       - 'pyproject.toml'
-      - '.github/workflows/test.yml'
+      - '.github/workflows/tests.yml'
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.11', '3.12']
+        python-version: ['3.11', '3.12', '3.13']
       fail-fast: false
 
     steps:
@@ -52,7 +52,7 @@ jobs:
         pytest tests/ -v --cov=caption_flow --cov-report=xml --cov-report=term
 
     - name: Upload coverage to Codecov
-      if: matrix.python-version == '3.12'  # Only upload once
+      if: matrix.python-version == '3.13'  # Only upload once
       uses: codecov/codecov-action@v4
       with:
         file: ./coverage.xml
@@ -67,7 +67,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.12'
+        python-version: '3.13'
     
     - name: Cache pip packages
       uses: actions/cache@v4

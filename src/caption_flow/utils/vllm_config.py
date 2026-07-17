@@ -31,6 +31,9 @@ class VLLMConfigManager:
         "enforce_eager",
         "limit_mm_per_prompt",
         "disable_mm_preprocessor_cache",
+        "mm_processor_cache_gb",
+        "mm_processor_cache_type",
+        "mm_shm_cache_max_object_size_mb",
     }
 
     # Fields that can be updated without reload
@@ -115,7 +118,7 @@ class VLLMConfigManager:
 
     def get_vllm_init_params(self, vllm_config: Dict[str, Any]) -> Dict[str, Any]:
         """Extract vLLM initialization parameters from config."""
-        return {
+        params = {
             "model": vllm_config["model"],
             "trust_remote_code": True,
             "tensor_parallel_size": vllm_config.get("tensor_parallel_size", 1),
@@ -126,6 +129,15 @@ class VLLMConfigManager:
             "limit_mm_per_prompt": vllm_config.get("limit_mm_per_prompt", {"image": 1}),
             "disable_mm_preprocessor_cache": vllm_config.get("disable_mm_preprocessor_cache", True),
         }
+        for optional_key in (
+            "mm_processor_cache_gb",
+            "mm_processor_cache_type",
+            "mm_shm_cache_max_object_size_mb",
+        ):
+            if vllm_config.get(optional_key) is not None:
+                params[optional_key] = vllm_config[optional_key]
+
+        return params
 
     def requires_tokenizer_reload(
         self, old_config: Optional[Dict[str, Any]], new_config: Dict[str, Any]

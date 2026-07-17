@@ -8,6 +8,8 @@ scalable, fault-tolerant **vLLM-powered image captioning**.
 
 a fast websocket-based orchestrator paired with lightweight gpu workers achieves exceptional performance for batched requests through vLLM.
 
+CaptionFlow is also integrated in [bghira/SimpleTuner](https://github.com/bghira/SimpleTuner), where it powers an end-to-end caption-to-training workflow through the SimpleTuner WebUI. Use CaptionFlow directly when you want a standalone distributed captioning system, or use it through SimpleTuner when you want dataset captioning, caption review/export, and model training managed as one suite.
+
 * **orchestrator**: hands out work in chunked shards, collects captions, checkpoints progress, and keeps simple stats.
 * **workers (vLLM)**: connect to the orchestrator, stream in image samples, batch them, and generate 1..N captions per image using prompts supplied by the orchestrator.
 * **config-driven**: all components read YAML config; flags can override.
@@ -16,13 +18,13 @@ a fast websocket-based orchestrator paired with lightweight gpu workers achieves
 
 ---
 
-## install
+## install from pypi
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # windows: .venv\Scripts\activate
 pip install --upgrade pip
-pip install -e ".[vllm]"  # NVIDIA/Linux: command and vLLM worker dependencies
+pip install "caption-flow[vllm]"
 ```
 
 For an orchestrator or monitor-only install, use `pip install -e .`.
@@ -55,6 +57,8 @@ For native macOS CPU vLLM instead, follow the
 [official source-build instructions](https://docs.vllm.ai/en/stable/getting_started/installation/cpu/?device=apple).
 
 ## quickstart (single box)
+
+for a full caption-to-training workflow with a web interface, use the SimpleTuner WebUI integration. the standalone flow below is best when you want to run CaptionFlow directly, contribute workers to a cluster, or export captions for your own downstream training pipeline.
 
 1. copy + edit the sample configs
 
@@ -102,15 +106,18 @@ Usage: caption-flow export [OPTIONS]
   Export caption data to various formats.
 
 Options:
-  --format [jsonl|json|csv|txt|huggingface_hub|all] Export format (default: jsonl)
+  --format [jsonl|json|csv|txt|parquet|webshart|lance|huggingface_hub|all] Export format (default: jsonl)
 ```
 
 * **jsonl**: create JSON line file in the specified `--output` path
 * **csv**: exports CSV-compatible data columns to the `--output` path containing incomplete metadata
 * **json**: creates a `.json` file for each sample inside the `--output` subdirectory containing **complete** metadata; useful for webdatasets
 * **txt**: creates `.txt` file for each sample inside the `--output` subdirectory containing ONLY captions
+* **webshart**: updates an **existing per-shard metadata `.json` file** by writing captions under the plural `captions` key. for this format, pass `--output` as the path to the existing shard metadata JSON file when exporting one shard. if you export multiple shards, pass `--output` as a directory containing one existing `{shard_name}.json` file per shard.
 * **huggingface_hub**: creates a dataset on Hugging Face Hub, possibly `--private` and `--nsfw` where necessary
-* **all**: creates all export formats in a specified `--output` directory
+* **all**: creates the directory/file-generating export formats in a specified `--output` directory. prefer a directory here; `webshart` is a special case that expects existing per-shard metadata `.json` files rather than creating new metadata files.
+
+> note: `--output` paths ending in `.json` are treated specially for `webshart`. use a directory for normal multi-format exports and an existing shard metadata JSON file only when intentionally updating a `webshart` shard.
 
 ---
 
@@ -137,6 +144,7 @@ Options:
 ## dataset formats
 
 * huggingface hub or local based URL list datasets that are compatible with the datasets library
+* huggingface hub datasets that are simple containers of raw image files
 * webdatasets shards containing full image data; also can be hosted on the hub
 * local folder filled with images; orchestrator will serve the data to workers
 
@@ -215,7 +223,7 @@ PRs welcome. keep it simple and fast.
 
 To contribute compute to a cluster:
 
-1. Install caption-flow: `pip install caption-flow`
+1. Install caption-flow: `pip install "caption-flow[vllm]"`
 2. Get a worker token from the project maintainer
 3. Run: `caption-flow worker --server wss://project.domain.com:8765 --token YOUR_TOKEN`
 
