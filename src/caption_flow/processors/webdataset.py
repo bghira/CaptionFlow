@@ -681,7 +681,9 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
             # Use webshart to process unprocessed ranges
             for start_idx, end_idx in unprocessed_ranges:
                 try:
-                    use_sample_loader = shard_idx is not None and hasattr(self.loader, "load_sample")
+                    use_sample_loader = shard_idx is not None and hasattr(
+                        self.loader, "load_sample"
+                    )
                     if not use_sample_loader:
                         # Fallback for older webshart versions. Seek once per contiguous range,
                         # then advance with next_with_cache_wait for each item.
