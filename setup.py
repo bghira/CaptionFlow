@@ -89,6 +89,7 @@ extras_require = {
         "pytest>=8.0.0,<9.0.0",
         "pytest-asyncio>=1.1.0,<2.0.0",
         "pytest-cov>=6.0.0,<7.0.0",
+        "transformers>=5.5.3,<6.0.0",
         "black>=25.0.0,<26.0.0",
         "ruff>=0.12.0,<1.0.0",
         "mypy>=1.17.0,<2.0.0",
