@@ -3,7 +3,9 @@
 import csv
 import json
 import logging
+import sys
 import tempfile
+import types
 from datetime import datetime
 from pathlib import Path
 
@@ -13,7 +15,7 @@ import pytest
 import pytest_asyncio
 from caption_flow.models import Caption, StorageContents
 from caption_flow.storage import StorageManager
-from caption_flow.storage.exporter import LanceStorageExporter, StorageExporter
+from caption_flow.storage.exporter import ExportError, LanceStorageExporter, StorageExporter
 
 # Set up logging to avoid logger not defined errors
 logging.basicConfig(level=logging.INFO)
@@ -179,6 +181,44 @@ class TestLanceStorageExporter:
         assert len(df) == 3
         assert "job_id" in df.columns
         assert "filename" in df.columns
+
+    @pytest.mark.asyncio
+    async def test_export_shard_webshart_directory_output(
+        self, populated_storage_manager, temp_storage_dir, monkeypatch
+    ):
+        """Test per-shard webshart export uses existing metadata in output directory."""
+        calls = []
+
+        def write_captions_to_metadata(metadata_path, captions_by_sample):
+            calls.append((Path(metadata_path), captions_by_sample))
+            return len(captions_by_sample)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "webshart",
+            types.SimpleNamespace(write_captions_to_metadata=write_captions_to_metadata),
+        )
+
+        metadata_path = temp_storage_dir / "default.json"
+        metadata_path.write_text('{"files": {}}', encoding="utf-8")
+        exporter = LanceStorageExporter(populated_storage_manager)
+
+        count = await exporter.export_shard("default", "webshart", temp_storage_dir)
+
+        assert count == 3
+        assert calls
+        assert calls[0][0] == metadata_path
+        assert all(isinstance(value, list) for value in calls[0][1].values())
+
+    @pytest.mark.asyncio
+    async def test_export_shard_webshart_rejects_mismatched_json_path(
+        self, populated_storage_manager, temp_storage_dir
+    ):
+        """Test explicit webshart JSON path must match the shard name."""
+        exporter = LanceStorageExporter(populated_storage_manager)
+
+        with pytest.raises(ExportError, match="explicit JSON output files must be named"):
+            await exporter.export_shard("default", "webshart", temp_storage_dir / "wrong.json")
 
     @pytest.mark.asyncio
     async def test_export_shard_json_directory(self, populated_storage_manager, temp_storage_dir):
@@ -437,6 +477,97 @@ class TestStorageExporter:
             rows = list(reader)
             assert len(rows) == 2
             assert "job_id" in rows[0]
+
+    def test_to_webshart_metadata_uses_webshart_api(
+        self, sample_storage_contents, temp_storage_dir, monkeypatch
+    ):
+        """Test webshart export delegates metadata writes to the webshart API."""
+        calls = []
+
+        def write_captions_to_metadata(metadata_path, captions_by_sample):
+            calls.append((Path(metadata_path), captions_by_sample))
+            return len(captions_by_sample)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "webshart",
+            types.SimpleNamespace(write_captions_to_metadata=write_captions_to_metadata),
+        )
+
+        exporter = StorageExporter(sample_storage_contents)
+        metadata_path = temp_storage_dir / "shard-0000.json"
+        metadata_path.write_text('{"files": {}}', encoding="utf-8")
+
+        count = exporter.to_webshart_metadata(metadata_path)
+
+        assert count == 2
+        assert calls == [
+            (
+                metadata_path,
+                {
+                    "image1.jpg": ["Test caption 1", "Test caption 2"],
+                    "image2.png": ["Another test caption"],
+                },
+            )
+        ]
+
+    def test_to_webshart_metadata_requires_existing_file(
+        self, sample_storage_contents, temp_storage_dir
+    ):
+        """Test webshart export fails clearly when metadata JSON is missing."""
+        exporter = StorageExporter(sample_storage_contents)
+        metadata_path = temp_storage_dir / "missing.json"
+
+        with pytest.raises(ExportError, match="does not exist"):
+            exporter.to_webshart_metadata(metadata_path)
+
+    def test_to_webshart_metadata_normalizes_string_captions(
+        self, sample_storage_contents, temp_storage_dir, monkeypatch
+    ):
+        """Test webshart export wraps single string captions in a list."""
+        calls = []
+
+        def write_captions_to_metadata(metadata_path, captions_by_sample):
+            calls.append(captions_by_sample)
+            return len(captions_by_sample)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "webshart",
+            types.SimpleNamespace(write_captions_to_metadata=write_captions_to_metadata),
+        )
+
+        contents = StorageContents(
+            rows=[{"filename": "image1.jpg", "captions": "single caption"}],
+            columns=["filename", "captions"],
+            output_fields=["captions"],
+            total_rows=1,
+            metadata={},
+        )
+        exporter = StorageExporter(contents)
+        metadata_path = temp_storage_dir / "shard-0000.json"
+        metadata_path.write_text('{"files": {}}', encoding="utf-8")
+
+        count = exporter.to_webshart_metadata(metadata_path)
+
+        assert count == 1
+        assert calls == [{"image1.jpg": ["single caption"]}]
+
+    def test_to_webshart_metadata_rejects_unexpected_caption_type(
+        self, sample_storage_contents, temp_storage_dir
+    ):
+        """Test webshart export rejects values that are not strings or lists."""
+        contents = StorageContents(
+            rows=[{"filename": "image1.jpg", "captions": {"bad": "shape"}}],
+            columns=["filename", "captions"],
+            output_fields=["captions"],
+            total_rows=1,
+            metadata={},
+        )
+        exporter = StorageExporter(contents)
+
+        with pytest.raises(ExportError, match="string or list of strings"):
+            exporter.to_webshart_metadata(temp_storage_dir / "shard-0000.json")
 
     def test_empty_contents_handling(self):
         """Test handling of empty storage contents."""

@@ -32,6 +32,8 @@ from .base import OrchestratorProcessor, ProcessorConfig, WorkerProcessor, WorkR
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+
 
 def log_memory(location: str):
     """Log memory usage at specific location."""
@@ -244,6 +246,10 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
             return match.group(1)
         return url.split("/")[-1]
 
+    def _is_image_file(self, filename: str) -> bool:
+        """Return whether a Hugging Face dataset file is a supported raw image."""
+        return Path(filename).suffix.lower() in IMAGE_EXTENSIONS
+
     def _get_data_files_from_builder(self) -> List[str]:
         """Get data files using dataset builder with minimal memory usage."""
         # Load builder to get correct file structure
@@ -317,21 +323,29 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                     token=self.token,
                 )
 
-                # Read only metadata
-                metadata = pq.read_metadata(local_path)
-                size = metadata.num_rows
+                file_type = "parquet"
+                try:
+                    # Read only metadata for parquet-backed datasets.
+                    metadata = pq.read_metadata(local_path)
+                    size = metadata.num_rows
+                except Exception:
+                    if not self._is_image_file(filename):
+                        raise
+                    file_type = "image"
+                    size = 1
 
                 self.shard_info[i] = {
                     "shard_id": i,
                     "file_url": file_url,
                     "filename": filename,
+                    "file_type": file_type,
                     "start_offset": cumulative_offset,
                     "size": size,
                     "end_offset": cumulative_offset + size - 1,
                 }
 
                 cumulative_offset += size
-                logger.info(f"Shard {i} ({filename}): {size} rows")
+                logger.info(f"Shard {i} ({filename}): {size} {file_type} item(s)")
 
             except Exception as e:
                 logger.error(f"Failed to discover shard {i}: {e}")
@@ -370,6 +384,14 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 local_index = global_index - sinfo["start_offset"]
                 return shard_id, local_index
         raise ValueError(f"Global index {global_index} not found in any shard")
+
+    def _get_shards_for_range(self, start_index: int, end_index: int) -> List[int]:
+        """Get all shard IDs intersecting an absolute index range."""
+        shard_ids = []
+        for shard_id, sinfo in self.shard_info.items():
+            if sinfo["start_offset"] <= end_index and sinfo["end_offset"] >= start_index:
+                shard_ids.append(shard_id)
+        return shard_ids
 
     def _restore_state(self, storage: StorageManager) -> None:
         """Restore state from chunk tracker and synchronize with storage."""
@@ -468,9 +490,10 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         current_index = chunk_index * self.chunk_size
         chunk_size = min(self.chunk_size, self.total_items - current_index)
 
-        # Find shard for this chunk
+        # Find all shards touched by this chunk/range set
         shard_id, local_idx = self._get_shard_for_index(current_index)
         shard_name = Path(self.shard_info[shard_id]["filename"]).stem
+        shard_ids = self._get_shards_for_range(ranges[0][0], ranges[-1][1])
 
         # Create unique unit ID that includes range info
         range_suffix = f"r{len(ranges)}"  # r2 = 2 ranges, etc.
@@ -497,8 +520,9 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 "unprocessed_ranges": ranges,
                 "range_based": True,
                 "is_split_unit": True,  # Flag to indicate this is a split from larger chunk
-                "shard_ids": [shard_id],
+                "shard_ids": shard_ids,
                 "data_files": self.data_files,
+                "shard_info": self.shard_info,
             },
             metadata={
                 "dataset": self.dataset_name,
@@ -519,9 +543,10 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
         chunk_size = min(self.chunk_size, self.total_items - current_index)
 
-        # Find shard for this chunk
+        # Find all shards touched by this chunk
         shard_id, local_idx = self._get_shard_for_index(current_index)
         shard_name = Path(self.shard_info[shard_id]["filename"]).stem
+        shard_ids = self._get_shards_for_range(current_index, current_index + chunk_size - 1)
 
         # Calculate RELATIVE chunk index within the shard
         job_id_obj = JobId(
@@ -556,13 +581,6 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
         # Calculate actual unprocessed items and total work to be assigned
         unprocessed_items = sum(end - start + 1 for start, end in unprocessed_ranges)
 
-        # Skip assignment if there are very few unprocessed items (< 10 items)
-        if unprocessed_items < 10:
-            logger.debug(
-                f"Chunk {unit_id} has only {unprocessed_items} unprocessed items, skipping assignment"
-            )
-            return None
-
         # Create work unit that represents ONLY the unprocessed ranges
         # This is the key fix: don't assign the full chunk, assign only unprocessed parts
         unit = WorkUnit(
@@ -579,8 +597,9 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                 "actual_work_size": unprocessed_items,  # NEW: actual work to be done
                 "unprocessed_ranges": unprocessed_ranges,  # The specific ranges to process
                 "range_based": True,  # NEW: flag to indicate this is range-based
-                "shard_ids": [shard_id],
+                "shard_ids": shard_ids,
                 "data_files": self.data_files,
+                "shard_info": self.shard_info,
             },
             metadata={
                 "dataset": self.dataset_name,
@@ -629,7 +648,7 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                     )
                     break
                 # Get shard info for proper unit_id
-                current_index = self.current_chunk_index
+                current_index = self.current_chunk_index * self.chunk_size
                 if current_index < self.total_items:
                     shard_id, _ = self._get_shard_for_index(current_index)
                     shard_name = Path(self.shard_info[shard_id]["filename"]).stem
@@ -980,6 +999,9 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     for start_idx, end_idx in ranges:
                         self.chunk_tracker.mark_items_processed(result.chunk_id, start_idx, end_idx)
+            elif "_item_index" in result.metadata and result.metadata["_item_index"] is not None:
+                item_index = int(result.metadata["_item_index"])
+                self.chunk_tracker.mark_items_processed(result.chunk_id, item_index, item_index)
 
         return base_result
 
@@ -1070,6 +1092,10 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
             return match.group(1)
         return url.split("/")[-1]
 
+    def _is_image_file(self, filename: str) -> bool:
+        """Return whether a Hugging Face dataset file is a supported raw image."""
+        return Path(filename).suffix.lower() in IMAGE_EXTENSIONS
+
     def _create_dummy_image(self, index: int, metadata: Dict[str, Any]) -> Image.Image:
         """Create a dummy image."""
         color = (0, 0, 0)
@@ -1091,13 +1117,41 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
         )
         shard_ids = unit.data.get("shard_ids", [])
         data_files = unit.data.get("data_files", [])
+        unit_shard_info = unit.data.get("shard_info", {})
+        unit_shard_info = {int(k): v for k, v in unit_shard_info.items()}
 
         logger.info(f"Processing unit {unit.unit_id} with ranges: {unprocessed_ranges}")
 
         # Build shard info from provided data files (no dataset builder needed)
         shard_info = {}
 
-        if data_files:
+        if unit_shard_info:
+            for shard_id in shard_ids:
+                shard_id = int(shard_id)
+                if shard_id not in unit_shard_info:
+                    continue
+                metadata = unit_shard_info[shard_id]
+                filename = metadata["filename"]
+                shard_path = self._get_shard_path(dataset_name, filename)
+                file_type = metadata.get("file_type") or (
+                    "image" if self._is_image_file(filename) else "parquet"
+                )
+
+                shard_info[shard_id] = {
+                    "path": shard_path,
+                    "filename": filename,
+                    "file_type": file_type,
+                    "start_offset": metadata["start_offset"],
+                    "end_offset": metadata["end_offset"],
+                    "size": metadata["size"],
+                    "metadata": None,
+                }
+
+                if file_type == "parquet":
+                    shard_info[shard_id]["metadata"] = pq.read_metadata(shard_path)
+
+        elif data_files:
+            shard_ids = {int(shard_id) for shard_id in shard_ids}
             # Use provided data files
             for i, file_url in enumerate(data_files):
                 if i in shard_ids:
@@ -1110,6 +1164,8 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
 
                     shard_info[i] = {
                         "path": shard_path,
+                        "filename": filename,
+                        "file_type": "parquet",
                         "start_offset": 0,  # Will be set below
                         "end_offset": 0,  # Will be set below
                         "size": size,
@@ -1152,6 +1208,49 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
         # Process items shard by shard
         for shard_id, idx_pairs in indices_by_shard.items():
             shard_path = shard_info[shard_id]["path"]
+            file_type = shard_info[shard_id].get("file_type", "parquet")
+            shard_name = Path(shard_info[shard_id]["filename"]).stem
+
+            if file_type == "image":
+                for global_idx, local_idx in idx_pairs:
+                    try:
+                        with Image.open(shard_path) as img:
+                            image = img.copy()
+
+                        chunk_index = unit.metadata["chunk_index"]
+                        job_id_obj = JobId(
+                            shard_id=shard_name,
+                            chunk_id=str(chunk_index),
+                            sample_id=str(global_idx),
+                        )
+                        job_id = job_id_obj.get_sample_str()
+
+                        clean_metadata = {
+                            "_item_index": global_idx,
+                            "_chunk_relative_index": global_idx - start_index,
+                            "_job_id": job_id,
+                            "_shard_id": shard_id,
+                            "_local_index": local_idx,
+                            "_filename": shard_info[shard_id]["filename"],
+                            "_url": None,
+                            "_mock": self.mock_results,
+                        }
+
+                        yield {
+                            "image": image,
+                            "item_key": str(global_idx),
+                            "item_index": global_idx,
+                            "metadata": clean_metadata,
+                            "job_id": job_id,
+                            "_processed_indices": processed_indices,
+                        }
+
+                        processed_indices.append(global_idx)
+
+                    except Exception as e:
+                        logger.error(f"Error processing image file at index {global_idx}: {e}")
+
+                continue
 
             # Process in batches to avoid loading entire table
             batch_size = 100
@@ -1325,11 +1424,10 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
 
                             # Build job ID
                             chunk_index = unit.metadata["chunk_index"]
-                            shard_name = unit.metadata["shard_name"]
                             job_id_obj = JobId(
                                 shard_id=shard_name,
                                 chunk_id=str(chunk_index),
-                                sample_id=str(local_idx),
+                                sample_id=str(global_idx),
                             )
                             job_id = job_id_obj.get_sample_str()
 
@@ -1362,7 +1460,7 @@ class HuggingFaceDatasetWorkerProcessor(WorkerProcessor):
                                 "_processed_indices": processed_indices,
                             }
 
-                            processed_indices.append(local_idx)
+                            processed_indices.append(global_idx)
 
                         except Exception as e:
                             logger.error(f"Error processing item at index {global_idx}: {e}")

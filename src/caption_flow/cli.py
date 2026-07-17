@@ -1498,7 +1498,17 @@ async def _run_export_process(
 @click.option(
     "--format",
     type=click.Choice(
-        ["jsonl", "json", "csv", "txt", "parquet", "lance", "huggingface_hub", "all"],
+        [
+            "jsonl",
+            "json",
+            "csv",
+            "txt",
+            "parquet",
+            "webshart",
+            "lance",
+            "huggingface_hub",
+            "all",
+        ],
         case_sensitive=False,
     ),
     default="jsonl",
