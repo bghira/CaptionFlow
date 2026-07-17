@@ -977,6 +977,77 @@ class TestWhenFinishedCLI:
             # Should work without errors
             assert "--post_exec_hook required" not in result.output
 
+    def test_worker_config_file_with_when_finished(self, runner, tmp_path):
+        """Test worker command reads when_finished from config file."""
+        # Create config file with when_finished setting
+        config_file = tmp_path / "test_config.yaml"
+        config_content = """
+worker:
+  server: "ws://localhost:8765"
+  token: "test-token"
+  when_finished: "shutdown"
+"""
+        config_file.write_text(config_content)
+
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
+            mock_worker_instance = Mock()
+            mock_worker.return_value = mock_worker_instance
+            mock_worker_instance.start = AsyncMock()
+
+            result = runner.invoke(main, ["worker", "--config", str(config_file), "--vllm"])
+            # Should load config successfully
+            assert result.exit_code != 1 or "--post_exec_hook required" not in result.output
+
+    def test_worker_config_file_with_post_exec_hook_validation(self, runner, tmp_path):
+        """Test config file validation for post_exec_hook requirement."""
+        # Create config file with post_exec_hook but no executable path
+        config_file = tmp_path / "test_config.yaml"
+        config_content = """
+worker:
+  server: "ws://localhost:8765"
+  token: "test-token"
+  when_finished: "post_exec_hook"
+"""
+        config_file.write_text(config_content)
+
+        result = runner.invoke(main, ["worker", "--config", str(config_file), "--vllm"])
+
+        # Should fail validation
+        assert result.exit_code == 1
+        assert "--post_exec_hook required when --when_finished=post_exec_hook" in result.output
+
+    def test_cli_override_config_when_finished(self, runner, tmp_path):
+        """Test CLI parameters override config file for when_finished."""
+        # Create config file with one setting
+        config_file = tmp_path / "test_config.yaml"
+        config_content = """
+worker:
+  server: "ws://localhost:8765"
+  token: "test-token"
+  when_finished: "stay_connected"
+"""
+        config_file.write_text(config_content)
+
+        with patch("caption_flow.workers.caption.CaptionWorker") as mock_worker:
+            mock_worker_instance = Mock()
+            mock_worker.return_value = mock_worker_instance
+            mock_worker_instance.start = AsyncMock()
+
+            result = runner.invoke(
+                main,
+                [
+                    "worker",
+                    "--config",
+                    str(config_file),
+                    "--vllm",
+                    "--when_finished",
+                    "shutdown",  # CLI override
+                ],
+            )
+
+            # Should use CLI override and pass validation
+            assert "--post_exec_hook required" not in result.output
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

@@ -74,3 +74,4 @@ checkpoints/
 config/
 webshart_cache/
 poetry.lock
+.coverage

@@ -859,9 +859,9 @@ class TestCaptionWorker:
                 work_failed_call = sent_data
                 break
 
-        assert work_failed_call is not None, (
-            "work_failed message should have been sent for incomplete unit"
-        )
+        assert (
+            work_failed_call is not None
+        ), "work_failed message should have been sent for incomplete unit"
         assert work_failed_call["unit_id"] == "unit1"
         assert "Processing incomplete" in work_failed_call["error"]
         assert "1/3 items processed" in work_failed_call["error"]
@@ -1328,6 +1328,114 @@ class TestWhenFinishedFunctionality:
 
         # Should handle non-executable file gracefully
         await worker._execute_post_hook()
+
+    @pytest.mark.asyncio
+    async def test_execute_post_hook_successful_execution(self, tmp_path):
+        """Test post-exec hook with successful execution and output."""
+        hook_script = tmp_path / "success_hook.sh"
+        hook_script.write_text("#!/bin/bash\necho 'Hook executed successfully'\nexit 0")
+        hook_script.chmod(0o755)
+
+        config = {
+            "name": "test_worker",
+            "token": "test_token",
+            "server": "ws://localhost:8765",
+            "server_url": "ws://localhost:8765",
+            "gpu_id": 0,
+            "when_finished": "post_exec_hook",
+            "post_exec_hook": str(hook_script),
+        }
+
+        worker = create_fast_caption_worker(config)
+        mock_websocket = AsyncMock()
+        worker.websocket = mock_websocket
+
+        # Should execute hook successfully and then shutdown
+        await worker._execute_post_hook()
+
+        # Should shutdown after successful execution
+        assert worker.running is False
+
+    @pytest.mark.asyncio
+    async def test_execute_post_hook_failed_execution(self, tmp_path):
+        """Test post-exec hook with failed execution and stderr."""
+        hook_script = tmp_path / "fail_hook.sh"
+        hook_script.write_text("#!/bin/bash\necho 'Error message' >&2\nexit 1")
+        hook_script.chmod(0o755)
+
+        config = {
+            "name": "test_worker",
+            "token": "test_token",
+            "server": "ws://localhost:8765",
+            "server_url": "ws://localhost:8765",
+            "gpu_id": 0,
+            "when_finished": "post_exec_hook",
+            "post_exec_hook": str(hook_script),
+        }
+
+        worker = create_fast_caption_worker(config)
+        mock_websocket = AsyncMock()
+        worker.websocket = mock_websocket
+
+        # Should handle failed execution and still shutdown
+        await worker._execute_post_hook()
+
+        # Should shutdown even after failed execution
+        assert worker.running is False
+
+    @pytest.mark.asyncio
+    async def test_execute_post_hook_exception_handling(self):
+        """Test post-exec hook with exception during execution."""
+        config = {
+            "name": "test_worker",
+            "token": "test_token",
+            "server": "ws://localhost:8765",
+            "server_url": "ws://localhost:8765",
+            "gpu_id": 0,
+            "when_finished": "post_exec_hook",
+            "post_exec_hook": "/valid/path/but/will/cause/exception",
+        }
+
+        worker = create_fast_caption_worker(config)
+        mock_websocket = AsyncMock()
+        worker.websocket = mock_websocket
+
+        # Mock Path.exists to return True but asyncio.create_subprocess_exec to raise
+        import unittest.mock
+        from pathlib import Path
+
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            with unittest.mock.patch("os.access", return_value=True):  # Make it appear executable
+                with unittest.mock.patch(
+                    "asyncio.create_subprocess_exec", side_effect=Exception("Test exception")
+                ):
+                    # Should handle exception gracefully and still shutdown
+                    await worker._execute_post_hook()
+
+                    # Should shutdown even after exception
+                    assert worker.running is False
+
+    def test_when_finished_enum_methods(self):
+        """Test WhenFinished enum methods for full coverage."""
+        # Test all enum values
+        stay = WhenFinished.STAY_CONNECTED
+        shutdown = WhenFinished.SHUTDOWN
+        hook = WhenFinished.POST_EXEC_HOOK
+
+        # Test __str__ method
+        assert str(stay) == "stay_connected"
+        assert str(shutdown) == "shutdown"
+        assert str(hook) == "post_exec_hook"
+
+        # Test to_json method
+        assert stay.to_json() == "stay_connected"
+        assert shutdown.to_json() == "shutdown"
+        assert hook.to_json() == "post_exec_hook"
+
+        # Test enum creation from string values
+        assert WhenFinished("stay_connected") == WhenFinished.STAY_CONNECTED
+        assert WhenFinished("shutdown") == WhenFinished.SHUTDOWN
+        assert WhenFinished("post_exec_hook") == WhenFinished.POST_EXEC_HOOK
 
 
 if __name__ == "__main__":
