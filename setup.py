@@ -80,6 +80,9 @@ APPLE_PYTORCH_DEPENDENCIES = [
 extras_require = {
     "vllm": vllm_deps,
     "captioning": vllm_deps,
+    # The OpenAI-compatible worker uses aiohttp from the base install and does
+    # not pull in the GPU stack. This named extra makes deployment intent clear.
+    "openai": [],
     "cpu": PYTORCH_DEPENDENCIES,
     "cuda": PYTORCH_DEPENDENCIES,
     "cuda13": PYTORCH_DEPENDENCIES,
@@ -109,7 +112,7 @@ setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     include_package_data=True,
-    python_requires=">=3.11,<3.14",
+    python_requires=">=3.12,<3.14",
     install_requires=base_deps,
     extras_require=extras_require,
     entry_points={"console_scripts": ["caption-flow=caption_flow.cli:main"]},
@@ -117,7 +120,6 @@ setup(
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
     ],

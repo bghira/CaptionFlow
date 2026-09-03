@@ -4,7 +4,7 @@ import json
 import logging
 import shutil
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -214,6 +214,20 @@ class TestStorageManager:
         assert retrieved.total_captions == 100
 
     @pytest.mark.asyncio
+    async def test_contributor_updates_are_upserted(self, storage_manager):
+        """Contributor updates replace prior totals instead of appending duplicates."""
+        await storage_manager.save_contributor(Contributor("user1", "User 1", 1, 1))
+        await storage_manager.save_contributor(Contributor("user1", "User 1", 2, 1))
+
+        buffered = await storage_manager.get_contributor("user1")
+        assert buffered.total_captions == 2
+
+        await storage_manager._flush_contributors()
+        assert storage_manager.contributors_dataset.count_rows() == 1
+        persisted = await storage_manager.get_contributor("user1")
+        assert persisted.total_captions == 2
+
+    @pytest.mark.asyncio
     async def test_get_top_contributors(self, storage_manager):
         """Test retrieving top contributors."""
         contributors = [
@@ -231,6 +245,22 @@ class TestStorageManager:
         assert len(top) == 2
         assert top[0].contributor_id == "user2"
         assert top[1].contributor_id == "user1"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_activity_is_retained_and_broadcast():
+    """Activity should be retained for new monitors and sent to live monitors."""
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.recent_activity = deque(maxlen=20)
+    monitor = AsyncMock()
+    orchestrator.monitors = {monitor}
+
+    await orchestrator._send_activity("Chunk completed: shard-00000:chunk:0")
+
+    assert len(orchestrator.recent_activity) == 1
+    assert orchestrator.recent_activity[0].endswith("Chunk completed: shard-00000:chunk:0")
+    sent = json.loads(monitor.send.await_args.args[0])
+    assert sent == {"type": "activity", "data": orchestrator.recent_activity[0]}
 
 
 # ============= Chunk Tracker Tests =============

@@ -5,12 +5,15 @@ import io
 import logging
 import os
 import threading
+import time
 from collections import defaultdict, deque
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Deque, Dict, Iterator, List, Optional, Set
 
 import cv2
 import numpy as np
+import requests
 import webshart
 from PIL import Image
 
@@ -588,6 +591,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.loader: Optional[webshart.TarDataLoader] = None
         self.dataset: Optional[webshart.DiscoveredDataset] = None
         self.mock_results = False
+        self.remote_range_reads = False
+        self.remote_range_timeout = 120.0
+        self.remote_range_retries = 3
+        self._remote_shard_layouts: Dict[int, Dict[str, Any]] = {}
+        self.http_session: Optional[requests.Session] = None
 
     def initialize(self, config: ProcessorConfig) -> None:
         """Initialize worker with webshart loader."""
@@ -597,6 +605,9 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.dataset_path = dataset_cfg.get("dataset_path")
         metadata_path = dataset_cfg.get("metadata_path", None)
         self.mock_results = dataset_cfg.get("mock_results", False)
+        self.remote_range_reads = bool(dataset_cfg.get("remote_range_reads", False))
+        self.remote_range_timeout = float(dataset_cfg.get("remote_range_timeout", 120))
+        self.remote_range_retries = max(1, int(dataset_cfg.get("remote_range_retries", 3)))
         split_worker_cache = dataset_cfg.get(
             "split_worker_cache", True
         )  # multiple workers get their own cache by default
@@ -631,7 +642,95 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 load_file_data=True,
             )
 
+            if self.remote_range_reads:
+                self.http_session = requests.Session()
+                logger.info(
+                    "Remote HTTP range reads enabled; samples will be fetched without "
+                    "downloading complete shards"
+                )
+
             logger.info("webshart TarDataLoader initialized")
+
+    def _get_remote_shard_layout(self, shard_idx: int) -> Dict[str, Any]:
+        """Load a remote shard's sample ordering and byte-range metadata."""
+        cached = self._remote_shard_layouts.get(shard_idx)
+        if cached is not None:
+            return cached
+        if not self.dataset or not self.http_session:
+            raise RuntimeError("Remote range reader is not initialized")
+
+        shard_info = self.dataset.get_shard_info(shard_idx)
+        tar_url = shard_info.get("tar_path") or shard_info.get("path")
+        metadata_url = shard_info.get("json_path")
+        if not tar_url or not str(tar_url).startswith(("http://", "https://")):
+            raise ValueError(f"Shard {shard_idx} does not have a remote tar URL")
+        if not metadata_url:
+            raise ValueError(f"Shard {shard_idx} does not have a metadata URL")
+
+        response = self.http_session.get(metadata_url, timeout=self.remote_range_timeout)
+        response.raise_for_status()
+        metadata = response.json()
+        files = metadata.get("files", {})
+        sample_paths = self.dataset.list_samples_in_shard(shard_idx)
+        entries = []
+        for path in sample_paths:
+            entry = files.get(path)
+            if not isinstance(entry, dict):
+                raise ValueError(f"Missing byte-range metadata for {path} in shard {shard_idx}")
+            entries.append(entry)
+
+        layout = {"tar_url": str(tar_url), "entries": entries}
+        self._remote_shard_layouts[shard_idx] = layout
+        return layout
+
+    def _load_remote_sample(self, shard_idx: int, sample_idx: int) -> SimpleNamespace:
+        """Fetch one WebDataset sample directly from its remote tar byte range."""
+        if not self.http_session:
+            raise RuntimeError("Remote range reader is not initialized")
+        layout = self._get_remote_shard_layout(shard_idx)
+        entries = layout["entries"]
+        if sample_idx < 0 or sample_idx >= len(entries):
+            raise IndexError(f"Sample index {sample_idx} is outside shard {shard_idx}")
+
+        metadata = entries[sample_idx]
+        offset = int(metadata["offset"])
+        length = int(metadata.get("length", metadata.get("size", 0)))
+        if length <= 0:
+            raise ValueError(f"Invalid byte length for sample {sample_idx} in shard {shard_idx}")
+        headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.remote_range_retries + 1):
+            try:
+                with self.http_session.get(
+                    layout["tar_url"],
+                    headers=headers,
+                    timeout=self.remote_range_timeout,
+                    stream=True,
+                ) as response:
+                    if response.status_code != 206:
+                        raise RuntimeError(
+                            f"Range request returned HTTP {response.status_code}, expected 206"
+                        )
+                    data = response.content
+                if len(data) != length:
+                    raise RuntimeError(
+                        f"Range request returned {len(data)} bytes, expected {length}"
+                    )
+                return SimpleNamespace(
+                    data=data,
+                    path=str(metadata.get("path", sample_idx)),
+                    size=length,
+                    metadata=metadata,
+                )
+            except (requests.RequestException, RuntimeError) as error:
+                last_error = error
+                if attempt < self.remote_range_retries:
+                    time.sleep(min(4.0, 0.5 * (2 ** (attempt - 1))))
+
+        raise RuntimeError(
+            f"Failed to fetch sample {sample_idx} from shard {shard_idx} by byte range"
+        ) from last_error
 
     def _create_mock_image(self, idx: int) -> Image.Image:
         """Create a dummy test image."""
@@ -696,7 +795,10 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                     for idx in range(start_idx, end_idx + 1):
                         try:
                             if use_sample_loader:
-                                entry = self.loader.load_sample(shard_idx, idx)
+                                if self.remote_range_reads:
+                                    entry = self._load_remote_sample(shard_idx, idx)
+                                else:
+                                    entry = self.loader.load_sample(shard_idx, idx)
                             else:
                                 entry = webshart.next_with_cache_wait(self.loader)
 

@@ -6,7 +6,7 @@ import os
 import ssl
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
@@ -38,6 +38,13 @@ class Orchestrator:
         self.config = config
         self.host = config.get("host", "0.0.0.0")
         self.port = config.get("port", 8765)
+        # Large remote WebDataset shard downloads can temporarily delay a
+        # worker's event loop even though the TCP connection is still healthy.
+        # Keep WebSocket keepalive behavior configurable so those downloads do
+        # not look like dead workers to the server. A timeout of None keeps
+        # sending pings but does not close a connection solely for a late pong.
+        self.websocket_ping_interval = config.get("websocket_ping_interval", 20)
+        self.websocket_ping_timeout = config.get("websocket_ping_timeout", 60)
 
         # Processor configuration
         processor_type = config.get("dataset", {}).get("processor_type", None)
@@ -86,6 +93,7 @@ class Orchestrator:
 
         # Cache for leaderboard
         self._cached_leaderboard = None
+        self.recent_activity = deque(maxlen=20)
 
         # Data worker stuff
         self.data_workers = {}
@@ -141,8 +149,13 @@ class Orchestrator:
             self.port,
             ssl=self.ssl_context,
             logger=websocket_logger,
+            ping_interval=self.websocket_ping_interval,
+            ping_timeout=self.websocket_ping_timeout,
         ):
             logger.info("Orchestrator ready for connections")
+            await self._send_activity(
+                f"Orchestrator ready: {self.processor.get_stats().get('total_shards', 0)} shards"
+            )
             await asyncio.Future()  # Run forever
 
     def get_workers_by_user_stats(self) -> Dict[str, Dict]:
@@ -203,6 +216,7 @@ class Orchestrator:
         self.workers[worker_id] = websocket
         self.workers_by_user[worker_user].add(worker_id)
         self.stats["connected_workers"] = len(self.workers)
+        await self._send_activity(f"Worker connected: {worker_id}")
 
         # Register contributor
         contributor = await self.storage.get_contributor(worker_user)
@@ -249,6 +263,7 @@ class Orchestrator:
             # Release assignments
             self.processor.release_assignments(worker_id)
             logger.info(f"Worker {worker_id} has safely disconnected")
+            await self._send_activity(f"Worker disconnected: {worker_id}")
 
     def _auth_configs_equal(
         self, current_config: Dict[str, Any], new_config: Dict[str, Any]
@@ -397,12 +412,14 @@ class Orchestrator:
             unit_id = data["unit_id"]
             self.processor.mark_completed(unit_id, worker_id)
             logger.debug(f"Work unit {unit_id} completed by worker {worker_id}")
+            await self._send_activity(f"Chunk completed: {unit_id}")
 
         elif msg_type == "work_failed":
             unit_id = data["unit_id"]
             error = data.get("error", "Unknown error")
             self.processor.mark_failed(unit_id, worker_id, error)
             logger.warning(f"Work unit {unit_id} failed on worker {worker_id}: {error}")
+            await self._send_activity(f"Chunk failed: {unit_id} — {error}")
 
         elif msg_type == "submit_results":
             await self._handle_results_submission(worker_id, data)
@@ -508,6 +525,9 @@ class Orchestrator:
 
             # Send initial stats
             await self._send_monitor_stats(websocket)
+            await self._send_monitor_leaderboard(websocket)
+            for activity in self.recent_activity:
+                await websocket.send(safe_json_dumps({"type": "activity", "data": activity}))
 
             # Keep connection alive
             async for _message in websocket:
@@ -754,12 +774,12 @@ class Orchestrator:
 
     async def _send_activity(self, activity: str):
         """Send activity update to monitors."""
+        formatted_activity = f"[{datetime.now().strftime('%H:%M:%S')}] {activity}"
+        self.recent_activity.append(formatted_activity)
         if not self.monitors:
             return
 
-        message = safe_json_dumps(
-            {"type": "activity", "data": f"[{datetime.now().strftime('%H:%M:%S')}] {activity}"}
-        )
+        message = safe_json_dumps({"type": "activity", "data": formatted_activity})
 
         disconnected = set()
         for monitor in self.monitors:
@@ -969,6 +989,7 @@ class Orchestrator:
                     self.rate_tracker["average_rate"] = (current_total / total_elapsed) * 60
 
             await self._broadcast_stats()
+            await self._broadcast_leaderboard()
 
     async def shutdown(self):
         """Graceful shutdown."""

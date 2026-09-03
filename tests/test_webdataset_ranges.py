@@ -146,9 +146,9 @@ class TestWebDatasetOrchestratorProcessor:
         chunk_state = orchestrator_processor.chunk_tracker.chunks[chunk_id]
         unprocessed_ranges = chunk_state.get_unprocessed_ranges()
         expected_unprocessed = [(10, 20), (50, 99)]
-        assert unprocessed_ranges == expected_unprocessed, (
-            f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
-        )
+        assert (
+            unprocessed_ranges == expected_unprocessed
+        ), f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
 
         orchestrator_processor._restore_state(mock_storage)
 
@@ -910,6 +910,172 @@ class TestWebDatasetWorkerProcessor:
         # Verify loader was called correctly
         worker_processor_real.loader.load_sample.assert_any_call(0, 5)
 
+    def test_remote_range_reader_fetches_only_sample_bytes(self, worker_processor_real):
+        """Remote range mode should avoid downloading a complete tar shard."""
+        worker_processor_real.remote_range_reads = True
+        worker_processor_real.remote_range_retries = 1
+        worker_processor_real.http_session = Mock()
+        worker_processor_real._remote_shard_layouts[0] = {
+            "tar_url": "https://example.test/shard.tar",
+            "entries": [
+                {
+                    "path": "images/example.png",
+                    "offset": 1024,
+                    "length": 4,
+                    "captions": "existing caption",
+                }
+            ],
+        }
+
+        response = Mock()
+        response.status_code = 206
+        response.content = b"data"
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        worker_processor_real.http_session.get.return_value = response
+
+        entry = worker_processor_real._load_remote_sample(0, 0)
+
+        assert entry.data == b"data"
+        assert entry.path == "images/example.png"
+        assert entry.metadata["captions"] == "existing caption"
+        worker_processor_real.http_session.get.assert_called_once_with(
+            "https://example.test/shard.tar",
+            headers={"Range": "bytes=1024-1027"},
+            timeout=120.0,
+            stream=True,
+        )
+
+    def test_remote_range_initialization_creates_http_session(self, worker_config):
+        """Enabling range reads should initialize both WebShart and HTTP clients."""
+        config_dict = worker_config.config.copy()
+        config_dict["dataset"] = {
+            **worker_config.config["dataset"],
+            "mock_results": False,
+            "remote_range_reads": True,
+            "remote_range_timeout": 15,
+            "remote_range_retries": 0,
+        }
+        dataset = Mock()
+
+        with (
+            patch(
+                "caption_flow.processors.webdataset.webshart.discover_dataset",
+                return_value=dataset,
+            ),
+            patch("caption_flow.processors.webdataset.webshart.TarDataLoader"),
+            patch("caption_flow.processors.webdataset.requests.Session") as session_class,
+        ):
+            processor = WebDatasetWorkerProcessor()
+            processor.gpu_id = 0
+            processor.initialize(ProcessorConfig(processor_type="webdataset", config=config_dict))
+
+        assert processor.http_session is session_class.return_value
+        assert processor.remote_range_timeout == 15
+        assert processor.remote_range_retries == 1
+
+    def test_remote_shard_layout_loads_metadata_once(self, worker_processor_real):
+        """The remote layout should preserve dataset ordering and be cached."""
+        processor = worker_processor_real
+        processor.http_session = Mock()
+        processor.dataset.get_shard_info.return_value = {
+            "tar_path": "https://example.test/shard.tar",
+            "json_path": "https://example.test/shard.json",
+        }
+        processor.dataset.list_samples_in_shard.return_value = ["b.png", "a.png"]
+        response = processor.http_session.get.return_value
+        response.json.return_value = {
+            "files": {
+                "a.png": {"offset": 0, "length": 2},
+                "b.png": {"offset": 2, "length": 3},
+            }
+        }
+
+        layout = processor._get_remote_shard_layout(2)
+        cached = processor._get_remote_shard_layout(2)
+
+        assert cached is layout
+        assert layout == {
+            "tar_url": "https://example.test/shard.tar",
+            "entries": [
+                {"offset": 2, "length": 3},
+                {"offset": 0, "length": 2},
+            ],
+        }
+        processor.http_session.get.assert_called_once_with(
+            "https://example.test/shard.json", timeout=120.0
+        )
+        response.raise_for_status.assert_called_once()
+
+    def test_remote_shard_layout_rejects_incomplete_metadata(self, worker_processor_real):
+        """Range mode should fail clearly when discovery metadata is incomplete."""
+        processor = worker_processor_real
+        with pytest.raises(RuntimeError, match="not initialized"):
+            processor._get_remote_shard_layout(0)
+
+        processor.http_session = Mock()
+        processor.dataset.get_shard_info.return_value = {
+            "tar_path": "local-shard.tar",
+            "json_path": "https://example.test/shard.json",
+        }
+        with pytest.raises(ValueError, match="remote tar URL"):
+            processor._get_remote_shard_layout(0)
+
+        processor.dataset.get_shard_info.return_value = {
+            "tar_path": "https://example.test/shard.tar"
+        }
+        with pytest.raises(ValueError, match="metadata URL"):
+            processor._get_remote_shard_layout(0)
+
+        processor.dataset.get_shard_info.return_value = {
+            "tar_path": "https://example.test/shard.tar",
+            "json_path": "https://example.test/shard.json",
+        }
+        processor.dataset.list_samples_in_shard.return_value = ["missing.png"]
+        processor.http_session.get.return_value.json.return_value = {"files": {}}
+        with pytest.raises(ValueError, match="Missing byte-range metadata"):
+            processor._get_remote_shard_layout(0)
+
+    def test_remote_sample_validates_ranges_and_retries_failures(self, worker_processor_real):
+        """Malformed and unsuccessful range responses should not yield corrupt samples."""
+        processor = worker_processor_real
+        with pytest.raises(RuntimeError, match="not initialized"):
+            processor._load_remote_sample(0, 0)
+
+        processor.http_session = Mock()
+        processor._remote_shard_layouts[0] = {
+            "tar_url": "https://example.test/shard.tar",
+            "entries": [],
+        }
+        with pytest.raises(IndexError, match="outside shard"):
+            processor._load_remote_sample(0, 0)
+
+        processor._remote_shard_layouts[0]["entries"] = [{"offset": 0, "length": 0}]
+        with pytest.raises(ValueError, match="Invalid byte length"):
+            processor._load_remote_sample(0, 0)
+
+        processor._remote_shard_layouts[0]["entries"] = [{"offset": 0, "length": 4}]
+        processor.remote_range_retries = 2
+        response = Mock(status_code=200, content=b"")
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        processor.http_session.get.return_value = response
+        with (
+            patch("caption_flow.processors.webdataset.time.sleep") as sleep,
+            pytest.raises(RuntimeError, match="Failed to fetch sample"),
+        ):
+            processor._load_remote_sample(0, 0)
+
+        assert processor.http_session.get.call_count == 2
+        sleep.assert_called_once_with(0.5)
+
+        response.status_code = 206
+        response.content = b"abc"
+        processor.remote_range_retries = 1
+        with pytest.raises(RuntimeError, match="Failed to fetch sample") as exc_info:
+            processor._load_remote_sample(0, 0)
+        assert "returned 3 bytes, expected 4" in str(exc_info.value.__cause__)
+
     def test_process_unit_real_mode_shard_by_name(self, worker_processor_real):
         """Test processing when shard_idx is None (fallback to name lookup)."""
         mock_entry = Mock()
@@ -1088,9 +1254,9 @@ class TestWebDatasetIntegration:
         for i, expected in enumerate(expected_chunks):
             actual = created_chunks[i]
             assert actual["chunk_id"] == expected["chunk_id"]
-            assert actual["start_index"] == expected["start_index"], (
-                f"Chunk {i} start_index mismatch"
-            )
+            assert (
+                actual["start_index"] == expected["start_index"]
+            ), f"Chunk {i} start_index mismatch"
             assert actual["chunk_size"] == expected["chunk_size"]
             assert actual["expected_chunk_index"] == expected["expected_chunk_index"]
 
@@ -1164,9 +1330,9 @@ class TestWebDatasetIntegration:
         chunk_state = chunk_tracker.chunks[chunk_id]
         unprocessed_ranges = chunk_state.get_unprocessed_ranges()
         expected_unprocessed = [(5, 9), (13, 19)]  # The gaps
-        assert unprocessed_ranges == expected_unprocessed, (
-            f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
-        )
+        assert (
+            unprocessed_ranges == expected_unprocessed
+        ), f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
 
         # Create work unit simulating orchestrator assignment
         unit = WorkUnit(

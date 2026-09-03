@@ -4,14 +4,14 @@
 [![codecov](https://codecov.io/github/bghira/CaptionFlow/graph/badge.svg?token=PRAQPNGYAS)](https://codecov.io/github/bghira/CaptionFlow)
 [![PyPI version](https://badge.fury.io/py/caption-flow.svg)](https://badge.fury.io/py/caption-flow)
 
-scalable, fault-tolerant **vLLM-powered image captioning**.
+scalable, fault-tolerant image captioning with **vLLM or contributed API workers**.
 
 a fast websocket-based orchestrator paired with lightweight gpu workers achieves exceptional performance for batched requests through vLLM.
 
 CaptionFlow is also integrated in [bghira/SimpleTuner](https://github.com/bghira/SimpleTuner), where it powers an end-to-end caption-to-training workflow through the SimpleTuner WebUI. Use CaptionFlow directly when you want a standalone distributed captioning system, or use it through SimpleTuner when you want dataset captioning, caption review/export, and model training managed as one suite.
 
 * **orchestrator**: hands out work in chunked shards, collects captions, checkpoints progress, and keeps simple stats.
-* **workers (vLLM)**: connect to the orchestrator, stream in image samples, batch them, and generate 1..N captions per image using prompts supplied by the orchestrator.
+* **workers (vLLM or BYOK API)**: connect to the orchestrator, stream in image samples, and generate 1..N captions per image using prompts supplied by the orchestrator.
 * **config-driven**: all components read YAML config; flags can override.
 
 > no conda. just `venv` + `pip`.
@@ -25,6 +25,12 @@ python -m venv .venv
 source .venv/bin/activate  # windows: .venv\Scripts\activate
 pip install --upgrade pip
 pip install "caption-flow[vllm]"
+```
+
+An OpenAI-compatible API worker does not need the GPU dependencies:
+
+```bash
+pip install "caption-flow[openai]"
 ```
 
 For an orchestrator or monitor-only install, use `pip install -e .`.
@@ -139,6 +145,39 @@ Options:
 * **resilient**: detects disconnects, abandons the current chunk cleanly, clears queues, reconnects, and resumes.
 * **batched generate()**: images are resized down for consistent batching; each image can get multiple captions (one per prompt).
 
+### OpenAI-compatible BYOK worker
+
+The API backend is a separate worker process, not an orchestrator integration.
+Provider keys remain in local environment variables; the CaptionFlow server sees
+only the normal worker token, submitted outputs, and non-secret capacity metrics.
+
+```bash
+cp examples/worker.openai-compatible.yaml my-api-worker.yaml
+export ZAI_API_KEY="..."
+caption-flow worker --config my-api-worker.yaml --openai-compatible
+```
+
+The worker sends OpenAI Chat Completions-compatible multimodal requests with an
+inline image data URL. Every configured endpoint can override the shared stage
+model with its own `model`, or use `model_map` when several orchestrator model
+names need explicit aliases.
+
+Capacity is discovered independently for each endpoint:
+
+* it starts at `initial_concurrency`, adds a slot after sustained successful calls, and never exceeds `max_concurrency`;
+* a 429 or recognizable concurrency/capacity response halves the active limit and honors `Retry-After` or common rate-reset headers;
+* `requests_per_minute` adds conservative start-time pacing when a plan publishes an RPM limit;
+* retries can spill onto another endpoint, so multiple accounts or providers form one local pool without exposing their credentials.
+
+The sample is ready for Z.AI's OpenAI-compatible Coding Plan endpoint and
+`glm-5.3-flash`. Change `base_url` and `model` to use any other compatible
+multimodal service; no orchestrator changes are needed.
+
+The orchestrator may use the backend-neutral `inference:` key for shared stages,
+prompts, sampling, and output fields. Existing `vllm:` configurations are also
+accepted by API workers for backward compatibility; endpoint-local `model`
+values take precedence over the broadcast model name.
+
 ---
 
 ## dataset formats
@@ -223,7 +262,7 @@ PRs welcome. keep it simple and fast.
 
 To contribute compute to a cluster:
 
-1. Install caption-flow: `pip install "caption-flow[vllm]"`
+1. Install caption-flow: `pip install "caption-flow[vllm]"` for a GPU worker or `pip install "caption-flow[openai]"` for a BYOK API worker
 2. Get a worker token from the project maintainer
 3. Run: `caption-flow worker --server wss://project.domain.com:8765 --token YOUR_TOKEN`
 
