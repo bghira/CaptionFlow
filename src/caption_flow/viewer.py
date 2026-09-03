@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
@@ -57,10 +58,20 @@ class DatasetViewer:
 
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir)
-        self.captions_path = self.data_dir / "captions.parquet"
+        lance_path = self.data_dir / "captions.lance"
+        parquet_path = self.data_dir / "captions.parquet"
 
-        if not self.captions_path.exists():
-            raise FileNotFoundError(f"No captions file found at {self.captions_path}")
+        # Lance is CaptionFlow's live storage format. Keep Parquet support for
+        # older exported datasets, preferring the live store when both exist.
+        if lance_path.exists():
+            self.captions_path = lance_path
+        elif parquet_path.exists():
+            self.captions_path = parquet_path
+        else:
+            raise FileNotFoundError(
+                f"No captions dataset found in {self.data_dir}; expected "
+                "captions.lance or captions.parquet"
+            )
 
         # Data
         self.df = None
@@ -80,6 +91,7 @@ class DatasetViewer:
         self.caption_box = None
         self.image_box = None
         self.image_widget = None
+        self.image_container = None
         self.shards_box = None  # Store LineBox reference
         self.items_box = None  # Store LineBox reference
 
@@ -87,13 +99,19 @@ class DatasetViewer:
         self.current_image_url = None
         self.session = None
         self.temp_files = []
+        self.webshart_datasets = {}
+        self.webshart_layouts = {}
 
     def load_data(self):
         """Load dataset synchronously."""
         logger.info("Loading dataset...")
 
-        # Read parquet file
-        self.df = pd.read_parquet(self.captions_path)
+        if self.captions_path.suffix == ".lance":
+            import lance
+
+            self.df = lance.dataset(str(self.captions_path)).to_table().to_pandas()
+        else:
+            self.df = pd.read_parquet(self.captions_path)
 
         # Get unique shards
         if "shard" in self.df.columns:
@@ -152,13 +170,15 @@ class DatasetViewer:
 
         # Image display
         if TERM_IMAGE_AVAILABLE and not self.disable_images:
-            self.image_placeholder = urwid.Text("No image loaded", align="center")
-            self.image_filler = urwid.Filler(self.image_placeholder)
+            image_content = self._image_message_widget("No image loaded")
         else:
             msg = "Image preview disabled" if self.disable_images else "term-image not installed"
-            self.image_filler = urwid.Filler(urwid.Text(msg, align="center"))
+            image_content = self._image_message_widget(msg)
 
-        self.image_box = urwid.LineBox(self.image_filler, title="Image Preview", title_attr="title")
+        self.image_container = urwid.WidgetPlaceholder(image_content)
+        self.image_box = urwid.LineBox(
+            self.image_container, title="Image Preview", title_attr="title"
+        )
 
         # Preview area (captions + image) - ADJUSTED WEIGHTS
         preview = urwid.Pile(
@@ -214,8 +234,15 @@ class DatasetViewer:
         for idx, item in enumerate(self.current_shard_items):
             # Extract filename
             filename = item.get("filename", "")
-            if not filename and "url" in item:
-                filename = os.path.basename(urlparse(item["url"]).path)
+            if not isinstance(filename, str):
+                filename = ""
+
+            url = item.get("url", "")
+            if not isinstance(url, str):
+                url = ""
+
+            if not filename and url:
+                filename = os.path.basename(urlparse(url).path)
             if not filename:
                 filename = f"item_{idx}"
 
@@ -383,22 +410,35 @@ class DatasetViewer:
         lines = textwrap.wrap(text, width=width)
         return "\n      ".join(lines)
 
+    def _image_message_widget(self, message):
+        """Create a centered box widget for image-preview status text."""
+        return urwid.Filler(urwid.Text(message, align="center"))
+
+    def _show_image_message(self, message):
+        """Replace the image preview with centered status text."""
+        self.image_container.original_widget = self._image_message_widget(message)
+
     def _update_image(self, item):
         """Update the image display."""
         url = item.get("url", "")
+        if not isinstance(url, str) or not url.strip():
+            url = ""
 
-        # Skip if same URL
-        if url == self.current_image_url:
+        webshart_ref = self._webshart_reference(item) if not url else None
+        image_ref = url or webshart_ref or ""
+
+        # Skip if the same image is already displayed.
+        if image_ref == self.current_image_url:
             return
 
-        self.current_image_url = url
+        self.current_image_url = image_ref
 
-        if not url:
-            self.image_filler.body = urwid.Text("No URL available", align="center")
+        if not image_ref:
+            self._show_image_message("No image source available")
             return
 
         # Show loading message
-        self.image_filler.body = urwid.Text("Loading image...", align="center")
+        self._show_image_message("Loading image...")
         self.loop.draw_screen()
 
         try:
@@ -406,19 +446,25 @@ class DatasetViewer:
             import urllib.error
             import urllib.request
 
-            # Create request with user agent to avoid 403 errors
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                },
-            )
+            if url:
+                # Create request with user agent to avoid 403 errors.
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        )
+                    },
+                )
 
-            with urllib.request.urlopen(request, timeout=10) as response:
-                image_data = response.read()
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    image_data = response.read()
+                suffix = Path(urlparse(url).path).suffix or ".jpg"
+            else:
+                image_data, suffix = self._load_webshart_image(item)
 
             # Save to temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(image_data)
                 tmp_path = tmp.name
                 self.temp_files.append(tmp_path)
@@ -426,47 +472,82 @@ class DatasetViewer:
             # Create term_image from file
             image = from_file(tmp_path)
 
-            # Dynamic sizing based on terminal size and actual space
-            if self.loop and self.screen:
-                cols, rows = self.screen.get_cols_rows()
-
-                # Calculate available space more accurately
-                # Left columns take 42 chars (12 + 30) + borders/padding
-                available_width = max(30, cols - 46)
-
-                # Image box has weight 1 out of 2 total in the preview pile (equal space)
-                # But account for borders, header, footer (about 6 rows total)
-                preview_height = rows - 6
-                image_height = preview_height // 2  # 1/2 of preview area now
-                available_height = max(20, image_height - 2)  # Account for box borders
-
-                # Try to preserve aspect ratio while maximizing use of space
-                # Prioritize HEIGHT to avoid vertical cropping
-                try:
-                    # First try setting only height, let width auto-adjust
-                    image.set_size(height=available_height)
-                except:
-                    # If that fails, try setting both but prioritize height
-                    try:
-                        image.set_size(width=available_width, height=available_height)
-                    except:
-                        # Last resort - use fixed size
-                        image.set_size(60, 30)
-            else:
-                # Fallback size
-                image.set_size(60, 30)
-
-            # Create UrwidImage widget without upscaling to maintain proper bounds
+            # Put the image widget directly in the box. UrwidImage then receives
+            # the pane's exact (width, height), fits to both axes while preserving
+            # aspect ratio, and recalculates when the terminal is resized.
             self.image_widget = UrwidImage(image, upscale=False)
-            # Center the image in the available space
-            self.image_filler.body = urwid.Padding(self.image_widget, align="center")
+            self.image_container.original_widget = self.image_widget
 
         except urllib.error.HTTPError as e:
-            self.image_filler.body = urwid.Text(f"HTTP Error {e.code}: {e.reason}", align="center")
+            self._show_image_message(f"HTTP Error {e.code}: {e.reason}")
         except urllib.error.URLError as e:
-            self.image_filler.body = urwid.Text(f"URL Error: {str(e)}", align="center")
+            self._show_image_message(f"URL Error: {str(e)}")
         except Exception as e:
-            self.image_filler.body = urwid.Text(f"Error: {str(e)}", align="center")
+            self._show_image_message(f"Error: {str(e)}")
+
+    def _webshart_reference(self, item):
+        """Return a stable reference for a WebShart-backed caption row."""
+        dataset = item.get("dataset")
+        shard = item.get("shard")
+        filename = item.get("filename")
+        if not all(isinstance(value, str) and value for value in (dataset, shard, filename)):
+            return None
+        if not re.fullmatch(r"shard-\d+", shard):
+            return None
+        return f"webshart://{dataset}/{shard}/{filename}"
+
+    def _load_webshart_image(self, item):
+        """Fetch one source image directly from its indexed tar byte range."""
+        import json
+        import urllib.request
+
+        import webshart
+
+        dataset_name = item["dataset"]
+        shard_name = item["shard"]
+        filename = item["filename"]
+        shard_idx = int(shard_name.rsplit("-", 1)[1])
+
+        dataset = self.webshart_datasets.get(dataset_name)
+        if dataset is None:
+            dataset = webshart.discover_dataset(source=dataset_name)
+            self.webshart_datasets[dataset_name] = dataset
+
+        layout_key = (dataset_name, shard_idx)
+        layout = self.webshart_layouts.get(layout_key)
+        if layout is None:
+            shard_info = dataset.get_shard_info(shard_idx)
+            metadata_url = shard_info.get("json_path")
+            tar_url = shard_info.get("tar_path") or shard_info.get("path")
+            if not metadata_url or not tar_url:
+                raise ValueError(f"Missing WebShart URLs for {shard_name}")
+
+            with urllib.request.urlopen(metadata_url, timeout=30) as response:
+                metadata = json.loads(response.read())
+            layout = {"tar_url": tar_url, "files": metadata.get("files", {})}
+            self.webshart_layouts[layout_key] = layout
+
+        entry = layout["files"].get(filename)
+        if not isinstance(entry, dict):
+            raise ValueError(f"Image {filename} is missing from {shard_name} metadata")
+
+        offset = int(entry["offset"])
+        length = int(entry.get("length", entry.get("size", 0)))
+        if length <= 0:
+            raise ValueError(f"Invalid WebShart image length for {filename}")
+
+        request = urllib.request.Request(
+            layout["tar_url"],
+            headers={"Range": f"bytes={offset}-{offset + length - 1}"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            image_data = response.read()
+        if len(image_data) != length:
+            raise ValueError(
+                f"WebShart returned {len(image_data)} bytes for {filename}; expected {length}"
+            )
+
+        return image_data, Path(filename).suffix or ".img"
 
     def handle_input(self, key):
         """Handle keyboard input."""

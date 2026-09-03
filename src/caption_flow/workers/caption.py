@@ -329,12 +329,14 @@ class CaptionWorker(BaseWorker):
             if "error" in welcome_data:
                 raise RuntimeError(f"Authentication failed: {welcome_data['error']}")
 
-            # Extract vLLM config from processor config
+            # ``inference`` is the backend-neutral spelling. Keep accepting
+            # ``vllm`` so existing orchestrators and worker configs continue
+            # to work unchanged.
             processor_config = welcome_data.get("processor_config", {})
-            self.vllm_config = processor_config.get("vllm", {})
+            self.vllm_config = processor_config.get("inference") or processor_config.get("vllm", {})
 
             if not self.vllm_config:
-                raise RuntimeError("No vLLM configuration received from orchestrator")
+                raise RuntimeError("No inference configuration received from orchestrator")
 
             # Parse stages
             self.stages = self._parse_stages_config(self.vllm_config)
@@ -376,8 +378,9 @@ class CaptionWorker(BaseWorker):
         self.dataset_path = self.processor.dataset_path
         self.units_per_request = processor_config.config.get("chunks_per_request", 1)
 
-        # Update vLLM config if provided
-        new_vllm_config = welcome_data.get("processor_config", {}).get("vllm")
+        # Update inference config if provided. ``vllm`` remains the legacy key.
+        received_config = welcome_data.get("processor_config", {})
+        new_vllm_config = received_config.get("inference") or received_config.get("vllm")
         if new_vllm_config and new_vllm_config != self.vllm_config:
             logger.info("Received updated vLLM configuration")
             self._handle_vllm_config_update(new_vllm_config)

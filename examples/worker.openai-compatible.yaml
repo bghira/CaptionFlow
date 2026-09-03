@@ -1,0 +1,39 @@
+worker:
+  # This process connects to CaptionFlow with the normal community worker token.
+  server: "wss://caption.example.com:8765"
+  token: "replace-with-captionflow-worker-token"
+  name: "my-api-pool"
+
+  # Provider API keys stay in this process. They are never sent to CaptionFlow.
+  openai_compatible:
+    # Keep enough local items ready to fill all discovered request slots.
+    batch_size: 64
+    include_image: true
+    image_detail: "auto"
+    image_format: "jpeg"
+    image_quality: 90
+
+    endpoints:
+      - name: "zai-coding-plan"
+        base_url: "https://api.z.ai/api/coding/paas/v4"
+        api_key_env: "ZAI_API_KEY"
+        model: "glm-5.3-flash"
+        initial_concurrency: 1
+        max_concurrency: 32
+        probe_after_successes: 8
+        # Set this when the plan publishes an RPM ceiling. Omit it to rely on
+        # adaptive concurrency and provider rate-limit responses.
+        # requests_per_minute: 600
+        timeout_seconds: 120
+        max_retries: 6
+
+      # Add more accounts or providers to aggregate their capacity. Model names
+      # can differ between endpoints.
+      # - name: "secondary"
+      #   base_url_env: "CAPTIONFLOW_SECONDARY_BASE_URL"
+      #   api_key_env: "CAPTIONFLOW_SECONDARY_API_KEY"
+      #   model: "another-vision-model"
+      #   initial_concurrency: 1
+      #   max_concurrency: 16
+
+  when_finished: "stay_connected"

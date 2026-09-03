@@ -146,9 +146,9 @@ class TestWebDatasetOrchestratorProcessor:
         chunk_state = orchestrator_processor.chunk_tracker.chunks[chunk_id]
         unprocessed_ranges = chunk_state.get_unprocessed_ranges()
         expected_unprocessed = [(10, 20), (50, 99)]
-        assert unprocessed_ranges == expected_unprocessed, (
-            f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
-        )
+        assert (
+            unprocessed_ranges == expected_unprocessed
+        ), f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
 
         orchestrator_processor._restore_state(mock_storage)
 
@@ -910,6 +910,42 @@ class TestWebDatasetWorkerProcessor:
         # Verify loader was called correctly
         worker_processor_real.loader.load_sample.assert_any_call(0, 5)
 
+    def test_remote_range_reader_fetches_only_sample_bytes(self, worker_processor_real):
+        """Remote range mode should avoid downloading a complete tar shard."""
+        worker_processor_real.remote_range_reads = True
+        worker_processor_real.remote_range_retries = 1
+        worker_processor_real.http_session = Mock()
+        worker_processor_real._remote_shard_layouts[0] = {
+            "tar_url": "https://example.test/shard.tar",
+            "entries": [
+                {
+                    "path": "images/example.png",
+                    "offset": 1024,
+                    "length": 4,
+                    "captions": "existing caption",
+                }
+            ],
+        }
+
+        response = Mock()
+        response.status_code = 206
+        response.content = b"data"
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        worker_processor_real.http_session.get.return_value = response
+
+        entry = worker_processor_real._load_remote_sample(0, 0)
+
+        assert entry.data == b"data"
+        assert entry.path == "images/example.png"
+        assert entry.metadata["captions"] == "existing caption"
+        worker_processor_real.http_session.get.assert_called_once_with(
+            "https://example.test/shard.tar",
+            headers={"Range": "bytes=1024-1027"},
+            timeout=120.0,
+            stream=True,
+        )
+
     def test_process_unit_real_mode_shard_by_name(self, worker_processor_real):
         """Test processing when shard_idx is None (fallback to name lookup)."""
         mock_entry = Mock()
@@ -1088,9 +1124,9 @@ class TestWebDatasetIntegration:
         for i, expected in enumerate(expected_chunks):
             actual = created_chunks[i]
             assert actual["chunk_id"] == expected["chunk_id"]
-            assert actual["start_index"] == expected["start_index"], (
-                f"Chunk {i} start_index mismatch"
-            )
+            assert (
+                actual["start_index"] == expected["start_index"]
+            ), f"Chunk {i} start_index mismatch"
             assert actual["chunk_size"] == expected["chunk_size"]
             assert actual["expected_chunk_index"] == expected["expected_chunk_index"]
 
@@ -1164,9 +1200,9 @@ class TestWebDatasetIntegration:
         chunk_state = chunk_tracker.chunks[chunk_id]
         unprocessed_ranges = chunk_state.get_unprocessed_ranges()
         expected_unprocessed = [(5, 9), (13, 19)]  # The gaps
-        assert unprocessed_ranges == expected_unprocessed, (
-            f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
-        )
+        assert (
+            unprocessed_ranges == expected_unprocessed
+        ), f"Expected {expected_unprocessed}, got {unprocessed_ranges}"
 
         # Create work unit simulating orchestrator assignment
         unit = WorkUnit(

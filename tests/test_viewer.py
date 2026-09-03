@@ -3,9 +3,11 @@
 import shutil
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
+import lance
 import pandas as pd
+import pyarrow as pa
 import pytest
 from caption_flow.viewer import DatasetViewer, SelectableListItem
 
@@ -147,6 +149,40 @@ class TestDatasetViewerInit:
         finally:
             shutil.rmtree(temp_dir)
 
+    def test_init_prefers_lance_dataset(self, tmp_path):
+        lance_path = tmp_path / "captions.lance"
+        lance.write_dataset(
+            pa.table({"job_id": ["job-1"], "captions": [["A short caption."]]}),
+            str(lance_path),
+            mode="create",
+        )
+        (tmp_path / "captions.parquet").touch()
+
+        viewer = DatasetViewer(tmp_path)
+
+        assert viewer.captions_path == lance_path
+
+    def test_load_lance_dataset(self, tmp_path):
+        lance_path = tmp_path / "captions.lance"
+        lance.write_dataset(
+            pa.table(
+                {
+                    "shard": ["shard1", "shard2"],
+                    "job_id": ["job-1", "job-2"],
+                    "item_index": [0, 0],
+                    "captions": [["First caption."], ["Second caption."]],
+                }
+            ),
+            str(lance_path),
+            mode="create",
+        )
+
+        viewer = DatasetViewer(tmp_path)
+        viewer.load_data()
+
+        assert len(viewer.df) == 2
+        assert viewer.shards == ["shard1", "shard2"]
+
     def test_palette_defined(self, temp_data_dir):
         """Test that color palette is properly defined."""
         viewer = DatasetViewer(temp_data_dir)
@@ -264,6 +300,23 @@ class TestDatasetViewerUI:
         assert hasattr(viewer, "create_ui")
         assert callable(viewer.create_ui)
 
+    def test_items_list_handles_missing_filename_and_url(self, tmp_path):
+        pd.DataFrame(
+            {
+                "shard": ["shard1"],
+                "job_id": ["job-1"],
+                "filename": [float("nan")],
+                "url": [float("nan")],
+                "captions": ["A caption."],
+            }
+        ).to_parquet(tmp_path / "captions.parquet")
+        viewer = DatasetViewer(tmp_path)
+        viewer.load_data()
+
+        viewer._create_items_list()
+
+        assert viewer.items_walker[0].content == "▶   0. item_0"
+
 
 class TestDatasetViewerImageHandling:
     """Test DatasetViewer image handling functionality."""
@@ -278,6 +331,77 @@ class TestDatasetViewerImageHandling:
         """Test that session is None initially."""
         viewer = DatasetViewer(temp_data_dir)
         assert viewer.session is None
+
+    def test_update_image_handles_nan_url(self, temp_data_dir):
+        """Rows without an image source render a placeholder instead of reaching urllib."""
+        viewer = DatasetViewer(temp_data_dir)
+        viewer.image_container = Mock()
+
+        viewer._update_image({"url": float("nan")})
+
+        assert viewer.current_image_url == ""
+        message_widget = viewer.image_container.original_widget
+        assert message_widget.original_widget.text == "No image source available"
+
+    @patch("urllib.request.urlopen")
+    @patch("webshart.discover_dataset")
+    def test_load_webshart_image_uses_tar_byte_range(
+        self, discover_dataset, urlopen, temp_data_dir
+    ):
+        """WebShart rows resolve their image from shard metadata without a URL column."""
+        dataset = Mock()
+        dataset.get_shard_info.return_value = {
+            "tar_path": "https://example.test/shard-00003.tar",
+            "json_path": "https://example.test/shard-00003.json",
+        }
+        discover_dataset.return_value = dataset
+
+        metadata_response = MagicMock()
+        metadata_response.__enter__.return_value.read.return_value = (
+            b'{"files":{"images/photo.png":{"offset":100,"length":4}}}'
+        )
+        image_response = MagicMock()
+        image_response.__enter__.return_value.read.return_value = b"data"
+        urlopen.side_effect = [metadata_response, image_response]
+
+        viewer = DatasetViewer(temp_data_dir)
+        image_data, suffix = viewer._load_webshart_image(
+            {
+                "dataset": "example/images",
+                "shard": "shard-00003",
+                "filename": "images/photo.png",
+            }
+        )
+
+        assert image_data == b"data"
+        assert suffix == ".png"
+        range_request = urlopen.call_args_list[1].args[0]
+        assert range_request.headers["Range"] == "bytes=100-103"
+
+    @patch("caption_flow.viewer.UrwidImage")
+    @patch("caption_flow.viewer.from_file")
+    def test_image_widget_receives_full_pane_bounds(self, from_file, urwid_image, temp_data_dir):
+        """Place UrwidImage directly in its box so it fits both viewport axes."""
+        viewer = DatasetViewer(temp_data_dir)
+        viewer.image_container = Mock()
+        viewer.loop = Mock()
+        viewer._load_webshart_image = Mock(return_value=(b"image bytes", ".png"))
+        image = Mock()
+        from_file.return_value = image
+        fitted_widget = Mock()
+        urwid_image.return_value = fitted_widget
+
+        viewer._update_image(
+            {
+                "dataset": "example/images",
+                "shard": "shard-00000",
+                "filename": "images/photo.png",
+            }
+        )
+
+        urwid_image.assert_called_once_with(image, upscale=False)
+        assert viewer.image_container.original_widget is fitted_widget
+        image.set_size.assert_not_called()
 
 
 class TestDatasetViewerUtilityMethods:

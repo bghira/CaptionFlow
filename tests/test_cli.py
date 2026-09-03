@@ -488,8 +488,7 @@ class TestViewCommand:
         assert "view" in result.output.lower()
 
     @patch("caption_flow.viewer.DatasetViewer")
-    @patch("caption_flow.cli.asyncio.run")
-    def test_view_run(self, mock_asyncio_run, mock_viewer_class, runner, tmp_path):
+    def test_view_run(self, mock_viewer_class, runner, tmp_path):
         """Test running view command."""
         # Create a temporary data directory with required files
         data_dir = tmp_path / "test_data"
@@ -497,14 +496,28 @@ class TestViewCommand:
         (data_dir / "captions.parquet").touch()
 
         mock_viewer = Mock()
-        mock_viewer.run = AsyncMock()
+        mock_viewer.run = Mock()
         mock_viewer_class.return_value = mock_viewer
 
         runner.invoke(main, ["view", "--data-dir", str(data_dir)])
 
         # Should create and run viewer
         mock_viewer_class.assert_called()
-        mock_asyncio_run.assert_called()
+        mock_viewer.run.assert_called_once_with()
+
+    @patch("caption_flow.viewer.DatasetViewer")
+    def test_view_accepts_lance_dataset(self, mock_viewer_class, runner, tmp_path):
+        """The viewer accepts CaptionFlow's live Lance storage format."""
+        data_dir = tmp_path / "test_data"
+        (data_dir / "captions.lance").mkdir(parents=True)
+        mock_viewer = Mock()
+        mock_viewer_class.return_value = mock_viewer
+
+        result = runner.invoke(main, ["view", "--data-dir", str(data_dir), "--no-images"])
+
+        assert result.exit_code == 0
+        mock_viewer_class.assert_called_once_with(data_dir)
+        mock_viewer.run.assert_called_once_with()
 
 
 class TestScanChunksCommand:

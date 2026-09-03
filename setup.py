@@ -80,6 +80,9 @@ APPLE_PYTORCH_DEPENDENCIES = [
 extras_require = {
     "vllm": vllm_deps,
     "captioning": vllm_deps,
+    # The OpenAI-compatible worker uses aiohttp from the base install and does
+    # not pull in the GPU stack. This named extra makes deployment intent clear.
+    "openai": [],
     "cpu": PYTORCH_DEPENDENCIES,
     "cuda": PYTORCH_DEPENDENCIES,
     "cuda13": PYTORCH_DEPENDENCIES,

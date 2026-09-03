@@ -320,6 +320,12 @@ class StorageManager:
             self.existing_contributor_ids = set(contributor_ids)
             logger.info(f"Loaded contributors dataset: {len(contributor_ids)} contributors")
 
+        # Caption rows are the authoritative source for contribution totals.
+        # This also repairs contributor datasets written by older versions that
+        # didn't return a success value from save_caption and therefore never
+        # incremented the contributor record.
+        await self._reconcile_contributor_counts()
+
         # Initialize jobs storage
         if not self.jobs_path.exists():
             # Create empty jobs dataset
@@ -414,7 +420,7 @@ class StorageManager:
         if job_id in self.existing_caption_job_ids:
             self.stats["duplicates_skipped"] += 1
             logger.debug(f"Skipping duplicate job_id: {job_id}")
-            return
+            return False
 
         # Try to find existing buffered row
         for _idx, row in enumerate(self.caption_buffer):
@@ -431,7 +437,7 @@ class StorageManager:
                 if "caption_count" in caption_dict:
                     old_count = row.get("caption_count", 0)
                     row["caption_count"] = old_count + caption_dict["caption_count"]
-                return
+                return True
 
         # Create new row
         for field_name, field_values in outputs.items():
@@ -451,6 +457,8 @@ class StorageManager:
         if len(self.caption_buffer) >= self.caption_buffer_size:
             logger.debug("Caption buffer full, flushing.")
             await self._flush_captions()
+
+        return True
 
     async def _flush_captions(self):
         """Flush caption buffer to Lance dataset."""
@@ -644,7 +652,13 @@ class StorageManager:
 
     async def save_contributor(self, contributor: Contributor):
         """Save or update contributor stats."""
-        self.contributor_buffer.append(asdict(contributor))
+        contributor_data = asdict(contributor)
+        for index, buffered in enumerate(self.contributor_buffer):
+            if buffered["contributor_id"] == contributor.contributor_id:
+                self.contributor_buffer[index] = contributor_data
+                break
+        else:
+            self.contributor_buffer.append(contributor_data)
 
         if len(self.contributor_buffer) >= self.contributor_buffer_size:
             await self._flush_contributors()
@@ -654,9 +668,17 @@ class StorageManager:
         if not self.contributor_buffer:
             return
 
-        table = pa.Table.from_pylist(self.contributor_buffer, schema=self.contributor_schema)
+        contributors_by_id = {}
+        if self.contributors_dataset:
+            for row in self.contributors_dataset.to_table().to_pylist():
+                contributors_by_id[row["contributor_id"]] = row
+        for row in self.contributor_buffer:
+            contributors_by_id[row["contributor_id"]] = row
 
-        mode = "append" if self.contributors_path.exists() else "create"
+        table = pa.Table.from_pylist(
+            list(contributors_by_id.values()), schema=self.contributor_schema
+        )
+        mode = "overwrite" if self.contributors_path.exists() else "create"
         self.contributors_dataset = lance.write_dataset(
             table, str(self.contributors_path), mode=mode
         )
@@ -664,6 +686,45 @@ class StorageManager:
             logger.info(f"Created contributor storage at {self.contributors_path}")
 
         self.contributor_buffer.clear()
+        self.existing_contributor_ids = set(contributors_by_id)
+
+    async def _reconcile_contributor_counts(self):
+        """Rebuild contributor totals from authoritative caption rows."""
+        if not self.captions_dataset or self.captions_dataset.count_rows() == 0:
+            return
+
+        totals: Dict[str, int] = defaultdict(int)
+        caption_rows = self.captions_dataset.to_table(
+            columns=["contributor_id", "caption_count"]
+        ).to_pylist()
+        for row in caption_rows:
+            contributor_id = row.get("contributor_id")
+            if contributor_id:
+                totals[contributor_id] += int(row.get("caption_count") or 0)
+
+        existing = {}
+        if self.contributors_dataset:
+            for row in self.contributors_dataset.to_table().to_pylist():
+                existing[row["contributor_id"]] = row
+
+        repaired = []
+        for contributor_id, total in totals.items():
+            row = existing.get(contributor_id, {})
+            repaired.append(
+                {
+                    "contributor_id": contributor_id,
+                    "name": row.get("name") or contributor_id,
+                    "total_captions": total,
+                    "trust_level": int(row.get("trust_level") or 1),
+                }
+            )
+
+        table = pa.Table.from_pylist(repaired, schema=self.contributor_schema)
+        self.contributors_dataset = lance.write_dataset(
+            table, str(self.contributors_path), mode="overwrite"
+        )
+        self.existing_contributor_ids = set(totals)
+        logger.info("Reconciled %d contributor totals from captions", len(repaired))
 
     async def _flush_jobs(self):
         """Flush job buffer to Lance."""
@@ -874,24 +935,17 @@ class StorageManager:
 
     async def get_top_contributors(self, limit: int = 10) -> List[Contributor]:
         """Get top contributors by caption count."""
-        contributors = []
+        contributors_by_id = {}
 
         if self.contributors_dataset:
-            table = self.contributors_dataset.to_table()
-            df = table.to_pandas()
-            df = df.sort_values("total_captions", ascending=False).head(limit)
+            for row in self.contributors_dataset.to_table().to_pylist():
+                contributors_by_id[row["contributor_id"]] = row
+        for row in self.contributor_buffer:
+            contributors_by_id[row["contributor_id"]] = row
 
-            for _, row in df.iterrows():
-                contributors.append(
-                    Contributor(
-                        contributor_id=row["contributor_id"],
-                        name=row["name"],
-                        total_captions=int(row["total_captions"]),
-                        trust_level=int(row["trust_level"]),
-                    )
-                )
-
-        return contributors
+        contributors = [Contributor(**row) for row in contributors_by_id.values()]
+        contributors.sort(key=lambda contributor: contributor.total_captions, reverse=True)
+        return contributors[:limit]
 
     async def get_output_field_stats(self) -> Dict[str, Any]:
         """Get statistics about output fields."""

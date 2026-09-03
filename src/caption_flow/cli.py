@@ -361,6 +361,11 @@ def orchestrator(ctx, config: Optional[str], **kwargs):
 @click.option("--batch-size", type=int, help="Inference batch size")
 @click.option("--no-verify-ssl", is_flag=True, help="Skip SSL verification")
 @click.option("--vllm", is_flag=True, help="Use vLLM worker for GPU inference")
+@click.option(
+    "--openai-compatible",
+    is_flag=True,
+    help="Use local BYOK OpenAI-compatible endpoint pool",
+)
 @click.option("--gpu-id", type=int, help="GPU device ID (for vLLM)")
 @click.option("--precision", help="Model precision (for vLLM)")
 @click.option("--model", help="Model name (for vLLM)")
@@ -418,8 +423,30 @@ def worker(ctx, config: Optional[str], **kwargs):
         )
         sys.exit(1)
 
-    # Choose worker type
-    if kwargs.get("vllm") or config_data.get("vllm"):
+    # Choose worker type. Provider credentials remain in this worker config and
+    # are never included in the orchestrator authentication payload.
+    requested_openai = bool(kwargs.get("openai_compatible"))
+    requested_vllm = bool(kwargs.get("vllm"))
+    if requested_openai and requested_vllm:
+        raise ValueError("Choose only one worker backend: vLLM or OpenAI-compatible")
+
+    # An explicit CLI backend overrides a backend selected by a discovered
+    # fallback config (for example examples/worker.yaml).
+    if requested_openai or requested_vllm:
+        use_openai_compatible = requested_openai
+        use_vllm = requested_vllm
+    else:
+        use_openai_compatible = bool(config_data.get("openai_compatible"))
+        use_vllm = bool(config_data.get("vllm"))
+
+    if use_openai_compatible and use_vllm:
+        raise ValueError("Choose only one worker backend: vLLM or OpenAI-compatible")
+
+    if use_openai_compatible:
+        from .workers.openai_compatible import OpenAICompatibleWorker
+
+        worker_instance = OpenAICompatibleWorker(config_data)
+    elif use_vllm:
         from .workers.caption import CaptionWorker
 
         worker_instance = CaptionWorker(config_data)
@@ -567,9 +594,9 @@ def view(ctx, data_dir: str, refresh_rate: int, no_images: bool):
         console.print(f"[red]Storage directory not found: {data_dir}[/red]")
         sys.exit(1)
 
-    if not (data_path / "captions.parquet").exists():
-        console.print(f"[red]No captions file found in {data_dir}[/red]")
-        console.print("[yellow]Have you exported any captions yet?[/yellow]")
+    if not any((data_path / name).exists() for name in ("captions.lance", "captions.parquet")):
+        console.print(f"[red]No captions dataset found in {data_dir}[/red]")
+        console.print("[yellow]Expected captions.lance or captions.parquet[/yellow]")
         sys.exit(1)
 
     # Check for term-image if images are enabled
@@ -591,7 +618,7 @@ def view(ctx, data_dir: str, refresh_rate: int, no_images: bool):
         console.print("[cyan]Starting dataset viewer...[/cyan]")
         console.print(f"[dim]Data directory: {data_path}[/dim]")
 
-        asyncio.run(viewer.run())
+        viewer.run()
 
     except FileNotFoundError as e:
         console.print(f"[red]Error: {e}[/red]")
