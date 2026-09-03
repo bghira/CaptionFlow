@@ -16,6 +16,11 @@ try:
 
     TERM_IMAGE_AVAILABLE = True
 except ImportError:
+    BaseImage = None
+    from_file = None
+    from_url = None
+    UrwidImage = None
+    UrwidImageScreen = None
     TERM_IMAGE_AVAILABLE = False
     logging.warning("term-image not available. Install with: pip install term-image")
 
