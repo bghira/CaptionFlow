@@ -41,6 +41,7 @@ class VLLMConfigManager:
         "batch_size",
         "sampling",
         "inference_prompts",
+        "refusal_markers",
         "retry_prompt",
         "retry_without_image",
     }

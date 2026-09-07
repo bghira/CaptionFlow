@@ -566,7 +566,7 @@ class OpenAICompatibleWorker(CaptionWorker):
         "presence_penalty",
         "seed",
     }
-    _REFUSAL_MARKERS = (
+    _DEFAULT_REFUSAL_MARKERS = (
         "i'm sorry",
         "i’m sorry",
         "i cannot",
@@ -621,6 +621,16 @@ class OpenAICompatibleWorker(CaptionWorker):
         self.image_quality = int(raw_config.get("image_quality", 90))
         configured_dimension = int(raw_config.get("max_image_dimension", 0) or 0)
         self.max_image_dimension = configured_dimension if configured_dimension > 0 else None
+        self._local_refusal_markers = (
+            self._normalize_refusal_markers(raw_config["refusal_markers"])
+            if "refusal_markers" in raw_config
+            else None
+        )
+        self.refusal_markers = (
+            self._local_refusal_markers
+            if self._local_refusal_markers is not None
+            else self._DEFAULT_REFUSAL_MARKERS
+        )
 
     async def _pre_start(self):
         """Fetch shared stage settings, then start the API processing thread."""
@@ -652,6 +662,14 @@ class OpenAICompatibleWorker(CaptionWorker):
         if batch_size is None:
             batch_size = sum(state.config.max_concurrency for state in self.endpoint_pool.states)
         self.vllm_config["batch_size"] = max(1, int(batch_size))
+        if self._local_refusal_markers is not None:
+            self.refusal_markers = self._local_refusal_markers
+        elif "refusal_markers" in self.vllm_config:
+            self.refusal_markers = self._normalize_refusal_markers(
+                self.vllm_config["refusal_markers"]
+            )
+        else:
+            self.refusal_markers = self._DEFAULT_REFUSAL_MARKERS
 
     def _handle_vllm_config_update(self, new_config: Dict[str, Any]) -> bool:
         """Apply shared prompt/stage changes without touching local credentials."""
@@ -822,10 +840,17 @@ class OpenAICompatibleWorker(CaptionWorker):
             self.items_processed += 1
         return results
 
-    @classmethod
-    def _is_refusal_text(cls, text: str) -> bool:
-        normalized = text.strip().lower()
-        return any(marker in normalized for marker in cls._REFUSAL_MARKERS)
+    @staticmethod
+    def _normalize_refusal_markers(value: Any) -> Tuple[str, ...]:
+        if not isinstance(value, list) or any(
+            not isinstance(marker, str) or not marker.strip() for marker in value
+        ):
+            raise ValueError("refusal_markers must be a list of non-empty strings")
+        return tuple(dict.fromkeys(marker.strip().casefold() for marker in value))
+
+    def _is_refusal_text(self, text: str) -> bool:
+        normalized = text.strip().casefold()
+        return any(marker in normalized for marker in self.refusal_markers)
 
     @classmethod
     def _is_semantic_caption_failure(cls, error: Exception) -> bool:
