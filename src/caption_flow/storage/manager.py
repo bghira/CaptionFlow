@@ -772,6 +772,7 @@ class StorageManager:
         limit: Optional[int] = None,
         columns: Optional[List[str]] = None,
         include_metadata: bool = True,
+        shard_name: Optional[str] = None,
     ) -> StorageContents:
         """Get storage contents for export using DuckDB."""
         # Flush buffers first
@@ -798,12 +799,16 @@ class StorageManager:
                 column_str = ", ".join([f'"{c}"' for c in columns])
 
             query = f"SELECT {column_str} FROM captions"
+            parameters = []
+            if shard_name is not None:
+                query += " WHERE shard = ?"
+                parameters.append(shard_name)
             if limit:
                 query += f" LIMIT {limit}"
 
             logger.debug(f"Executing DuckDB query: {query}")
             # Execute query and fetch data
-            table = con.execute(query).to_arrow_table()
+            table = con.execute(query, parameters).to_arrow_table()
             logger.debug(f"Query executed successfully, got {table.num_rows} rows")
             rows = table.to_pylist()
             actual_columns = table.schema.names
@@ -1077,6 +1082,17 @@ class StorageManager:
         """Compatibility property for exporter - returns output fields for default shard."""
         return {"default": self.known_output_fields.copy()}
 
+    async def list_shards(self) -> List[str]:
+        """Return logical shard names stored in the combined captions dataset."""
+        await self.checkpoint()
+        if not self.captions_dataset or "shard" not in self.captions_dataset.schema.names:
+            return []
+
+        shard_names = set()
+        for batch in self.captions_dataset.to_batches(columns=["shard"], batch_size=65536):
+            shard_names.update(value for value in batch.column("shard").to_pylist() if value)
+        return sorted(shard_names)
+
     async def get_shard_contents(
         self,
         shard_name: str,
@@ -1084,18 +1100,10 @@ class StorageManager:
         columns: Optional[List[str]] = None,
         include_metadata: bool = True,
     ) -> StorageContents:
-        """Compatibility method for exporter - delegates to get_storage_contents for default shard."""
-        if shard_name != "default":
-            return StorageContents(
-                rows=[],
-                columns=[],
-                output_fields=list(self.known_output_fields),
-                total_rows=0,
-                metadata={
-                    "error": f"Shard '{shard_name}' not found. Only 'default' shard is supported."
-                },
-            )
-
+        """Return rows for one logical shard in the combined captions dataset."""
         return await self.get_storage_contents(
-            limit=limit, columns=columns, include_metadata=include_metadata
+            limit=limit,
+            columns=columns,
+            include_metadata=include_metadata,
+            shard_name=shard_name,
         )

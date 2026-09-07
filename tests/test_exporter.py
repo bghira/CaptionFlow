@@ -307,6 +307,66 @@ class TestLanceStorageExporter:
         assert jsonl_file.exists()
 
     @pytest.mark.asyncio
+    async def test_export_all_logical_shards_from_combined_lance_dataset(
+        self, temp_storage_dir, monkeypatch
+    ):
+        """Export rows by their logical shard column from one Lance dataset."""
+        storage = StorageManager(temp_storage_dir / "storage")
+        await storage.initialize()
+        assert await storage.list_shards() == []
+
+        for job_id, shard, filename in [
+            ("job-a1", "shard-a", "a1.jpg"),
+            ("job-a2", "shard-a", "a2.jpg"),
+            ("job-b1", "shard-b", "b1.jpg"),
+        ]:
+            await storage.save_caption(
+                Caption(
+                    job_id=job_id,
+                    dataset="test_dataset",
+                    shard=shard,
+                    item_key=Path(filename).stem,
+                    contributor_id="test_user",
+                    filename=filename,
+                    timestamp=datetime.now(),
+                    captions=[f"Caption for {filename}"],
+                    outputs={"captions": [f"Caption for {filename}"]},
+                )
+            )
+        await storage.checkpoint()
+
+        calls = {}
+
+        def write_captions_to_metadata(metadata_path, captions_by_sample):
+            calls[Path(metadata_path).name] = captions_by_sample
+            return len(captions_by_sample)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "webshart",
+            types.SimpleNamespace(write_captions_to_metadata=write_captions_to_metadata),
+        )
+        output_dir = temp_storage_dir / "metadata"
+        output_dir.mkdir()
+        (output_dir / "shard-a.json").write_text('{"files": {}}', encoding="utf-8")
+        (output_dir / "shard-b.json").write_text('{"files": {}}', encoding="utf-8")
+
+        exporter = LanceStorageExporter(storage)
+        results = await exporter.export_all_shards("webshart", output_dir)
+
+        assert results == {"shard-a": 2, "shard-b": 1}
+        assert set(calls["shard-a.json"]) == {"a1.jpg", "a2.jpg"}
+        assert set(calls["shard-b.json"]) == {"b1.jpg"}
+
+        calls.clear()
+        results = await exporter.export_all_shards(
+            "webshart", output_dir, shard_filter=["shard-b", "missing"]
+        )
+
+        assert results == {"shard-b": 1}
+        assert set(calls) == {"shard-b.json"}
+
+    @pytest.mark.asyncio
     async def test_export_with_column_filter(self, populated_storage_manager, temp_storage_dir):
         """Test exporting with specific columns."""
         storage = populated_storage_manager

@@ -151,10 +151,11 @@ class LanceStorageExporter:
 
         # Get shards to export
         await self.storage_manager.initialize()
+        available_shards = await self.storage_manager.list_shards()
         if shard_filter:
-            shards = [s for s in shard_filter if s in self.storage_manager.shard_datasets]
+            shards = [s for s in shard_filter if s in available_shards]
         else:
-            shards = list(self.storage_manager.shard_datasets.keys())
+            shards = available_shards
 
         logger.info(f"Exporting {len(shards)} shards to {format} format")
 
