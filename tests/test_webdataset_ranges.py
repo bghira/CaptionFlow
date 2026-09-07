@@ -786,6 +786,45 @@ class TestWebDatasetWorkerProcessor:
         assert worker_processor_real.dataset is not None
         assert worker_processor_real.loader is not None
 
+    def test_initialization_forwards_webshart_performance_settings(self, worker_config, temp_dir):
+        config_dict = {
+            **worker_config.config,
+            "dataset": {
+                **worker_config.config["dataset"],
+                "mock_results": False,
+            },
+            "cache_dir": str(temp_dir / "performance-cache"),
+            "webshart_parallel_downloads": 8,
+            "webshart_chunk_size_mb": 32,
+        }
+        dataset = Mock()
+
+        with (
+            patch(
+                "caption_flow.processors.webdataset.webshart.discover_dataset",
+                return_value=dataset,
+            ),
+            patch("caption_flow.processors.webdataset.webshart.TarDataLoader") as loader,
+        ):
+            processor = WebDatasetWorkerProcessor()
+            processor.gpu_id = 0
+            processor.initialize(ProcessorConfig(processor_type="webdataset", config=config_dict))
+
+        dataset.enable_shard_cache.assert_called_once_with(
+            location=str(temp_dir / "performance-cache" / "shard_cache" / "0"),
+            cache_limit_gb=1.0,
+            parallel_downloads=8,
+        )
+        loader.assert_called_once_with(
+            dataset,
+            buffer_size=10,
+            max_file_size=100 * 1024 * 1024,
+            load_file_data=True,
+            chunk_size_mb=32,
+        )
+        assert processor.webshart_parallel_downloads == 8
+        assert processor.webshart_chunk_size_mb == 32
+
     def test_mock_image_creation(self, worker_processor):
         """Test mock image creation produces different images."""
         img1 = worker_processor._create_mock_image(0)

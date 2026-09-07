@@ -624,6 +624,8 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.remote_range_timeout = 120.0
         self.remote_range_retries = 3
         self.decode_images = True
+        self.webshart_parallel_downloads = 4
+        self.webshart_chunk_size_mb = 10
         self._remote_shard_layouts: Dict[int, Dict[str, Any]] = {}
         self.http_session: Optional[requests.Session] = None
 
@@ -639,6 +641,8 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.remote_range_timeout = float(dataset_cfg.get("remote_range_timeout", 120))
         self.remote_range_retries = max(1, int(dataset_cfg.get("remote_range_retries", 3)))
         self.decode_images = bool(dataset_cfg.get("decode_images", True))
+        self.webshart_parallel_downloads = max(1, int(cfg.get("webshart_parallel_downloads", 4)))
+        self.webshart_chunk_size_mb = max(1, int(cfg.get("webshart_chunk_size_mb", 10)))
         split_worker_cache = dataset_cfg.get(
             "split_worker_cache", True
         )  # multiple workers get their own cache by default
@@ -663,6 +667,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                     else str(cache_dir / "shard_cache")
                 ),
                 cache_limit_gb=cfg.get("shard_cache_gb", 10.0),
+                parallel_downloads=self.webshart_parallel_downloads,
             )
 
             # Create loader
@@ -671,6 +676,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 buffer_size=cfg.get("buffer_size", 10),
                 max_file_size=cfg.get("max_file_size", 100 * 1024 * 1024),
                 load_file_data=True,
+                chunk_size_mb=self.webshart_chunk_size_mb,
             )
 
             if self.remote_range_reads:
