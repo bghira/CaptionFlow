@@ -933,20 +933,14 @@ class TestWebDatasetWorkerProcessor:
             metadata={"chunk_index": 0},
         )
 
-        # Mock the image decoding
+        # Mock the Rust-backed image decoding
         test_image = Image.new("RGB", (100, 100), color="red")
 
-        with patch("caption_flow.processors.webdataset.cv2.imdecode") as mock_decode:
-            with patch("caption_flow.processors.webdataset.cv2.cvtColor") as mock_convert:
-                with patch(
-                    "caption_flow.processors.webdataset.Image.fromarray",
-                    return_value=test_image,
-                ):
-                    # Mock cv2 processing chain
-                    mock_decode.return_value = "fake_cv2_image"
-                    mock_convert.return_value = "fake_rgb_array"
-
-                    results = list(worker_processor_real.process_unit(unit, {}))
+        with patch(
+            "caption_flow.processors.webdataset.ImageProcessor.decode_image_data",
+            return_value=test_image,
+        ) as mock_decode:
+            results = list(worker_processor_real.process_unit(unit, {}))
 
         assert len(results) == 3
 
@@ -965,6 +959,7 @@ class TestWebDatasetWorkerProcessor:
         assert "json_path" not in result["metadata"]
         assert result["metadata"]["_filename"] != "wrong.jpg"
         assert not result["metadata"].get("_mock", False)  # Should not have mock flag
+        assert mock_decode.call_count == 3
 
         # Verify loader was called correctly
         worker_processor_real.loader.load_sample.assert_any_call(0, 5)
@@ -1160,17 +1155,17 @@ class TestWebDatasetWorkerProcessor:
 
         test_image = Image.new("RGB", (50, 50))
 
-        with patch(
-            "caption_flow.processors.webdataset.webshart.next_with_cache_wait",
-            return_value=mock_entry,
+        with (
+            patch(
+                "caption_flow.processors.webdataset.webshart.next_with_cache_wait",
+                return_value=mock_entry,
+            ),
+            patch(
+                "caption_flow.processors.webdataset.ImageProcessor.decode_image_data",
+                return_value=test_image,
+            ),
         ):
-            with patch("caption_flow.processors.webdataset.Image.open", return_value=test_image):
-                # Simulate cv2 import error to test PIL fallback
-                with patch(
-                    "caption_flow.processors.webdataset.cv2.imdecode",
-                    side_effect=ImportError("cv2 not available"),
-                ):
-                    results = list(worker_processor_real.process_unit(unit, {}))
+            results = list(worker_processor_real.process_unit(unit, {}))
 
         assert len(results) == 1
 
@@ -1179,9 +1174,34 @@ class TestWebDatasetWorkerProcessor:
             filename="shard_unknown", cursor_idx=10
         )
 
-        # Should have used PIL fallback
         result = results[0]
         assert result["image"] == test_image
+
+    def test_process_unit_can_defer_image_decode(self, worker_processor_real):
+        """API workers can preserve encoded bytes for fused batch preprocessing."""
+        worker_processor_real.decode_images = False
+        mock_entry = Mock(data=b"encoded", path="test.jpg", size=7, metadata={})
+        worker_processor_real.loader.load_sample = Mock(return_value=mock_entry)
+        unit = WorkUnit(
+            unit_id="shard_0:chunk:0",
+            chunk_id="shard_0:chunk:0",
+            source_id="shard_0",
+            unit_size=1,
+            data={
+                "shard_name": "shard_0",
+                "shard_idx": 0,
+                "start_index": 0,
+                "unprocessed_ranges": [(0, 0)],
+            },
+            metadata={"chunk_index": 0},
+        )
+
+        with patch("caption_flow.processors.webdataset.ImageProcessor.decode_image_data") as decode:
+            [result] = list(worker_processor_real.process_unit(unit, {}))
+
+        decode.assert_not_called()
+        assert result["image"] is None
+        assert result["image_data"] == b"encoded"
 
     def test_get_dataset_info_mock_mode(self, worker_processor):
         """Test dataset info in mock mode."""

@@ -144,6 +144,20 @@ The worker token must match one of the orchestrator's `auth.worker_tokens`.
 When vLLM and the CaptionFlow worker run in different containers, replace
 `127.0.0.1` with a private, reachable vLLM address.
 
+For WebDataset runs, keep encoded samples intact until the worker has assembled
+a complete request batch:
+
+```yaml
+orchestrator:
+  dataset:
+    decode_images: false
+```
+
+The API worker will then use `trainingsample`'s Rust-backed fused batch
+decode/resize pipeline. This avoids decoding each sample once in the dataset
+reader and again while normalizing it for the endpoint. Pillow remains a
+per-image fallback for malformed or unsupported inputs.
+
 ## Configure caption generation
 
 The orchestrator owns the prompt and sampling configuration. This is the

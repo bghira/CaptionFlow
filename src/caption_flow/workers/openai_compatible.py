@@ -25,6 +25,7 @@ from PIL import Image
 
 from .. import __version__
 from ..models import ProcessingStage, StageResult
+from ..utils.image_processor import ImageProcessor
 from ..utils.prompt_template import PromptTemplateManager
 from .caption import CaptionWorker, ProcessingItem
 
@@ -688,8 +689,7 @@ class OpenAICompatibleWorker(CaptionWorker):
         active_batch = list(batch)
         image_urls: Dict[int, Optional[str]] = {}
         if self.include_image:
-            for item in active_batch:
-                image_urls[id(item)] = self._image_data_url(item)
+            image_urls = self._image_data_urls(active_batch)
 
         for stage_name in self.stage_order:
             stage = next(stage for stage in self.stages if stage.name == stage_name)
@@ -893,13 +893,10 @@ class OpenAICompatibleWorker(CaptionWorker):
             output = io.BytesIO()
             save_format = "JPEG" if target_format == "jpeg" else target_format.upper()
             if image is None:
-                image = Image.open(io.BytesIO(item.image_data))
+                image = ImageProcessor.decode_image_data(item.image_data)
             if self.max_image_dimension and max(image.size) > self.max_image_dimension:
-                image = image.copy()
-                image.thumbnail(
-                    (self.max_image_dimension, self.max_image_dimension),
-                    Image.Resampling.LANCZOS,
-                )
+                target_size = ImageProcessor.constrained_size(image.size, self.max_image_dimension)
+                image = ImageProcessor.resize_images([image], [target_size])[0]
             save_kwargs: Dict[str, Any] = {}
             if save_format == "JPEG":
                 if image.mode not in {"RGB", "L"}:
@@ -912,6 +909,60 @@ class OpenAICompatibleWorker(CaptionWorker):
 
         encoded = base64.b64encode(data).decode("ascii")
         return f"data:image/{target_format};base64,{encoded}"
+
+    def _image_data_urls(self, items: Iterable[ProcessingItem]) -> Dict[int, Optional[str]]:
+        """Encode a request batch, fusing byte decode and resize when possible."""
+        item_list = list(items)
+        results: Dict[int, Optional[str]] = {}
+        target_format = "jpeg" if self.image_format in {"jpg", "jpeg"} else self.image_format
+        fast_items: List[ProcessingItem] = []
+        fast_sizes: List[tuple[int, int]] = []
+
+        if target_format == "jpeg":
+            for item in item_list:
+                if item.image is not None or not item.image_data:
+                    continue
+                try:
+                    with Image.open(io.BytesIO(item.image_data)) as source:
+                        source_format = str(source.format or "").lower()
+                        source_size = source.size
+                    normalized_source = (
+                        "jpeg" if source_format in {"jpg", "jpeg"} else source_format
+                    )
+                    target_size = source_size
+                    if self.max_image_dimension:
+                        target_size = ImageProcessor.constrained_size(
+                            source_size, self.max_image_dimension
+                        )
+                    if normalized_source == "jpeg" and target_size == source_size:
+                        encoded = base64.b64encode(item.image_data).decode("ascii")
+                        results[id(item)] = f"data:image/jpeg;base64,{encoded}"
+                    else:
+                        fast_items.append(item)
+                        fast_sizes.append(target_size)
+                except (OSError, ValueError):
+                    continue
+
+        if fast_items:
+            try:
+                images = ImageProcessor.preprocess_encoded_batch(
+                    [item.image_data for item in fast_items], fast_sizes
+                )
+                for item, image in zip(fast_items, images, strict=True):
+                    output = io.BytesIO()
+                    image.save(output, format="JPEG", quality=self.image_quality)
+                    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+                    results[id(item)] = f"data:image/jpeg;base64,{encoded}"
+            except Exception:
+                logger.warning(
+                    "Rust batch image preprocessing failed; falling back to individual images",
+                    exc_info=True,
+                )
+
+        for item in item_list:
+            if id(item) not in results:
+                results[id(item)] = self._image_data_url(item)
+        return results
 
     def _get_heartbeat_data(self) -> Dict[str, Any]:
         data = super()._get_heartbeat_data()

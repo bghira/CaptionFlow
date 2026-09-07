@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from PIL import Image
 
 from caption_flow.workers.caption import ProcessingItem
+from caption_flow.utils.image_processor import ImageProcessor
 from caption_flow.workers.openai_compatible import (
     AdaptiveEndpointPool,
     ChatRequest,
@@ -491,6 +492,83 @@ def test_worker_disables_image_resize_for_non_positive_dimension():
         worker = OpenAICompatibleWorker(worker_config)
 
     assert worker.max_image_dimension is None
+
+
+def test_worker_fuses_encoded_image_batch_preprocessing():
+    worker_config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+            "max_image_dimension": 100,
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "provider-secret"}):
+        worker = OpenAICompatibleWorker(worker_config)
+
+    items = []
+    for index, size in enumerate(((200, 100), (100, 200))):
+        buffer = io.BytesIO()
+        Image.new("RGB", size, color="blue").save(buffer, format="PNG")
+        items.append(
+            ProcessingItem(
+                unit_id="unit",
+                job_id=f"job-{index}",
+                chunk_id="chunk",
+                item_key=f"image-{index}.png",
+                item_index=index,
+                image=None,
+                image_data=buffer.getvalue(),
+                metadata={},
+            )
+        )
+
+    with patch.object(
+        ImageProcessor,
+        "preprocess_encoded_batch",
+        wraps=ImageProcessor.preprocess_encoded_batch,
+    ) as preprocess:
+        urls = worker._image_data_urls(items)
+
+    preprocess.assert_called_once()
+    assert preprocess.call_args.args[1] == [(100, 50), (50, 100)]
+    for item, expected_size in zip(items, ((100, 50), (50, 100)), strict=True):
+        encoded = base64.b64decode(urls[id(item)].split(",", 1)[1])
+        with Image.open(io.BytesIO(encoded)) as image:
+            assert image.size == expected_size
+
+
+def test_worker_batch_preprocessing_falls_back_per_item():
+    worker_config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "provider-secret"}):
+        worker = OpenAICompatibleWorker(worker_config)
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), color="blue").save(buffer, format="PNG")
+    item = ProcessingItem(
+        unit_id="unit",
+        job_id="job",
+        chunk_id="chunk",
+        item_key="image.png",
+        item_index=0,
+        image=None,
+        image_data=buffer.getvalue(),
+        metadata={},
+    )
+    with (
+        patch.object(ImageProcessor, "preprocess_encoded_batch", side_effect=RuntimeError),
+        patch.object(worker, "_image_data_url", return_value="fallback") as fallback,
+    ):
+        assert worker._image_data_urls([item]) == {id(item): "fallback"}
+    fallback.assert_called_once_with(item)
 
 
 def test_worker_validates_config_and_applies_shared_updates():

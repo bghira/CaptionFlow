@@ -1042,7 +1042,7 @@ class CaptionWorker(BaseWorker):
         new_height = int(item.image.height * target_ratio)
 
         # Resize image
-        resized_image = item.image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        resized_image = ImageProcessor.resize_images([item.image], [(new_width, new_height)])[0]
 
         # Create new item with resized image
         new_item = ProcessingItem(

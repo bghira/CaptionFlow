@@ -1,7 +1,6 @@
 """WebDataset processor implementation using webshart TarDataLoader."""
 
 import gc
-import io
 import logging
 import os
 import threading
@@ -11,8 +10,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, Iterator, List, Optional, Set
 
-import cv2
-import numpy as np
 import requests
 import webshart
 from PIL import Image
@@ -21,6 +18,7 @@ from caption_flow.models import JobId
 from caption_flow.storage import StorageManager
 
 from ..utils import ChunkTracker
+from ..utils.image_processor import ImageProcessor
 from .base import OrchestratorProcessor, ProcessorConfig, WorkerProcessor, WorkResult, WorkUnit
 
 logger = logging.getLogger(__name__)
@@ -625,6 +623,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.remote_range_reads = False
         self.remote_range_timeout = 120.0
         self.remote_range_retries = 3
+        self.decode_images = True
         self._remote_shard_layouts: Dict[int, Dict[str, Any]] = {}
         self.http_session: Optional[requests.Session] = None
 
@@ -639,6 +638,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.remote_range_reads = bool(dataset_cfg.get("remote_range_reads", False))
         self.remote_range_timeout = float(dataset_cfg.get("remote_range_timeout", 120))
         self.remote_range_retries = max(1, int(dataset_cfg.get("remote_range_retries", 3)))
+        self.decode_images = bool(dataset_cfg.get("decode_images", True))
         split_worker_cache = dataset_cfg.get(
             "split_worker_cache", True
         )  # multiple workers get their own cache by default
@@ -835,28 +835,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
 
                             # Decode image
                             image = None
-                            if entry.data:
+                            if entry.data and self.decode_images:
                                 try:
-                                    # Use cv2 to decode from memory
-                                    nparr = np.frombuffer(entry.data, np.uint8)
-                                    img_np = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-                                    if img_np is not None:
-                                        # Convert from BGR (OpenCV default) to RGB (PIL default)
-                                        img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
-                                        image = Image.fromarray(img_rgb)
-                                    else:
-                                        logger.warning(f"cv2.imdecode failed for {entry.path}")
-
-                                except ImportError:
-                                    logger.warning(
-                                        "cv2 or numpy not installed, falling back to PIL"
-                                    )
-                                    image = Image.open(io.BytesIO(entry.data))
+                                    image = ImageProcessor.decode_image_data(entry.data)
                                 except Exception as img_e:
-                                    logger.error(
-                                        f"Error decoding image {entry.path} with cv2: {img_e}"
-                                    )
+                                    logger.error(f"Error decoding image {entry.path}: {img_e}")
 
                             # Generate job ID using JobId class
                             job_id = JobId.from_values(
