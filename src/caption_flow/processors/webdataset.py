@@ -130,6 +130,25 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         shards_summary = self.chunk_tracker.get_shards_summary()
         logger.info(f"Restoring work units from chunk tracker: {len(shards_summary)} shards")
 
+        # Resolve each current shard once. A checkpoint may describe an older
+        # version of a mutable dataset whose final chunk was larger.
+        incomplete_shards = {
+            shard_name
+            for shard_name, summary in shards_summary.items()
+            if any(chunk.status != "completed" for chunk in summary.get("chunks", []))
+        }
+        current_shards = {}
+        if self.dataset and incomplete_shards:
+            for shard_idx in range(self.dataset.num_shards):
+                current_info = self._get_shard_info_cached(shard_idx)
+                if not current_info or current_info.get("name") not in incomplete_shards:
+                    continue
+                sample_count = current_info.get("num_samples", current_info.get("num_files"))
+                if sample_count is not None:
+                    current_shards[current_info["name"]] = (shard_idx, sample_count)
+                if len(current_shards) == len(incomplete_shards):
+                    break
+
         with self.lock:
             restored_count = 0
             for shard_name, shard_info in shards_summary.items():
@@ -139,6 +158,23 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                     if chunk_state.status == "completed":
                         logger.debug(f"Skipping completed chunk {chunk_state.chunk_id}")
                         continue
+
+                    current_shard = current_shards.get(shard_name)
+                    if current_shard:
+                        _shard_idx, sample_count = current_shard
+                        current_size = max(
+                            0,
+                            min(chunk_state.chunk_size, sample_count - chunk_state.start_index),
+                        )
+                        if self.chunk_tracker.shrink_chunk(chunk_state.chunk_id, current_size):
+                            logger.warning(
+                                "Clamped restored chunk %s to %d samples "
+                                "using current shard bounds",
+                                chunk_state.chunk_id,
+                                current_size,
+                            )
+                        if chunk_state.status == "completed":
+                            continue
 
                     # Get unprocessed ranges
                     unprocessed_ranges = chunk_state.get_unprocessed_ranges()
@@ -161,19 +197,13 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         absolute_ranges.append((abs_start, abs_end))
 
                     # Get shard index if available
-                    shard_idx = None
-                    if self.dataset:
-                        for idx in range(self.dataset.num_shards):
-                            shard_info = self._get_shard_info_cached(idx)
-                            if shard_info and shard_info["name"] == shard_name:
-                                shard_idx = idx
-                                break
+                    shard_idx = current_shard[0] if current_shard else None
 
                     unit = WorkUnit(
                         unit_id=chunk_state.chunk_id,
                         chunk_id=chunk_state.chunk_id,
                         source_id=shard_name,
-                        unit_size=chunk_state.chunk_size,
+                        unit_size=sum(end - start + 1 for start, end in absolute_ranges),
                         data={
                             "shard_url": chunk_state.shard_url,
                             "shard_name": shard_name,
@@ -345,6 +375,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                         # Update the work unit's unprocessed ranges
                         unit.data["unprocessed_ranges"] = absolute_ranges
+                        unit.unit_size = sum(end - start + 1 for start, end in absolute_ranges)
 
                         logger.debug(
                             f"Updated unit {unit_id} with unprocessed ranges: {absolute_ranges}"

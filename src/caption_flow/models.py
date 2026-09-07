@@ -179,6 +179,12 @@ class ProcessingStage:
     dtype: Optional[str] = None
     gpu_memory_utilization: Optional[float] = None
 
+    # Optional semantic fallback for empty/refused caption responses. API
+    # workers can omit the image on the fallback request when an upstream
+    # provider rejects the image before inference.
+    retry_prompt: Optional[str] = None
+    retry_without_image: bool = False
+
 
 @dataclass
 class StageResult:

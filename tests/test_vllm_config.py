@@ -55,6 +55,8 @@ class TestVLLMConfigManagerInit:
         assert "tensor_parallel_size" in VLLMConfigManager.RELOAD_REQUIRED_FIELDS
         assert "batch_size" in VLLMConfigManager.RUNTIME_UPDATEABLE_FIELDS
         assert "sampling" in VLLMConfigManager.RUNTIME_UPDATEABLE_FIELDS
+        assert "retry_prompt" in VLLMConfigManager.RUNTIME_UPDATEABLE_FIELDS
+        assert "retry_without_image" in VLLMConfigManager.RUNTIME_UPDATEABLE_FIELDS
 
 
 class TestVLLMConfigManagerAnalyzeChange:

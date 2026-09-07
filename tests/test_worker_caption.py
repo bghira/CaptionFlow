@@ -255,6 +255,8 @@ class TestCaptionWorker:
         old_config = {
             "model": "single-model",
             "inference_prompts": ["Test prompt"],
+            "retry_prompt": "Fallback prompt",
+            "retry_without_image": True,
         }
 
         stages = caption_worker._parse_stages_config(old_config)
@@ -263,6 +265,8 @@ class TestCaptionWorker:
         assert stages[0].name == "default"
         assert stages[0].model == "single-model"
         assert stages[0].output_field == "captions"
+        assert stages[0].retry_prompt == "Fallback prompt"
+        assert stages[0].retry_without_image is True
 
     def test_topological_sort_stages(self, caption_worker):
         """Test dependency sorting of stages."""
@@ -950,9 +954,9 @@ class TestCaptionWorker:
                 work_failed_call = sent_data
                 break
 
-        assert work_failed_call is not None, (
-            "work_failed message should have been sent for incomplete unit"
-        )
+        assert (
+            work_failed_call is not None
+        ), "work_failed message should have been sent for incomplete unit"
         assert work_failed_call["unit_id"] == "unit1"
         assert "Processing incomplete" in work_failed_call["error"]
         assert "1/3 items processed" in work_failed_call["error"]

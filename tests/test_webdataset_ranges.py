@@ -163,6 +163,7 @@ class TestWebDatasetOrchestratorProcessor:
         # Should have the unprocessed ranges as absolute indices
         expected_ranges = [(10, 20), (50, 99)]
         assert unit.data["unprocessed_ranges"] == expected_ranges
+        assert unit.unit_size == 61
 
     def test_restore_state_skips_completed_chunks(self, orchestrator_processor, mock_storage):
         """Test that completed chunks are skipped during restoration."""
@@ -193,6 +194,63 @@ class TestWebDatasetOrchestratorProcessor:
         # Note: _restore_state only restores existing chunks, it doesn't create new chunks
         assert len(orchestrator_processor.work_units) == 0
         assert len(orchestrator_processor.pending_units) == 0
+
+    def test_restore_state_clamps_stale_final_chunk(self, orchestrator_processor, mock_storage):
+        """Restore only missing samples that still exist in the current shard."""
+        mock_storage.get_all_processed_job_ids.return_value = set()
+        processor = orchestrator_processor
+        processor.chunk_tracker.chunks.clear()
+        processor.work_units.clear()
+        processor.pending_units.clear()
+        processor.shard_info_cache[0] = {
+            "name": "shard_0",
+            "path": "shard_0.tar",
+            "num_samples": 75,
+            "num_files": 96,
+        }
+
+        chunk_id = "shard_0:chunk:2"
+        processor.chunk_tracker.add_chunk(chunk_id, "shard_0", "shard_0.tar", 64, 32)
+        processor.chunk_tracker.mark_items_processed(chunk_id, 64, 68)
+        processor.chunk_tracker.mark_items_processed(chunk_id, 70, 74)
+
+        processor._restore_state(mock_storage)
+
+        state = processor.chunk_tracker.chunks[chunk_id]
+        assert state.chunk_size == 11
+        assert state.processed_ranges == [(0, 4), (6, 10)]
+        assert state.get_unprocessed_ranges() == [(5, 5)]
+        assert processor.work_units[chunk_id].unit_size == 1
+        assert processor.work_units[chunk_id].data["chunk_size"] == 11
+        assert processor.work_units[chunk_id].data["unprocessed_ranges"] == [(69, 69)]
+
+    def test_restore_state_completes_stale_out_of_bounds_tail(
+        self, orchestrator_processor, mock_storage
+    ):
+        """A nonexistent tail must not keep an otherwise complete chunk pending."""
+        mock_storage.get_all_processed_job_ids.return_value = set()
+        processor = orchestrator_processor
+        processor.chunk_tracker.chunks.clear()
+        processor.work_units.clear()
+        processor.pending_units.clear()
+        processor.shard_info_cache[0] = {
+            "name": "shard_0",
+            "path": "shard_0.tar",
+            "num_samples": 75,
+            "num_files": 96,
+        }
+
+        chunk_id = "shard_0:chunk:2"
+        processor.chunk_tracker.add_chunk(chunk_id, "shard_0", "shard_0.tar", 64, 32)
+        processor.chunk_tracker.mark_items_processed(chunk_id, 64, 74)
+
+        processor._restore_state(mock_storage)
+
+        state = processor.chunk_tracker.chunks[chunk_id]
+        assert state.chunk_size == 11
+        assert state.status == "completed"
+        assert chunk_id not in processor.work_units
+        assert chunk_id not in processor.pending_units
 
     def test_work_unit_creation_basic(self, orchestrator_processor):
         """Test basic work unit creation logic by directly testing unit creation."""
@@ -277,6 +335,7 @@ class TestWebDatasetOrchestratorProcessor:
         # Should have updated unprocessed ranges to absolute indices
         expected_ranges = [(5, 15), (30, 40)]  # The gaps we left
         assert assigned_unit.data["unprocessed_ranges"] == expected_ranges
+        assert assigned_unit.unit_size == 22
 
     def test_work_unit_assignment_skips_completed_chunks(self, orchestrator_processor):
         """Test that work unit assignment skips chunks with no unprocessed ranges."""
