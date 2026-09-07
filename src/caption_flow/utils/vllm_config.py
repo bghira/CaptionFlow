@@ -41,6 +41,8 @@ class VLLMConfigManager:
         "batch_size",
         "sampling",
         "inference_prompts",
+        "retry_prompt",
+        "retry_without_image",
     }
 
     def __init__(self):

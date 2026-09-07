@@ -1,7 +1,6 @@
 """WebDataset processor implementation using webshart TarDataLoader."""
 
 import gc
-import io
 import logging
 import os
 import threading
@@ -11,8 +10,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, Iterator, List, Optional, Set
 
-import cv2
-import numpy as np
 import requests
 import webshart
 from PIL import Image
@@ -21,6 +18,7 @@ from caption_flow.models import JobId
 from caption_flow.storage import StorageManager
 
 from ..utils import ChunkTracker
+from ..utils.image_processor import ImageProcessor
 from .base import OrchestratorProcessor, ProcessorConfig, WorkerProcessor, WorkResult, WorkUnit
 
 logger = logging.getLogger(__name__)
@@ -130,6 +128,25 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         shards_summary = self.chunk_tracker.get_shards_summary()
         logger.info(f"Restoring work units from chunk tracker: {len(shards_summary)} shards")
 
+        # Resolve each current shard once. A checkpoint may describe an older
+        # version of a mutable dataset whose final chunk was larger.
+        incomplete_shards = {
+            shard_name
+            for shard_name, summary in shards_summary.items()
+            if any(chunk.status != "completed" for chunk in summary.get("chunks", []))
+        }
+        current_shards = {}
+        if self.dataset and incomplete_shards:
+            for shard_idx in range(self.dataset.num_shards):
+                current_info = self._get_shard_info_cached(shard_idx)
+                if not current_info or current_info.get("name") not in incomplete_shards:
+                    continue
+                sample_count = current_info.get("num_samples", current_info.get("num_files"))
+                if sample_count is not None:
+                    current_shards[current_info["name"]] = (shard_idx, sample_count)
+                if len(current_shards) == len(incomplete_shards):
+                    break
+
         with self.lock:
             restored_count = 0
             for shard_name, shard_info in shards_summary.items():
@@ -139,6 +156,23 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                     if chunk_state.status == "completed":
                         logger.debug(f"Skipping completed chunk {chunk_state.chunk_id}")
                         continue
+
+                    current_shard = current_shards.get(shard_name)
+                    if current_shard:
+                        _shard_idx, sample_count = current_shard
+                        current_size = max(
+                            0,
+                            min(chunk_state.chunk_size, sample_count - chunk_state.start_index),
+                        )
+                        if self.chunk_tracker.shrink_chunk(chunk_state.chunk_id, current_size):
+                            logger.warning(
+                                "Clamped restored chunk %s to %d samples "
+                                "using current shard bounds",
+                                chunk_state.chunk_id,
+                                current_size,
+                            )
+                        if chunk_state.status == "completed":
+                            continue
 
                     # Get unprocessed ranges
                     unprocessed_ranges = chunk_state.get_unprocessed_ranges()
@@ -161,19 +195,13 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         absolute_ranges.append((abs_start, abs_end))
 
                     # Get shard index if available
-                    shard_idx = None
-                    if self.dataset:
-                        for idx in range(self.dataset.num_shards):
-                            shard_info = self._get_shard_info_cached(idx)
-                            if shard_info and shard_info["name"] == shard_name:
-                                shard_idx = idx
-                                break
+                    shard_idx = current_shard[0] if current_shard else None
 
                     unit = WorkUnit(
                         unit_id=chunk_state.chunk_id,
                         chunk_id=chunk_state.chunk_id,
                         source_id=shard_name,
-                        unit_size=chunk_state.chunk_size,
+                        unit_size=sum(end - start + 1 for start, end in absolute_ranges),
                         data={
                             "shard_url": chunk_state.shard_url,
                             "shard_name": shard_name,
@@ -345,6 +373,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                         # Update the work unit's unprocessed ranges
                         unit.data["unprocessed_ranges"] = absolute_ranges
+                        unit.unit_size = sum(end - start + 1 for start, end in absolute_ranges)
 
                         logger.debug(
                             f"Updated unit {unit_id} with unprocessed ranges: {absolute_ranges}"
@@ -594,6 +623,9 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.remote_range_reads = False
         self.remote_range_timeout = 120.0
         self.remote_range_retries = 3
+        self.decode_images = True
+        self.webshart_parallel_downloads = 4
+        self.webshart_chunk_size_mb = 10
         self._remote_shard_layouts: Dict[int, Dict[str, Any]] = {}
         self.http_session: Optional[requests.Session] = None
 
@@ -608,6 +640,9 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.remote_range_reads = bool(dataset_cfg.get("remote_range_reads", False))
         self.remote_range_timeout = float(dataset_cfg.get("remote_range_timeout", 120))
         self.remote_range_retries = max(1, int(dataset_cfg.get("remote_range_retries", 3)))
+        self.decode_images = bool(dataset_cfg.get("decode_images", True))
+        self.webshart_parallel_downloads = max(1, int(cfg.get("webshart_parallel_downloads", 4)))
+        self.webshart_chunk_size_mb = max(1, int(cfg.get("webshart_chunk_size_mb", 10)))
         split_worker_cache = dataset_cfg.get(
             "split_worker_cache", True
         )  # multiple workers get their own cache by default
@@ -632,6 +667,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                     else str(cache_dir / "shard_cache")
                 ),
                 cache_limit_gb=cfg.get("shard_cache_gb", 10.0),
+                parallel_downloads=self.webshart_parallel_downloads,
             )
 
             # Create loader
@@ -640,6 +676,7 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 buffer_size=cfg.get("buffer_size", 10),
                 max_file_size=cfg.get("max_file_size", 100 * 1024 * 1024),
                 load_file_data=True,
+                chunk_size_mb=self.webshart_chunk_size_mb,
             )
 
             if self.remote_range_reads:
@@ -804,28 +841,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
 
                             # Decode image
                             image = None
-                            if entry.data:
+                            if entry.data and self.decode_images:
                                 try:
-                                    # Use cv2 to decode from memory
-                                    nparr = np.frombuffer(entry.data, np.uint8)
-                                    img_np = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-                                    if img_np is not None:
-                                        # Convert from BGR (OpenCV default) to RGB (PIL default)
-                                        img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
-                                        image = Image.fromarray(img_rgb)
-                                    else:
-                                        logger.warning(f"cv2.imdecode failed for {entry.path}")
-
-                                except ImportError:
-                                    logger.warning(
-                                        "cv2 or numpy not installed, falling back to PIL"
-                                    )
-                                    image = Image.open(io.BytesIO(entry.data))
+                                    image = ImageProcessor.decode_image_data(entry.data)
                                 except Exception as img_e:
-                                    logger.error(
-                                        f"Error decoding image {entry.path} with cv2: {img_e}"
-                                    )
+                                    logger.error(f"Error decoding image {entry.path}: {img_e}")
 
                             # Generate job ID using JobId class
                             job_id = JobId.from_values(

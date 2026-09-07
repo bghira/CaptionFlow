@@ -163,6 +163,7 @@ class TestWebDatasetOrchestratorProcessor:
         # Should have the unprocessed ranges as absolute indices
         expected_ranges = [(10, 20), (50, 99)]
         assert unit.data["unprocessed_ranges"] == expected_ranges
+        assert unit.unit_size == 61
 
     def test_restore_state_skips_completed_chunks(self, orchestrator_processor, mock_storage):
         """Test that completed chunks are skipped during restoration."""
@@ -193,6 +194,63 @@ class TestWebDatasetOrchestratorProcessor:
         # Note: _restore_state only restores existing chunks, it doesn't create new chunks
         assert len(orchestrator_processor.work_units) == 0
         assert len(orchestrator_processor.pending_units) == 0
+
+    def test_restore_state_clamps_stale_final_chunk(self, orchestrator_processor, mock_storage):
+        """Restore only missing samples that still exist in the current shard."""
+        mock_storage.get_all_processed_job_ids.return_value = set()
+        processor = orchestrator_processor
+        processor.chunk_tracker.chunks.clear()
+        processor.work_units.clear()
+        processor.pending_units.clear()
+        processor.shard_info_cache[0] = {
+            "name": "shard_0",
+            "path": "shard_0.tar",
+            "num_samples": 75,
+            "num_files": 96,
+        }
+
+        chunk_id = "shard_0:chunk:2"
+        processor.chunk_tracker.add_chunk(chunk_id, "shard_0", "shard_0.tar", 64, 32)
+        processor.chunk_tracker.mark_items_processed(chunk_id, 64, 68)
+        processor.chunk_tracker.mark_items_processed(chunk_id, 70, 74)
+
+        processor._restore_state(mock_storage)
+
+        state = processor.chunk_tracker.chunks[chunk_id]
+        assert state.chunk_size == 11
+        assert state.processed_ranges == [(0, 4), (6, 10)]
+        assert state.get_unprocessed_ranges() == [(5, 5)]
+        assert processor.work_units[chunk_id].unit_size == 1
+        assert processor.work_units[chunk_id].data["chunk_size"] == 11
+        assert processor.work_units[chunk_id].data["unprocessed_ranges"] == [(69, 69)]
+
+    def test_restore_state_completes_stale_out_of_bounds_tail(
+        self, orchestrator_processor, mock_storage
+    ):
+        """A nonexistent tail must not keep an otherwise complete chunk pending."""
+        mock_storage.get_all_processed_job_ids.return_value = set()
+        processor = orchestrator_processor
+        processor.chunk_tracker.chunks.clear()
+        processor.work_units.clear()
+        processor.pending_units.clear()
+        processor.shard_info_cache[0] = {
+            "name": "shard_0",
+            "path": "shard_0.tar",
+            "num_samples": 75,
+            "num_files": 96,
+        }
+
+        chunk_id = "shard_0:chunk:2"
+        processor.chunk_tracker.add_chunk(chunk_id, "shard_0", "shard_0.tar", 64, 32)
+        processor.chunk_tracker.mark_items_processed(chunk_id, 64, 74)
+
+        processor._restore_state(mock_storage)
+
+        state = processor.chunk_tracker.chunks[chunk_id]
+        assert state.chunk_size == 11
+        assert state.status == "completed"
+        assert chunk_id not in processor.work_units
+        assert chunk_id not in processor.pending_units
 
     def test_work_unit_creation_basic(self, orchestrator_processor):
         """Test basic work unit creation logic by directly testing unit creation."""
@@ -277,6 +335,7 @@ class TestWebDatasetOrchestratorProcessor:
         # Should have updated unprocessed ranges to absolute indices
         expected_ranges = [(5, 15), (30, 40)]  # The gaps we left
         assert assigned_unit.data["unprocessed_ranges"] == expected_ranges
+        assert assigned_unit.unit_size == 22
 
     def test_work_unit_assignment_skips_completed_chunks(self, orchestrator_processor):
         """Test that work unit assignment skips chunks with no unprocessed ranges."""
@@ -727,6 +786,45 @@ class TestWebDatasetWorkerProcessor:
         assert worker_processor_real.dataset is not None
         assert worker_processor_real.loader is not None
 
+    def test_initialization_forwards_webshart_performance_settings(self, worker_config, temp_dir):
+        config_dict = {
+            **worker_config.config,
+            "dataset": {
+                **worker_config.config["dataset"],
+                "mock_results": False,
+            },
+            "cache_dir": str(temp_dir / "performance-cache"),
+            "webshart_parallel_downloads": 8,
+            "webshart_chunk_size_mb": 32,
+        }
+        dataset = Mock()
+
+        with (
+            patch(
+                "caption_flow.processors.webdataset.webshart.discover_dataset",
+                return_value=dataset,
+            ),
+            patch("caption_flow.processors.webdataset.webshart.TarDataLoader") as loader,
+        ):
+            processor = WebDatasetWorkerProcessor()
+            processor.gpu_id = 0
+            processor.initialize(ProcessorConfig(processor_type="webdataset", config=config_dict))
+
+        dataset.enable_shard_cache.assert_called_once_with(
+            location=str(temp_dir / "performance-cache" / "shard_cache" / "0"),
+            cache_limit_gb=1.0,
+            parallel_downloads=8,
+        )
+        loader.assert_called_once_with(
+            dataset,
+            buffer_size=10,
+            max_file_size=100 * 1024 * 1024,
+            load_file_data=True,
+            chunk_size_mb=32,
+        )
+        assert processor.webshart_parallel_downloads == 8
+        assert processor.webshart_chunk_size_mb == 32
+
     def test_mock_image_creation(self, worker_processor):
         """Test mock image creation produces different images."""
         img1 = worker_processor._create_mock_image(0)
@@ -874,20 +972,14 @@ class TestWebDatasetWorkerProcessor:
             metadata={"chunk_index": 0},
         )
 
-        # Mock the image decoding
+        # Mock the Rust-backed image decoding
         test_image = Image.new("RGB", (100, 100), color="red")
 
-        with patch("caption_flow.processors.webdataset.cv2.imdecode") as mock_decode:
-            with patch("caption_flow.processors.webdataset.cv2.cvtColor") as mock_convert:
-                with patch(
-                    "caption_flow.processors.webdataset.Image.fromarray",
-                    return_value=test_image,
-                ):
-                    # Mock cv2 processing chain
-                    mock_decode.return_value = "fake_cv2_image"
-                    mock_convert.return_value = "fake_rgb_array"
-
-                    results = list(worker_processor_real.process_unit(unit, {}))
+        with patch(
+            "caption_flow.processors.webdataset.ImageProcessor.decode_image_data",
+            return_value=test_image,
+        ) as mock_decode:
+            results = list(worker_processor_real.process_unit(unit, {}))
 
         assert len(results) == 3
 
@@ -906,6 +998,7 @@ class TestWebDatasetWorkerProcessor:
         assert "json_path" not in result["metadata"]
         assert result["metadata"]["_filename"] != "wrong.jpg"
         assert not result["metadata"].get("_mock", False)  # Should not have mock flag
+        assert mock_decode.call_count == 3
 
         # Verify loader was called correctly
         worker_processor_real.loader.load_sample.assert_any_call(0, 5)
@@ -1101,17 +1194,17 @@ class TestWebDatasetWorkerProcessor:
 
         test_image = Image.new("RGB", (50, 50))
 
-        with patch(
-            "caption_flow.processors.webdataset.webshart.next_with_cache_wait",
-            return_value=mock_entry,
+        with (
+            patch(
+                "caption_flow.processors.webdataset.webshart.next_with_cache_wait",
+                return_value=mock_entry,
+            ),
+            patch(
+                "caption_flow.processors.webdataset.ImageProcessor.decode_image_data",
+                return_value=test_image,
+            ),
         ):
-            with patch("caption_flow.processors.webdataset.Image.open", return_value=test_image):
-                # Simulate cv2 import error to test PIL fallback
-                with patch(
-                    "caption_flow.processors.webdataset.cv2.imdecode",
-                    side_effect=ImportError("cv2 not available"),
-                ):
-                    results = list(worker_processor_real.process_unit(unit, {}))
+            results = list(worker_processor_real.process_unit(unit, {}))
 
         assert len(results) == 1
 
@@ -1120,9 +1213,34 @@ class TestWebDatasetWorkerProcessor:
             filename="shard_unknown", cursor_idx=10
         )
 
-        # Should have used PIL fallback
         result = results[0]
         assert result["image"] == test_image
+
+    def test_process_unit_can_defer_image_decode(self, worker_processor_real):
+        """API workers can preserve encoded bytes for fused batch preprocessing."""
+        worker_processor_real.decode_images = False
+        mock_entry = Mock(data=b"encoded", path="test.jpg", size=7, metadata={})
+        worker_processor_real.loader.load_sample = Mock(return_value=mock_entry)
+        unit = WorkUnit(
+            unit_id="shard_0:chunk:0",
+            chunk_id="shard_0:chunk:0",
+            source_id="shard_0",
+            unit_size=1,
+            data={
+                "shard_name": "shard_0",
+                "shard_idx": 0,
+                "start_index": 0,
+                "unprocessed_ranges": [(0, 0)],
+            },
+            metadata={"chunk_index": 0},
+        )
+
+        with patch("caption_flow.processors.webdataset.ImageProcessor.decode_image_data") as decode:
+            [result] = list(worker_processor_real.process_unit(unit, {}))
+
+        decode.assert_not_called()
+        assert result["image"] is None
+        assert result["image_data"] == b"encoded"
 
     def test_get_dataset_info_mock_mode(self, worker_processor):
         """Test dataset info in mock mode."""

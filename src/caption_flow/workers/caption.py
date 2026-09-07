@@ -515,6 +515,8 @@ class CaptionWorker(BaseWorker):
                     prompts=vllm_config.get("inference_prompts", ["describe this image"]),
                     output_field="captions",
                     requires=[],
+                    retry_prompt=vllm_config.get("retry_prompt"),
+                    retry_without_image=bool(vllm_config.get("retry_without_image", False)),
                 )
             ]
 
@@ -532,6 +534,13 @@ class CaptionWorker(BaseWorker):
                 max_model_len=stage_cfg.get("max_model_len"),
                 dtype=stage_cfg.get("dtype"),
                 gpu_memory_utilization=stage_cfg.get("gpu_memory_utilization"),
+                retry_prompt=stage_cfg.get("retry_prompt", vllm_config.get("retry_prompt")),
+                retry_without_image=bool(
+                    stage_cfg.get(
+                        "retry_without_image",
+                        vllm_config.get("retry_without_image", False),
+                    )
+                ),
             )
             stages.append(stage)
 
@@ -1033,7 +1042,7 @@ class CaptionWorker(BaseWorker):
         new_height = int(item.image.height * target_ratio)
 
         # Resize image
-        resized_image = item.image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        resized_image = ImageProcessor.resize_images([item.image], [(new_width, new_height)])[0]
 
         # Create new item with resized image
         new_item = ProcessingItem(

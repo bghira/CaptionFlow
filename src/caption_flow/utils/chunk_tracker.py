@@ -369,6 +369,39 @@ class ChunkTracker(CheckpointTracker):
             if self._completed_count % 50 == 0:
                 self._limit_completed_chunks_in_memory()
 
+    def shrink_chunk(self, chunk_id: str, chunk_size: int) -> bool:
+        """Shrink a chunk to the source's current bounds.
+
+        Checkpoints can outlive a mutable remote dataset.  Keep already
+        processed indices that still exist and complete the chunk when the
+        remaining range consisted only of indices past the end of the shard.
+        """
+        if chunk_size < 0:
+            raise ValueError("chunk_size must be non-negative")
+
+        chunk = self.chunks.get(chunk_id)
+        if not chunk or chunk_size >= chunk.chunk_size:
+            return False
+
+        clamped_ranges = [
+            (max(0, start), min(end, chunk_size - 1))
+            for start, end in chunk.processed_ranges
+            if start < chunk_size and end >= 0
+        ]
+        chunk.chunk_size = chunk_size
+        chunk.processed_ranges = chunk._merge_ranges(clamped_ranges)
+        chunk.processed_count = sum(end - start + 1 for start, end in chunk.processed_ranges)
+        chunk._invalidate_cache()
+
+        if chunk.processed_count >= chunk_size:
+            was_completed = chunk.status == "completed"
+            chunk.mark_completed()
+            if not was_completed:
+                self._completed_count += 1
+
+        self._mark_dirty()
+        return True
+
     def mark_failed(self, chunk_id: str):
         """Mark chunk as failed."""
         if chunk_id in self.chunks:

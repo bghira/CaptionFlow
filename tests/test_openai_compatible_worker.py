@@ -1,6 +1,7 @@
 """Tests for the BYOK OpenAI-compatible caption worker."""
 
 import asyncio
+import base64
 import io
 import os
 from unittest.mock import AsyncMock, patch
@@ -10,6 +11,7 @@ from click.testing import CliRunner
 from PIL import Image
 
 from caption_flow.workers.caption import ProcessingItem
+from caption_flow.utils.image_processor import ImageProcessor
 from caption_flow.workers.openai_compatible import (
     AdaptiveEndpointPool,
     ChatRequest,
@@ -421,7 +423,11 @@ def test_worker_image_encoding_handles_passthrough_conversion_and_missing_data()
         image_data=png_buffer.getvalue(),
         metadata={},
     )
+    assert worker._image_data_url(passthrough).startswith("data:image/jpeg;base64,")
+
+    worker.image_format = "png"
     assert worker._image_data_url(passthrough).startswith("data:image/png;base64,")
+    worker.image_format = "jpeg"
 
     converted = ProcessingItem(
         unit_id="unit",
@@ -438,6 +444,131 @@ def test_worker_image_encoding_handles_passthrough_conversion_and_missing_data()
     converted.image = None
     with pytest.raises(ValueError, match="has no image data"):
         worker._image_data_url(converted)
+
+
+def test_worker_resizes_large_images_before_encoding():
+    worker_config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+            "max_image_dimension": 1024,
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "provider-secret"}):
+        worker = OpenAICompatibleWorker(worker_config)
+
+    jpeg_buffer = io.BytesIO()
+    Image.new("RGB", (2400, 1600), color="green").save(jpeg_buffer, format="JPEG")
+    item = ProcessingItem(
+        unit_id="unit",
+        job_id="job",
+        chunk_id="chunk",
+        item_key="large.jpg",
+        item_index=0,
+        image=None,
+        image_data=jpeg_buffer.getvalue(),
+        metadata={},
+    )
+
+    encoded = worker._image_data_url(item)
+    encoded_bytes = base64.b64decode(encoded.split(",", 1)[1])
+    with Image.open(io.BytesIO(encoded_bytes)) as resized:
+        assert resized.size == (1024, 683)
+
+
+def test_worker_disables_image_resize_for_non_positive_dimension():
+    worker_config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+            "max_image_dimension": -1,
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "provider-secret"}):
+        worker = OpenAICompatibleWorker(worker_config)
+
+    assert worker.max_image_dimension is None
+
+
+def test_worker_fuses_encoded_image_batch_preprocessing():
+    worker_config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+            "max_image_dimension": 100,
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "provider-secret"}):
+        worker = OpenAICompatibleWorker(worker_config)
+
+    items = []
+    for index, size in enumerate(((200, 100), (100, 200))):
+        buffer = io.BytesIO()
+        Image.new("RGB", size, color="blue").save(buffer, format="PNG")
+        items.append(
+            ProcessingItem(
+                unit_id="unit",
+                job_id=f"job-{index}",
+                chunk_id="chunk",
+                item_key=f"image-{index}.png",
+                item_index=index,
+                image=None,
+                image_data=buffer.getvalue(),
+                metadata={},
+            )
+        )
+
+    with patch.object(
+        ImageProcessor,
+        "preprocess_encoded_batch",
+        wraps=ImageProcessor.preprocess_encoded_batch,
+    ) as preprocess:
+        urls = worker._image_data_urls(items)
+
+    preprocess.assert_called_once()
+    assert preprocess.call_args.args[1] == [(100, 50), (50, 100)]
+    for item, expected_size in zip(items, ((100, 50), (50, 100)), strict=True):
+        encoded = base64.b64decode(urls[id(item)].split(",", 1)[1])
+        with Image.open(io.BytesIO(encoded)) as image:
+            assert image.size == expected_size
+
+
+def test_worker_batch_preprocessing_falls_back_per_item():
+    worker_config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "provider-secret"}):
+        worker = OpenAICompatibleWorker(worker_config)
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), color="blue").save(buffer, format="PNG")
+    item = ProcessingItem(
+        unit_id="unit",
+        job_id="job",
+        chunk_id="chunk",
+        item_key="image.png",
+        item_index=0,
+        image=None,
+        image_data=buffer.getvalue(),
+        metadata={},
+    )
+    with (
+        patch.object(ImageProcessor, "preprocess_encoded_batch", side_effect=RuntimeError),
+        patch.object(worker, "_image_data_url", return_value="fallback") as fallback,
+    ):
+        assert worker._image_data_urls([item]) == {id(item): "fallback"}
+    fallback.assert_called_once_with(item)
 
 
 def test_worker_validates_config_and_applies_shared_updates():
@@ -521,6 +652,115 @@ def test_worker_runs_shared_caption_stage_through_endpoint_pool():
     assert request.requested_model == "shared-model"
     assert request.parameters == {"max_tokens": 123}
     assert request.image_data_url.startswith("data:image/jpeg;base64,")
+
+
+def test_worker_retries_policy_rejection_with_metadata_and_without_image():
+    worker_config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "batch_image_processing": False,
+        "openai_compatible": {
+            "endpoints": [
+                {
+                    "base_url": "https://provider.example/v1",
+                    "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+                    "model": "provider-vision-model",
+                }
+            ]
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "provider-secret"}):
+        worker = OpenAICompatibleWorker(worker_config)
+
+    worker.vllm_config = {
+        "model": "shared-model",
+        "inference_prompts": ["Describe this image"],
+        "retry_prompt": "Rewrite neutrally: {column:captions}",
+        "retry_without_image": True,
+    }
+    worker.stages = worker._parse_stages_config(worker.vllm_config)
+    worker.stage_order = worker._topological_sort_stages(worker.stages)
+    policy_error = EndpointRequestError(
+        "provider",
+        400,
+        '{"contentFilter": [{"level": 2}], "error": "unsafe or sensitive content"}',
+        {},
+    )
+    worker.endpoint_pool.run_many = AsyncMock(
+        side_effect=[[policy_error], ["A woman sits among fallen leaves in a forest."]]
+    )
+    worker.api_loop = asyncio.new_event_loop()
+    item = ProcessingItem(
+        unit_id="unit",
+        job_id="shard:chunk:0:idx:6",
+        chunk_id="chunk",
+        item_key="image.png",
+        item_index=6,
+        image=Image.new("RGB", (2, 2), color="red"),
+        image_data=b"",
+        metadata={"captions": "A woman sits in a forest."},
+    )
+
+    try:
+        results = worker._process_batch_multi_stage([item])
+    finally:
+        worker.api_loop.close()
+
+    assert results == [(item, {"captions": ["A woman sits among fallen leaves in a forest."]})]
+    assert worker.endpoint_pool.run_many.await_count == 2
+    first_request = worker.endpoint_pool.run_many.await_args_list[0].args[0][0]
+    retry_request = worker.endpoint_pool.run_many.await_args_list[1].args[0][0]
+    assert first_request.image_data_url.startswith("data:image/jpeg;base64,")
+    assert retry_request.prompt == "Rewrite neutrally: A woman sits in a forest."
+    assert retry_request.image_data_url is None
+
+
+def test_worker_retries_empty_refusal_but_not_unrelated_request_error():
+    worker_config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "provider-secret"}):
+        worker = OpenAICompatibleWorker(worker_config)
+
+    worker.vllm_config = {
+        "model": "vision",
+        "inference_prompts": ["Describe"],
+        "retry_prompt": "Try a neutral description",
+    }
+    worker.stages = worker._parse_stages_config(worker.vllm_config)
+    worker.stage_order = worker._topological_sort_stages(worker.stages)
+    worker.endpoint_pool.run_many = AsyncMock(
+        side_effect=[["I'm sorry, I cannot describe this image."], ["A neutral caption."]]
+    )
+    worker.api_loop = asyncio.new_event_loop()
+    item = ProcessingItem(
+        unit_id="unit",
+        job_id="job",
+        chunk_id="chunk",
+        item_key="image.png",
+        item_index=0,
+        image=Image.new("RGB", (2, 2), color="red"),
+        image_data=b"",
+        metadata={},
+    )
+
+    try:
+        results = worker._process_batch_multi_stage([item])
+    finally:
+        worker.api_loop.close()
+
+    assert results == [(item, {"captions": ["A neutral caption."]})]
+    retry_request = worker.endpoint_pool.run_many.await_args_list[1].args[0][0]
+    assert retry_request.image_data_url.startswith("data:image/jpeg;base64,")
+    assert worker._is_semantic_caption_failure(ValueError("returned no message content"))
+    assert not worker._is_semantic_caption_failure(
+        EndpointRequestError("provider", 400, "invalid request", {})
+    )
 
 
 def test_cli_selects_openai_compatible_worker():

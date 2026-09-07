@@ -25,6 +25,7 @@ from PIL import Image
 
 from .. import __version__
 from ..models import ProcessingStage, StageResult
+from ..utils.image_processor import ImageProcessor
 from ..utils.prompt_template import PromptTemplateManager
 from .caption import CaptionWorker, ProcessingItem
 
@@ -565,6 +566,31 @@ class OpenAICompatibleWorker(CaptionWorker):
         "presence_penalty",
         "seed",
     }
+    _REFUSAL_MARKERS = (
+        "i'm sorry",
+        "i’m sorry",
+        "i cannot",
+        "i can't",
+        "i can’t",
+        "unable to provide",
+        "unable to describe",
+        "cannot provide",
+        "can't provide",
+        "can’t provide",
+        "cannot assist",
+        "can't assist",
+        "can’t assist",
+    )
+    _POLICY_ERROR_MARKERS = (
+        "contentfilter",
+        "content filter",
+        "content policy",
+        "content_policy",
+        "moderation",
+        "policy violation",
+        "safety system",
+        "unsafe or sensitive",
+    )
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
@@ -593,6 +619,8 @@ class OpenAICompatibleWorker(CaptionWorker):
         self.image_detail = raw_config.get("image_detail", "auto")
         self.image_format = str(raw_config.get("image_format", "jpeg")).lower()
         self.image_quality = int(raw_config.get("image_quality", 90))
+        configured_dimension = int(raw_config.get("max_image_dimension", 0) or 0)
+        self.max_image_dimension = configured_dimension if configured_dimension > 0 else None
 
     async def _pre_start(self):
         """Fetch shared stage settings, then start the API processing thread."""
@@ -661,8 +689,7 @@ class OpenAICompatibleWorker(CaptionWorker):
         active_batch = list(batch)
         image_urls: Dict[int, Optional[str]] = {}
         if self.include_image:
-            for item in active_batch:
-                image_urls[id(item)] = self._image_data_url(item)
+            image_urls = self._image_data_urls(active_batch)
 
         for stage_name in self.stage_order:
             stage = next(stage for stage in self.stages if stage.name == stage_name)
@@ -671,13 +698,7 @@ class OpenAICompatibleWorker(CaptionWorker):
             sampling = self._sampling_for_stage(stage)
 
             for item in active_batch:
-                context = dict(item.metadata)
-                for previous_name, result in item.stage_results.items():
-                    for index, output in enumerate(result.outputs):
-                        context[f"{previous_name}_output_{index}"] = output
-                    context[result.output_field] = (
-                        result.outputs[0] if len(result.outputs) == 1 else result.outputs
-                    )
+                context = self._stage_context(item)
 
                 for prompt in PromptTemplateManager(stage.prompts).format_all(context):
                     requests.append(
@@ -692,8 +713,10 @@ class OpenAICompatibleWorker(CaptionWorker):
                     )
                     owners.append(item)
 
+            api_started = time.monotonic()
             responses = self.api_loop.run_until_complete(self.endpoint_pool.run_many(requests))
             outputs_by_item: Dict[int, List[str]] = defaultdict(list)
+            retryable_item_ids = set()
             for owner, response in zip(owners, responses, strict=True):
                 if isinstance(response, Exception):
                     logger.error(
@@ -702,10 +725,76 @@ class OpenAICompatibleWorker(CaptionWorker):
                         stage_name,
                         response,
                     )
+                    if self._is_semantic_caption_failure(response):
+                        retryable_item_ids.add(id(owner))
                     continue
                 cleaned = self._clean_output(response)
-                if cleaned:
+                if cleaned and not self._is_refusal_text(cleaned):
                     outputs_by_item[id(owner)].append(cleaned)
+                else:
+                    retryable_item_ids.add(id(owner))
+
+            retry_items = [
+                item
+                for item in active_batch
+                if id(item) in retryable_item_ids
+                and not outputs_by_item.get(id(item))
+                and stage.retry_prompt
+            ]
+            if retry_items:
+                retry_requests = []
+                for item in retry_items:
+                    context = self._stage_context(item)
+                    retry_prompt = PromptTemplateManager([stage.retry_prompt]).format_all(context)[
+                        0
+                    ]
+                    retry_requests.append(
+                        ChatRequest(
+                            prompt=retry_prompt,
+                            image_data_url=(
+                                None if stage.retry_without_image else image_urls.get(id(item))
+                            ),
+                            requested_model=stage.model,
+                            parameters=sampling,
+                            system_prompt=self.system_prompt,
+                            image_detail=self.image_detail,
+                        )
+                    )
+
+                logger.info(
+                    "Retrying %d empty or refused caption(s) in stage %s%s",
+                    len(retry_items),
+                    stage_name,
+                    " without images" if stage.retry_without_image else "",
+                )
+                retry_responses = self.api_loop.run_until_complete(
+                    self.endpoint_pool.run_many(retry_requests)
+                )
+                for item, response in zip(retry_items, retry_responses, strict=True):
+                    if isinstance(response, Exception):
+                        logger.error(
+                            "Fallback API request failed for item %s in stage %s: %s",
+                            item.item_key,
+                            stage_name,
+                            response,
+                        )
+                        continue
+                    cleaned = self._clean_output(response)
+                    if cleaned and not self._is_refusal_text(cleaned):
+                        outputs_by_item[id(item)].append(cleaned)
+                    else:
+                        logger.error(
+                            "Fallback returned no usable output for %s in stage %s",
+                            item.item_key,
+                            stage_name,
+                        )
+
+            logger.info(
+                "API stage %s completed %d request(s) in %.3f seconds",
+                stage_name,
+                len(requests) + len(retry_items),
+                time.monotonic() - api_started,
+            )
 
             next_batch = []
             for item in active_batch:
@@ -733,6 +822,32 @@ class OpenAICompatibleWorker(CaptionWorker):
             self.items_processed += 1
         return results
 
+    @classmethod
+    def _is_refusal_text(cls, text: str) -> bool:
+        normalized = text.strip().lower()
+        return any(marker in normalized for marker in cls._REFUSAL_MARKERS)
+
+    @classmethod
+    def _is_semantic_caption_failure(cls, error: Exception) -> bool:
+        if isinstance(error, EndpointRequestError):
+            message = error.message.lower()
+            return any(marker in message for marker in cls._POLICY_ERROR_MARKERS)
+        if isinstance(error, ValueError):
+            message = str(error).lower()
+            return "message content" in message
+        return False
+
+    @staticmethod
+    def _stage_context(item: ProcessingItem) -> Dict[str, Any]:
+        context = dict(item.metadata)
+        for previous_name, result in item.stage_results.items():
+            for index, output in enumerate(result.outputs):
+                context[f"{previous_name}_output_{index}"] = output
+            context[result.output_field] = (
+                result.outputs[0] if len(result.outputs) == 1 else result.outputs
+            )
+        return context
+
     def _sampling_for_stage(self, stage: ProcessingStage) -> Dict[str, Any]:
         sampling = dict(self.vllm_config.get("sampling", {}))
         if stage.sampling:
@@ -743,44 +858,111 @@ class OpenAICompatibleWorker(CaptionWorker):
             if key in self._SUPPORTED_SAMPLING_KEYS and value is not None
         }
 
-    def _image_data_url(self, item: ProcessingItem) -> str:
-        image_format = (
+    def _image_data_url(self, item: ProcessingItem) -> str:  # noqa: C901
+        source_format = (
             (item.image.format if item.image else None)
             or item.metadata.get("image_format")
             or item.metadata.get("_image_format")
         )
-        if not image_format and item.image_data:
+        if not source_format and item.image_data:
             try:
                 with Image.open(io.BytesIO(item.image_data)) as source:
-                    image_format = source.format
+                    source_format = source.format
             except (OSError, ValueError):
                 pass
-        image_format = image_format or self.image_format
-        image_format = str(image_format).lower()
-        mime_format = "jpeg" if image_format in {"jpg", "jpeg"} else image_format
-        supported_passthrough = mime_format in {"jpeg", "png", "gif", "webp"}
 
-        if item.image_data and supported_passthrough:
+        target_format = "jpeg" if self.image_format in {"jpg", "jpeg"} else self.image_format
+        if target_format not in {"jpeg", "png", "gif", "webp"}:
+            target_format = "jpeg"
+        normalized_source = str(source_format or "").lower()
+        if normalized_source in {"jpg", "jpeg"}:
+            normalized_source = "jpeg"
+
+        image = item.image
+        needs_resize = False
+        if self.max_image_dimension:
+            if image is not None:
+                needs_resize = max(image.size) > self.max_image_dimension
+            elif item.image_data:
+                with Image.open(io.BytesIO(item.image_data)) as source:
+                    needs_resize = max(source.size) > self.max_image_dimension
+
+        if item.image_data and normalized_source == target_format and not needs_resize:
             data = item.image_data
-        elif item.image is not None:
+        elif image is not None or item.image_data:
             output = io.BytesIO()
-            save_format = (
-                "JPEG" if self.image_format in {"jpg", "jpeg"} else self.image_format.upper()
-            )
-            image = item.image
+            save_format = "JPEG" if target_format == "jpeg" else target_format.upper()
+            if image is None:
+                image = ImageProcessor.decode_image_data(item.image_data)
+            if self.max_image_dimension and max(image.size) > self.max_image_dimension:
+                target_size = ImageProcessor.constrained_size(image.size, self.max_image_dimension)
+                image = ImageProcessor.resize_images([image], [target_size])[0]
             save_kwargs: Dict[str, Any] = {}
             if save_format == "JPEG":
                 if image.mode not in {"RGB", "L"}:
                     image = image.convert("RGB")
                 save_kwargs["quality"] = self.image_quality
-                mime_format = "jpeg"
             image.save(output, format=save_format, **save_kwargs)
             data = output.getvalue()
         else:
             raise ValueError(f"Item {item.item_key} has no image data")
 
         encoded = base64.b64encode(data).decode("ascii")
-        return f"data:image/{mime_format};base64,{encoded}"
+        return f"data:image/{target_format};base64,{encoded}"
+
+    def _image_data_urls(self, items: Iterable[ProcessingItem]) -> Dict[int, Optional[str]]:
+        """Encode a request batch, fusing byte decode and resize when possible."""
+        item_list = list(items)
+        results: Dict[int, Optional[str]] = {}
+        target_format = "jpeg" if self.image_format in {"jpg", "jpeg"} else self.image_format
+        fast_items: List[ProcessingItem] = []
+        fast_sizes: List[tuple[int, int]] = []
+
+        if target_format == "jpeg":
+            for item in item_list:
+                if item.image is not None or not item.image_data:
+                    continue
+                try:
+                    with Image.open(io.BytesIO(item.image_data)) as source:
+                        source_format = str(source.format or "").lower()
+                        source_size = source.size
+                    normalized_source = (
+                        "jpeg" if source_format in {"jpg", "jpeg"} else source_format
+                    )
+                    target_size = source_size
+                    if self.max_image_dimension:
+                        target_size = ImageProcessor.constrained_size(
+                            source_size, self.max_image_dimension
+                        )
+                    if normalized_source == "jpeg" and target_size == source_size:
+                        encoded = base64.b64encode(item.image_data).decode("ascii")
+                        results[id(item)] = f"data:image/jpeg;base64,{encoded}"
+                    else:
+                        fast_items.append(item)
+                        fast_sizes.append(target_size)
+                except (OSError, ValueError):
+                    continue
+
+        if fast_items:
+            try:
+                images = ImageProcessor.preprocess_encoded_batch(
+                    [item.image_data for item in fast_items], fast_sizes
+                )
+                for item, image in zip(fast_items, images, strict=True):
+                    output = io.BytesIO()
+                    image.save(output, format="JPEG", quality=self.image_quality)
+                    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+                    results[id(item)] = f"data:image/jpeg;base64,{encoded}"
+            except Exception:
+                logger.warning(
+                    "Rust batch image preprocessing failed; falling back to individual images",
+                    exc_info=True,
+                )
+
+        for item in item_list:
+            if id(item) not in results:
+                results[id(item)] = self._image_data_url(item)
+        return results
 
     def _get_heartbeat_data(self) -> Dict[str, Any]:
         data = super()._get_heartbeat_data()
