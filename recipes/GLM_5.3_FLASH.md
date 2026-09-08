@@ -192,6 +192,13 @@ the OpenAI-compatible worker can make one text-only fallback attempt:
 ```yaml
 orchestrator:
   inference:
+    # Override the built-in defaults when literal image text could resemble a
+    # refusal. An empty list disables text-based refusal detection entirely.
+    refusal_markers:
+      - "i cannot describe"
+      - "unable to describe"
+      - "cannot provide a caption"
+      - "unable to provide a caption"
     retry_prompt: >-
       Rewrite the following source description as one concise, neutral,
       standalone caption. Preserve only concrete visual details, omit

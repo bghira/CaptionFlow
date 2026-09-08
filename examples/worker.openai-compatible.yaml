@@ -13,6 +13,13 @@ worker:
     image_format: "jpeg"
     image_quality: 90
 
+    # Optional local override for refusal detection. An empty list disables
+    # text-based refusal detection. This takes precedence over the shared
+    # orchestrator inference.refusal_markers setting.
+    # refusal_markers:
+    #   - "i cannot describe"
+    #   - "unable to provide a caption"
+
     endpoints:
       - name: "zai-coding-plan"
         base_url: "https://api.z.ai/api/coding/paas/v4"

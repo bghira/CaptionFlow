@@ -10,8 +10,8 @@ import pytest
 from click.testing import CliRunner
 from PIL import Image
 
-from caption_flow.workers.caption import ProcessingItem
 from caption_flow.utils.image_processor import ImageProcessor
+from caption_flow.workers.caption import ProcessingItem
 from caption_flow.workers.openai_compatible import (
     AdaptiveEndpointPool,
     ChatRequest,
@@ -579,6 +579,18 @@ def test_worker_validates_config_and_applies_shared_updates():
     with pytest.raises(ValueError, match="list of mappings"):
         OpenAICompatibleWorker({**base, "openai_compatible": {"endpoints": ["invalid"]}})
 
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}):
+        with pytest.raises(ValueError, match="list of non-empty strings"):
+            OpenAICompatibleWorker(
+                {
+                    **base,
+                    "openai_compatible": {
+                        "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+                        "refusal_markers": "i cannot describe",
+                    },
+                }
+            )
+
     config = {
         **base,
         "openai_compatible": {
@@ -602,6 +614,68 @@ def test_worker_validates_config_and_applies_shared_updates():
 
     with pytest.raises(RuntimeError, match="loop is not ready"):
         worker._process_batch_multi_stage([])
+
+
+def test_worker_configures_refusal_markers_from_shared_or_local_config():
+    base = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}):
+        worker = OpenAICompatibleWorker(base)
+
+    assert worker._is_refusal_text("I'm sorry, I can't describe this image.")
+    assert worker._is_refusal_text("A shirt reading “I can't stay at home.”")
+
+    assert worker._handle_vllm_config_update(
+        {
+            "model": "vision",
+            "inference_prompts": ["Describe"],
+            "refusal_markers": [
+                " I cannot describe ",
+                "i cannot describe",
+                "unable to provide a caption",
+            ],
+        }
+    )
+    assert worker.refusal_markers == (
+        "i cannot describe",
+        "unable to provide a caption",
+    )
+    assert worker._is_refusal_text("I cannot describe this image.")
+    assert not worker._is_refusal_text("A shirt reading “I can't stay at home.”")
+
+    local_config = {
+        **base,
+        "openai_compatible": {
+            **base["openai_compatible"],
+            "refusal_markers": [],
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}):
+        local_worker = OpenAICompatibleWorker(local_config)
+    assert local_worker._handle_vllm_config_update(
+        {
+            "model": "vision",
+            "inference_prompts": ["Describe"],
+            "refusal_markers": ["i cannot describe"],
+        }
+    )
+    assert local_worker.refusal_markers == ()
+    assert not local_worker._is_refusal_text("I cannot describe this image.")
+
+    with pytest.raises(ValueError, match="list of non-empty strings"):
+        worker._handle_vllm_config_update(
+            {
+                "model": "vision",
+                "inference_prompts": ["Describe"],
+                "refusal_markers": [""],
+            }
+        )
 
 
 def test_worker_runs_shared_caption_stage_through_endpoint_pool():
