@@ -257,6 +257,7 @@ class TestCaptionWorker:
             "inference_prompts": ["Test prompt"],
             "retry_prompt": "Fallback prompt",
             "retry_without_image": True,
+            "retry_sampling": {"max_tokens": 2048},
         }
 
         stages = caption_worker._parse_stages_config(old_config)
@@ -267,6 +268,28 @@ class TestCaptionWorker:
         assert stages[0].output_field == "captions"
         assert stages[0].retry_prompt == "Fallback prompt"
         assert stages[0].retry_without_image is True
+        assert stages[0].retry_sampling == {"max_tokens": 2048}
+
+        old_config["retry_sampling"] = []
+        with pytest.raises(ValueError, match="retry_sampling must be a mapping"):
+            caption_worker._parse_stages_config(old_config)
+
+    def test_parse_stage_retry_sampling_override(self, caption_worker):
+        """Stage retry sampling overrides the shared fallback settings."""
+        config = {
+            "retry_sampling": {"max_tokens": 1024},
+            "stages": [
+                {"name": "caption", "prompts": ["Caption"], "retry_sampling": {"top_p": 0.8}}
+            ],
+        }
+
+        stage = caption_worker._parse_stages_config(config)[0]
+
+        assert stage.retry_sampling == {"top_p": 0.8}
+
+        config["stages"][0]["retry_sampling"] = "invalid"
+        with pytest.raises(ValueError, match="Stage 'caption' retry_sampling must be a mapping"):
+            caption_worker._parse_stages_config(config)
 
     def test_topological_sort_stages(self, caption_worker):
         """Test dependency sorting of stages."""

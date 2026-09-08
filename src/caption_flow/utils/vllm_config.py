@@ -43,6 +43,7 @@ class VLLMConfigManager:
         "inference_prompts",
         "refusal_markers",
         "retry_prompt",
+        "retry_sampling",
         "retry_without_image",
     }
 

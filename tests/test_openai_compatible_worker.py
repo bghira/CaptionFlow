@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import io
+import json
 import os
 from unittest.mock import AsyncMock, patch
 
@@ -317,6 +318,10 @@ async def test_request_uses_openai_chat_completions_shape():
             image_data_url="data:image/png;base64,AAAA",
             requested_model="shared-model",
             parameters={"max_tokens": 100},
+            extra_body={
+                "reasoning_effort": "high",
+                "response_format": {"type": "json_object"},
+            },
             system_prompt="Be precise",
             image_detail="low",
         ),
@@ -329,7 +334,8 @@ async def test_request_uses_openai_chat_completions_shape():
     assert kwargs["headers"]["User-Agent"].startswith("CaptionFlow/")
     assert kwargs["json"]["model"] == "provider-model"
     assert kwargs["json"]["max_tokens"] == 100
-    assert kwargs["json"]["reasoning_effort"] == "low"
+    assert kwargs["json"]["reasoning_effort"] == "high"
+    assert kwargs["json"]["response_format"] == {"type": "json_object"}
     assert kwargs["json"]["messages"][0] == {"role": "system", "content": "Be precise"}
     assert kwargs["json"]["messages"][1]["content"][0]["image_url"]["detail"] == "low"
 
@@ -591,6 +597,28 @@ def test_worker_validates_config_and_applies_shared_updates():
                 }
             )
 
+        with pytest.raises(ValueError, match="retry_extra_body must be a mapping"):
+            OpenAICompatibleWorker(
+                {
+                    **base,
+                    "openai_compatible": {
+                        "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+                        "retry_extra_body": [],
+                    },
+                }
+            )
+
+        with pytest.raises(ValueError, match="retry_extra_body cannot override: model"):
+            OpenAICompatibleWorker(
+                {
+                    **base,
+                    "openai_compatible": {
+                        "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+                        "retry_extra_body": {"model": "other"},
+                    },
+                }
+            )
+
     config = {
         **base,
         "openai_compatible": {
@@ -676,6 +704,117 @@ def test_worker_configures_refusal_markers_from_shared_or_local_config():
                 "refusal_markers": [""],
             }
         )
+
+
+def test_worker_can_require_valid_json_output():
+    config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+            "validate_json_output": True,
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}):
+        worker = OpenAICompatibleWorker(config)
+
+    assert worker._validated_output('{"caption": "A red square."}') is not None
+    assert worker._validated_output('{"caption": "truncated"') is None
+    assert worker._validated_output('{"confidence": NaN}') is None
+    assert worker._validated_output("I'm sorry, but I cannot describe it.") is None
+
+    config["openai_compatible"]["validate_json_output"] = "true"
+    with (
+        patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}),
+        pytest.raises(ValueError, match="validate_json_output must be a boolean"),
+    ):
+        OpenAICompatibleWorker(config)
+
+
+def test_worker_can_repair_only_invalid_json_escapes():
+    config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+            "validate_json_output": True,
+            "repair_invalid_json_escapes": True,
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}):
+        worker = OpenAICompatibleWorker(config)
+
+    malformed = r'{"text": "C:\users\path and \u12Z4", "quote": "ok\nline"}'
+    repaired = worker._validated_output(malformed)
+    assert repaired is not None
+    assert json.loads(repaired) == {
+        "text": r"C:\users\path and \u12Z4",
+        "quote": "ok\nline",
+    }
+    assert worker._validated_output('{"text": "still truncated"') is None
+    assert worker._validated_output(r'{"text": "bad\q"') is None
+
+    config["openai_compatible"]["repair_invalid_json_escapes"] = 1
+    with (
+        patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}),
+        pytest.raises(ValueError, match="repair_invalid_json_escapes must be a boolean"),
+    ):
+        OpenAICompatibleWorker(config)
+
+
+def test_worker_can_canonicalize_json_and_normalize_yxyx_boxes():
+    config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+            "validate_json_output": True,
+            "canonicalize_json_output": True,
+            "normalize_yxyx_bboxes": True,
+            "deduplicate_json_elements": True,
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}):
+        worker = OpenAICompatibleWorker(config)
+
+    output = worker._validated_output(
+        '{"description":"caf\\u00e9","elements":['
+        '{"bbox":[900,800,100,200]},{"bbox":[900,800,100,200]}]}'
+    )
+    assert output == '{"description":"café","elements":[{"bbox":[100,200,900,800]}]}'
+
+    for option in (
+        "repair_invalid_json_escapes",
+        "canonicalize_json_output",
+        "normalize_yxyx_bboxes",
+        "deduplicate_json_elements",
+    ):
+        invalid = {
+            **config,
+            "openai_compatible": {**config["openai_compatible"], option: "true"},
+        }
+        with (
+            patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}),
+            pytest.raises(ValueError, match=f"{option} must be a boolean"),
+        ):
+            OpenAICompatibleWorker(invalid)
+
+        without_validation = {
+            **config,
+            "openai_compatible": {
+                **config["openai_compatible"],
+                "validate_json_output": False,
+                option: True,
+            },
+        }
+        with (
+            patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "secret"}),
+            pytest.raises(ValueError, match="validate_json_output must be enabled"),
+        ):
+            OpenAICompatibleWorker(without_validation)
 
 
 def test_worker_runs_shared_caption_stage_through_endpoint_pool():
@@ -835,6 +974,55 @@ def test_worker_retries_empty_refusal_but_not_unrelated_request_error():
     assert not worker._is_semantic_caption_failure(
         EndpointRequestError("provider", 400, "invalid request", {})
     )
+
+
+def test_worker_retries_invalid_json_output():
+    worker_config = {
+        "server": "ws://localhost:8765",
+        "token": "orchestrator-token",
+        "openai_compatible": {
+            "api_key_env": "CAPTIONFLOW_TEST_API_KEY",
+            "model": "vision",
+            "validate_json_output": True,
+            "retry_extra_body": {"response_format": {"type": "json_object"}},
+        },
+    }
+    with patch.dict(os.environ, {"CAPTIONFLOW_TEST_API_KEY": "provider-secret"}):
+        worker = OpenAICompatibleWorker(worker_config)
+
+    worker.vllm_config = {
+        "model": "vision",
+        "inference_prompts": ["Describe as JSON"],
+        "retry_prompt": "Retry as valid JSON",
+        "retry_sampling": {"max_tokens": 4096, "repetition_penalty": 1.1},
+    }
+    worker.stages = worker._parse_stages_config(worker.vllm_config)
+    worker.stage_order = worker._topological_sort_stages(worker.stages)
+    worker.endpoint_pool.run_many = AsyncMock(
+        side_effect=[['{"caption": "truncated"'], ['{"caption": "A red square."}']]
+    )
+    worker.api_loop = asyncio.new_event_loop()
+    item = ProcessingItem(
+        unit_id="unit",
+        job_id="job",
+        chunk_id="chunk",
+        item_key="image.png",
+        item_index=0,
+        image=Image.new("RGB", (2, 2), color="red"),
+        image_data=b"",
+        metadata={},
+    )
+
+    try:
+        results = worker._process_batch_multi_stage([item])
+    finally:
+        worker.api_loop.close()
+
+    assert results == [(item, {"captions": ['{"caption": "A red square."}']})]
+    assert worker.endpoint_pool.run_many.await_count == 2
+    retry_request = worker.endpoint_pool.run_many.await_args_list[1].args[0][0]
+    assert retry_request.parameters == {"max_tokens": 4096}
+    assert retry_request.extra_body == {"response_format": {"type": "json_object"}}
 
 
 def test_cli_selects_openai_compatible_worker():

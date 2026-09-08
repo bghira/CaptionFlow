@@ -184,6 +184,7 @@ class ProcessingStage:
     # provider rejects the image before inference.
     retry_prompt: Optional[str] = None
     retry_without_image: bool = False
+    retry_sampling: Optional[Dict[str, Any]] = None
 
 
 @dataclass

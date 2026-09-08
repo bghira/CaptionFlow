@@ -58,6 +58,7 @@ class TestVLLMConfigManagerInit:
         assert "sampling" in VLLMConfigManager.RUNTIME_UPDATEABLE_FIELDS
         assert "refusal_markers" in VLLMConfigManager.RUNTIME_UPDATEABLE_FIELDS
         assert "retry_prompt" in VLLMConfigManager.RUNTIME_UPDATEABLE_FIELDS
+        assert "retry_sampling" in VLLMConfigManager.RUNTIME_UPDATEABLE_FIELDS
         assert "retry_without_image" in VLLMConfigManager.RUNTIME_UPDATEABLE_FIELDS
 
 
