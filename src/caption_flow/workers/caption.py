@@ -505,6 +505,9 @@ class CaptionWorker(BaseWorker):
     def _parse_stages_config(self, vllm_config: Dict[str, Any]) -> List[ProcessingStage]:
         """Parse stages configuration from vLLM config."""
         stages_config = vllm_config.get("stages", [])
+        default_retry_sampling = vllm_config.get("retry_sampling")
+        if default_retry_sampling is not None and not isinstance(default_retry_sampling, dict):
+            raise ValueError("retry_sampling must be a mapping")
 
         if not stages_config:
             # Backward compatibility
@@ -517,12 +520,18 @@ class CaptionWorker(BaseWorker):
                     requires=[],
                     retry_prompt=vllm_config.get("retry_prompt"),
                     retry_without_image=bool(vllm_config.get("retry_without_image", False)),
+                    retry_sampling=(
+                        dict(default_retry_sampling) if default_retry_sampling is not None else None
+                    ),
                 )
             ]
 
         # Parse stages
         stages = []
         for stage_cfg in stages_config:
+            retry_sampling = stage_cfg.get("retry_sampling", default_retry_sampling)
+            if retry_sampling is not None and not isinstance(retry_sampling, dict):
+                raise ValueError(f"Stage '{stage_cfg['name']}' retry_sampling must be a mapping")
             stage = ProcessingStage(
                 name=stage_cfg["name"],
                 model=stage_cfg.get("model", vllm_config.get("model")),
@@ -541,6 +550,7 @@ class CaptionWorker(BaseWorker):
                         vllm_config.get("retry_without_image", False),
                     )
                 ),
+                retry_sampling=dict(retry_sampling) if retry_sampling is not None else None,
             )
             stages.append(stage)
 

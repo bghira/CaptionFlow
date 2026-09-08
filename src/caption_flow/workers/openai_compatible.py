@@ -10,6 +10,7 @@ import asyncio
 import base64
 import email.utils
 import io
+import json
 import logging
 import math
 import os
@@ -189,6 +190,7 @@ class ChatRequest:
     image_data_url: Optional[str]
     requested_model: Optional[str]
     parameters: Dict[str, Any] = field(default_factory=dict)
+    extra_body: Dict[str, Any] = field(default_factory=dict)
     system_prompt: Optional[str] = None
     image_detail: Optional[str] = None
 
@@ -460,6 +462,7 @@ class AdaptiveEndpointPool:
             "messages": messages,
             **request.parameters,
             **config.extra_body,
+            **request.extra_body,
         }
         headers = {
             "Authorization": f"Bearer {config.api_key}",
@@ -592,7 +595,7 @@ class OpenAICompatibleWorker(CaptionWorker):
         "unsafe or sensitive",
     )
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any]):  # noqa: C901
         super().__init__(config)
         raw_config = config.get("openai_compatible")
         if raw_config is True:
@@ -631,6 +634,52 @@ class OpenAICompatibleWorker(CaptionWorker):
             if self._local_refusal_markers is not None
             else self._DEFAULT_REFUSAL_MARKERS
         )
+        validate_json_output = raw_config.get("validate_json_output", False)
+        if not isinstance(validate_json_output, bool):
+            raise ValueError("openai_compatible.validate_json_output must be a boolean")
+        self.validate_json_output = validate_json_output
+        repair_json_escapes = raw_config.get("repair_invalid_json_escapes", False)
+        if not isinstance(repair_json_escapes, bool):
+            raise ValueError("openai_compatible.repair_invalid_json_escapes must be a boolean")
+        self.repair_invalid_json_escapes = repair_json_escapes
+        canonicalize_json_output = raw_config.get("canonicalize_json_output", False)
+        if not isinstance(canonicalize_json_output, bool):
+            raise ValueError("openai_compatible.canonicalize_json_output must be a boolean")
+        self.canonicalize_json_output = canonicalize_json_output
+        normalize_yxyx_bboxes = raw_config.get("normalize_yxyx_bboxes", False)
+        if not isinstance(normalize_yxyx_bboxes, bool):
+            raise ValueError("openai_compatible.normalize_yxyx_bboxes must be a boolean")
+        self.normalize_yxyx_bboxes = normalize_yxyx_bboxes
+        deduplicate_json_elements = raw_config.get("deduplicate_json_elements", False)
+        if not isinstance(deduplicate_json_elements, bool):
+            raise ValueError("openai_compatible.deduplicate_json_elements must be a boolean")
+        self.deduplicate_json_elements = deduplicate_json_elements
+        json_transforms = {
+            "repair_invalid_json_escapes": self.repair_invalid_json_escapes,
+            "canonicalize_json_output": self.canonicalize_json_output,
+            "normalize_yxyx_bboxes": self.normalize_yxyx_bboxes,
+            "deduplicate_json_elements": self.deduplicate_json_elements,
+        }
+        enabled_without_validation = [
+            name
+            for name, enabled in json_transforms.items()
+            if enabled and not validate_json_output
+        ]
+        if enabled_without_validation:
+            raise ValueError(
+                "openai_compatible.validate_json_output must be enabled when using: "
+                + ", ".join(enabled_without_validation)
+            )
+        retry_extra_body = raw_config.get("retry_extra_body", {})
+        if not isinstance(retry_extra_body, dict):
+            raise ValueError("openai_compatible.retry_extra_body must be a mapping")
+        reserved_retry_keys = {"model", "messages"}.intersection(retry_extra_body)
+        if reserved_retry_keys:
+            raise ValueError(
+                "openai_compatible.retry_extra_body cannot override: "
+                + ", ".join(sorted(reserved_retry_keys))
+            )
+        self.retry_extra_body = dict(retry_extra_body)
 
     async def _pre_start(self):
         """Fetch shared stage settings, then start the API processing thread."""
@@ -746,8 +795,8 @@ class OpenAICompatibleWorker(CaptionWorker):
                     if self._is_semantic_caption_failure(response):
                         retryable_item_ids.add(id(owner))
                     continue
-                cleaned = self._clean_output(response)
-                if cleaned and not self._is_refusal_text(cleaned):
+                cleaned = self._validated_output(self._clean_output(response))
+                if cleaned is not None:
                     outputs_by_item[id(owner)].append(cleaned)
                 else:
                     retryable_item_ids.add(id(owner))
@@ -761,6 +810,15 @@ class OpenAICompatibleWorker(CaptionWorker):
             ]
             if retry_items:
                 retry_requests = []
+                retry_sampling = dict(sampling)
+                if stage.retry_sampling:
+                    retry_sampling.update(
+                        {
+                            key: value
+                            for key, value in stage.retry_sampling.items()
+                            if key in self._SUPPORTED_SAMPLING_KEYS and value is not None
+                        }
+                    )
                 for item in retry_items:
                     context = self._stage_context(item)
                     retry_prompt = PromptTemplateManager([stage.retry_prompt]).format_all(context)[
@@ -773,7 +831,8 @@ class OpenAICompatibleWorker(CaptionWorker):
                                 None if stage.retry_without_image else image_urls.get(id(item))
                             ),
                             requested_model=stage.model,
-                            parameters=sampling,
+                            parameters=retry_sampling,
+                            extra_body=self.retry_extra_body,
                             system_prompt=self.system_prompt,
                             image_detail=self.image_detail,
                         )
@@ -797,8 +856,8 @@ class OpenAICompatibleWorker(CaptionWorker):
                             response,
                         )
                         continue
-                    cleaned = self._clean_output(response)
-                    if cleaned and not self._is_refusal_text(cleaned):
+                    cleaned = self._validated_output(self._clean_output(response))
+                    if cleaned is not None:
                         outputs_by_item[id(item)].append(cleaned)
                     else:
                         logger.error(
@@ -851,6 +910,121 @@ class OpenAICompatibleWorker(CaptionWorker):
     def _is_refusal_text(self, text: str) -> bool:
         normalized = text.strip().casefold()
         return any(marker in normalized for marker in self.refusal_markers)
+
+    def _validated_output(self, text: str) -> Optional[str]:
+        if not text or self._is_refusal_text(text):
+            return None
+        if not self.validate_json_output:
+            return text
+
+        parsed_output = self._parse_json_output(text)
+        if parsed_output is None:
+            return None
+        parsed, text = parsed_output
+
+        if self.normalize_yxyx_bboxes:
+            self._normalize_yxyx_bbox_values(parsed)
+        if self.deduplicate_json_elements:
+            self._deduplicate_element_arrays(parsed)
+        if (
+            self.canonicalize_json_output
+            or self.normalize_yxyx_bboxes
+            or self.deduplicate_json_elements
+        ):
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        return text
+
+    def _parse_json_output(self, text: str) -> Optional[Tuple[Any, str]]:
+        try:
+            return self._strict_json_loads(text), text
+        except (TypeError, ValueError) as error:
+            if self.repair_invalid_json_escapes:
+                repaired = self._repair_json_escapes(text)
+                if repaired != text:
+                    try:
+                        parsed = self._strict_json_loads(repaired)
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        logger.warning("Repaired invalid JSON escape sequence: %s", error)
+                        return parsed, repaired
+            logger.warning("Rejecting invalid JSON output: %s", error)
+            return None
+
+    @staticmethod
+    def _strict_json_loads(text: str) -> Any:
+        def reject_constant(value: str) -> None:
+            raise ValueError(f"Invalid JSON numeric constant: {value}")
+
+        return json.loads(text, parse_constant=reject_constant)
+
+    @classmethod
+    def _deduplicate_element_arrays(cls, value: Any) -> None:
+        if isinstance(value, dict):
+            elements = value.get("elements")
+            if isinstance(elements, list):
+                unique = []
+                seen = set()
+                for element in elements:
+                    fingerprint = json.dumps(
+                        element, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    )
+                    if fingerprint not in seen:
+                        seen.add(fingerprint)
+                        unique.append(element)
+                value["elements"] = unique
+            for child in value.values():
+                cls._deduplicate_element_arrays(child)
+        elif isinstance(value, list):
+            for child in value:
+                cls._deduplicate_element_arrays(child)
+
+    @classmethod
+    def _normalize_yxyx_bbox_values(cls, value: Any) -> None:
+        if isinstance(value, dict):
+            bbox = value.get("bbox")
+            if (
+                isinstance(bbox, list)
+                and len(bbox) == 4
+                and all(type(coordinate) is int for coordinate in bbox)
+            ):
+                ymin, xmin, ymax, xmax = bbox
+                value["bbox"] = [
+                    min(ymin, ymax),
+                    min(xmin, xmax),
+                    max(ymin, ymax),
+                    max(xmin, xmax),
+                ]
+            for child in value.values():
+                cls._normalize_yxyx_bbox_values(child)
+        elif isinstance(value, list):
+            for child in value:
+                cls._normalize_yxyx_bbox_values(child)
+
+    @staticmethod
+    def _repair_json_escapes(text: str) -> str:
+        """Escape only backslashes that cannot begin a valid JSON escape."""
+        repaired: List[str] = []
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if char != "\\":
+                repaired.append(char)
+                index += 1
+                continue
+
+            following = text[index + 1] if index + 1 < len(text) else ""
+            valid_unicode = (
+                following == "u"
+                and all(digit in "0123456789abcdefABCDEF" for digit in text[index + 2 : index + 6])
+                and len(text[index + 2 : index + 6]) == 4
+            )
+            if following in '"\\/bfnrt' or valid_unicode:
+                repaired.append(char)
+            else:
+                repaired.append("\\\\")
+            index += 1
+        return "".join(repaired)
 
     @classmethod
     def _is_semantic_caption_failure(cls, error: Exception) -> bool:
