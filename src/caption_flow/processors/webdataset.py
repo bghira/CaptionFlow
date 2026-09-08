@@ -855,6 +855,12 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                             entry_metadata = getattr(entry, "metadata", {}) or {}
                             if not isinstance(entry_metadata, dict):
                                 entry_metadata = {}
+                            image_width = entry_metadata.get("image_width")
+                            if image_width is None:
+                                image_width = entry_metadata.get("width")
+                            image_height = entry_metadata.get("image_height")
+                            if image_height is None:
+                                image_height = entry_metadata.get("height")
                             filtered_entry_metadata = {
                                 k: v
                                 for k, v in entry_metadata.items()
@@ -884,6 +890,8 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                                     "_filename": entry.path,
                                     "_file_size": entry.size,
                                     "_json_path": entry_metadata.get("json_path"),
+                                    "image_width": image_width,
+                                    "image_height": image_height,
                                     "_processed_indices": processed_indices,
                                 },
                                 "job_id": job_id_str,

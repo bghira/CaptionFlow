@@ -1219,7 +1219,12 @@ class TestWebDatasetWorkerProcessor:
     def test_process_unit_can_defer_image_decode(self, worker_processor_real):
         """API workers can preserve encoded bytes for fused batch preprocessing."""
         worker_processor_real.decode_images = False
-        mock_entry = Mock(data=b"encoded", path="test.jpg", size=7, metadata={})
+        mock_entry = Mock(
+            data=b"encoded",
+            path="test.jpg",
+            size=7,
+            metadata={"width": 640, "height": 480, "aspect": 4 / 3},
+        )
         worker_processor_real.loader.load_sample = Mock(return_value=mock_entry)
         unit = WorkUnit(
             unit_id="shard_0:chunk:0",
@@ -1241,6 +1246,10 @@ class TestWebDatasetWorkerProcessor:
         decode.assert_not_called()
         assert result["image"] is None
         assert result["image_data"] == b"encoded"
+        assert result["metadata"]["image_width"] == 640
+        assert result["metadata"]["image_height"] == 480
+        assert "width" not in result["metadata"]
+        assert "height" not in result["metadata"]
 
     def test_get_dataset_info_mock_mode(self, worker_processor):
         """Test dataset info in mock mode."""
