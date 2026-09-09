@@ -178,6 +178,13 @@ prompts, sampling, and output fields. Existing `vllm:` configurations are also
 accepted by API workers for backward compatibility; endpoint-local `model`
 values take precedence over the broadcast model name.
 
+Direct vLLM and API workers share JSON validation, output transformations,
+refusal detection, and semantic retries. Configure those under
+`inference.output_processing`; use `response_format` and `retry_response_format`
+for constrained decoding on either backend. See the
+[structured JSON recipe](recipes/STRUCTURED_JSON.md) for examples and native
+vLLM tuning details.
+
 ---
 
 ## dataset formats

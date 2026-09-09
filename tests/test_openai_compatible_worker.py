@@ -640,8 +640,9 @@ def test_worker_validates_config_and_applies_shared_updates():
     assert worker.mock_mode is True
     assert worker.stage_order == ["default"]
 
+    assert worker._process_batch_multi_stage([]) == []
     with pytest.raises(RuntimeError, match="loop is not ready"):
-        worker._process_batch_multi_stage([])
+        worker._prepare_stage_batch([], worker.stages[0])
 
 
 def test_worker_configures_refusal_markers_from_shared_or_local_config():

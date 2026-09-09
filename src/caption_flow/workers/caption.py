@@ -1,13 +1,10 @@
 """Caption worker with processor abstraction for distributed captioning."""
 
-import os
-
-os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
 import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -30,9 +27,11 @@ from ..processors import (
     WorkUnit,
 )
 from ..utils.image_processor import ImageProcessor
+from ..utils.output_policy import OutputPolicy, validate_response_format
 from ..utils.prompt_template import PromptTemplateManager
-from ..utils.vllm_config import VLLMConfigManager
+from ..utils.vllm_config import VLLMConfigManager, create_native_sampling_params
 from .base import BaseWorker
+from .pipeline import StageRequest, run_caption_pipeline, stage_context
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -159,24 +158,21 @@ class MultiStageVLLMManager:
         self.models[model_name] = LLM(**self._filter_engine_args(vllm_params, EngineArgs))
         logger.info(f"Model {model_name} loaded successfully")
 
-    def create_sampling_params(self, stage: ProcessingStage, base_sampling: Dict[str, Any]):
+    def create_sampling_params(
+        self, stage: ProcessingStage, base_sampling: Dict[str, Any], retry: bool = False
+    ):
         """Create sampling params for a stage."""
-        from vllm import SamplingParams
-
         sampling_config = base_sampling.copy()
         if stage.sampling:
             sampling_config.update(stage.sampling)
-
-        params = SamplingParams(
-            temperature=sampling_config.get("temperature", 0.7),
-            top_p=sampling_config.get("top_p", 0.95),
-            max_tokens=sampling_config.get("max_tokens", 256),
-            stop=sampling_config.get("stop", ["<|end|>", "<|endoftext|>", "<|im_end|>"]),
-            repetition_penalty=sampling_config.get("repetition_penalty", 1.05),
-            skip_special_tokens=sampling_config.get("skip_special_tokens", True),
-        )
-
-        self.sampling_params[stage.name] = params
+        if retry and stage.retry_sampling:
+            sampling_config.update(stage.retry_sampling)
+        response_format = stage.response_format
+        if retry and stage.retry_response_format is not None:
+            response_format = stage.retry_response_format
+        params = create_native_sampling_params(sampling_config, response_format)
+        if not retry:
+            self.sampling_params[stage.name] = params
         return params
 
     def get_model_for_stage(self, stage_name: str, model_name: str) -> Tuple[Any, Any, Any, Any]:
@@ -219,6 +215,10 @@ class CaptionWorker(BaseWorker):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
+        self.output_processing_overrides = dict(config.get("output_processing", {}))
+        # Local overrides may inherit validation from the orchestrator. Check
+        # their types now and validate the merged policy when stages arrive.
+        OutputPolicy.from_config(self.output_processing_overrides, partial=True)
 
         # Processor configuration
         self.processor_type = None
@@ -509,6 +509,25 @@ class CaptionWorker(BaseWorker):
         if default_retry_sampling is not None and not isinstance(default_retry_sampling, dict):
             raise ValueError("retry_sampling must be a mapping")
 
+        def output_options(stage_config: Dict[str, Any]) -> Dict[str, Any]:
+            options = dict(vllm_config.get("output_processing", {}))
+            if "refusal_markers" in vllm_config:
+                options.setdefault("refusal_markers", vllm_config["refusal_markers"])
+            options.update(stage_config.get("output_processing", {}))
+            OutputPolicy.from_config({**options, **self.output_processing_overrides})
+            result = {
+                "output_processing": options,
+                "response_format": stage_config.get(
+                    "response_format", vllm_config.get("response_format")
+                ),
+                "retry_response_format": stage_config.get(
+                    "retry_response_format", vllm_config.get("retry_response_format")
+                ),
+            }
+            validate_response_format(result["response_format"])
+            validate_response_format(result["retry_response_format"])
+            return result
+
         if not stages_config:
             # Backward compatibility
             return [
@@ -523,6 +542,7 @@ class CaptionWorker(BaseWorker):
                     retry_sampling=(
                         dict(default_retry_sampling) if default_retry_sampling is not None else None
                     ),
+                    **output_options({}),
                 )
             ]
 
@@ -551,6 +571,7 @@ class CaptionWorker(BaseWorker):
                     )
                 ),
                 retry_sampling=dict(retry_sampling) if retry_sampling is not None else None,
+                **output_options(stage_cfg),
             )
             stages.append(stage)
 
@@ -591,6 +612,7 @@ class CaptionWorker(BaseWorker):
         if not self.vllm_config:
             raise RuntimeError("vLLM config not received")
 
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
 
         # Initialize model manager
@@ -637,34 +659,41 @@ class CaptionWorker(BaseWorker):
 
         # Check if mock mode changed
         old_mock_mode = self.mock_mode
-        self.mock_mode = new_config.get("mock_results", False)
+        new_mock_mode = new_config.get("mock_results", False)
 
-        if old_mock_mode != self.mock_mode:
-            logger.info(f"Mock mode changed from {old_mock_mode} to {self.mock_mode}")
+        if old_mock_mode != new_mock_mode:
+            logger.info(f"Mock mode changed from {old_mock_mode} to {new_mock_mode}")
 
         # Parse new stages
         new_stages = self._parse_stages_config(new_config)
+        new_order = self._topological_sort_stages(new_stages)
 
         # Check if stages changed significantly
-        stages_changed = len(new_stages) != len(self.stages)
+        stages_changed = len(new_stages) != len(
+            self.stages
+        ) or self.vllm_config_manager.should_reload_vllm(self.vllm_config, new_config)
         if not stages_changed:
             for old, new in zip(self.stages, new_stages, strict=False):
                 if (
                     old.name != new.name
                     or old.model != new.model
-                    or old.prompts != new.prompts
-                    or old.output_field != new.output_field
+                    or old.tensor_parallel_size != new.tensor_parallel_size
+                    or old.max_model_len != new.max_model_len
+                    or old.dtype != new.dtype
+                    or old.gpu_memory_utilization != new.gpu_memory_utilization
                 ):
                     stages_changed = True
                     break
 
-        if stages_changed or old_mock_mode != self.mock_mode:
+        if stages_changed or old_mock_mode != new_mock_mode:
             logger.info("Configuration changed significantly")
 
             old_config = self.vllm_config
+            old_stages, old_order = self.stages, self.stage_order
+            self.mock_mode = new_mock_mode
             self.vllm_config = new_config
             self.stages = new_stages
-            self.stage_order = self._topological_sort_stages(self.stages)
+            self.stage_order = new_order
 
             if not self.mock_mode:
                 try:
@@ -675,9 +704,9 @@ class CaptionWorker(BaseWorker):
                 except Exception as e:
                     logger.error(f"Failed to reload vLLM: {e}")
                     # Restore previous state
+                    self.mock_mode = old_mock_mode
                     self.vllm_config = old_config
-                    self.stages = self._parse_stages_config(old_config)
-                    self.stage_order = self._topological_sort_stages(self.stages)
+                    self.stages, self.stage_order = old_stages, old_order
                     # Attempt to restore previous models
                     try:
                         self._setup_vllm()
@@ -699,9 +728,11 @@ class CaptionWorker(BaseWorker):
             if not self.mock_mode:
                 logger.info("Updating sampling parameters without model reload")
                 base_sampling = new_config.get("sampling", {})
-                for stage in self.stages:
+                for stage in new_stages:
                     self.model_manager.create_sampling_params(stage, base_sampling)
             self.vllm_config = new_config
+            self.stages = new_stages
+            self.stage_order = new_order
             return True
 
     def _processing_thread(self):
@@ -981,14 +1012,7 @@ class CaptionWorker(BaseWorker):
                 )  # Test with first prompt
 
                 # Build context
-                context = item.metadata.copy()
-                for prev_stage_name, stage_result in item.stage_results.items():
-                    for i, output in enumerate(stage_result.outputs):
-                        context[f"{prev_stage_name}_output_{i}"] = output
-                    if len(stage_result.outputs) == 1:
-                        context[stage_result.output_field] = stage_result.outputs[0]
-                    else:
-                        context[stage_result.output_field] = stage_result.outputs
+                context = stage_context(item)
                 logger.debug(f"Validation context for {item.item_key}: {context}")
 
                 # Format test prompt
@@ -1069,157 +1093,112 @@ class CaptionWorker(BaseWorker):
 
         return new_item
 
+    def _output_policy(self, stage: Optional[ProcessingStage] = None) -> OutputPolicy:
+        config = self.vllm_config or {}
+        options = dict(config.get("output_processing", {}))
+        if "refusal_markers" in config:
+            options.setdefault("refusal_markers", config["refusal_markers"])
+        if stage and stage.output_processing:
+            options.update(stage.output_processing)
+        options.update(self.output_processing_overrides)
+        return OutputPolicy.from_config(options)
+
+    @property
+    def refusal_markers(self):
+        return self._output_policy().refusal_markers
+
+    def _is_refusal_text(self, text: str) -> bool:
+        return self._output_policy().is_refusal(text)
+
+    def _validated_output(self, text: str) -> Optional[str]:
+        return self._output_policy().process(text)
+
     def _process_batch_multi_stage(
-        self, batch: List[ProcessingItem], max_attempts: int = 3
+        self, batch: List[ProcessingItem]
     ) -> List[Tuple[ProcessingItem, Dict]]:
-        """Process a batch through all stages with token validation."""
-        results = []
-
-        # Get max model length from config
-        max_model_len = self.vllm_config.get("max_model_len", 16384)
-
-        # Process each stage in order
-        for stage_name in self.stage_order:
-            stage = next(s for s in self.stages if s.name == stage_name)
-            logger.debug(f"Processing batch through stage: {stage_name}")
-
-            # Check if model manager is properly initialized
-            if not self.model_manager:
-                logger.error("Model manager not initialized")
-                self.items_failed += len(batch)
-                return []
-
-            # Get model components
-            try:
-                llm, processor, tokenizer, sampling_params = self.model_manager.get_model_for_stage(
-                    stage_name, stage.model
-                )
-            except KeyError as e:
-                logger.error(f"Model not found during batch processing: {e}")
-                self.items_failed += len(batch)
-                return []
-
-            # Validate batch before processing
-            processable_batch, too_long_items = self._validate_and_split_batch(
-                batch, stage, processor, tokenizer, sampling_params, max_model_len
-            )
-
-            # Handle items that are too long
-            for item in too_long_items:
-                logger.warning(f"Item {item.item_key} exceeds token limit, attempting resize")
-
-                # Try resizing the image
-                resized_item = self._resize_image_for_tokens(item, target_ratio=0.7)
-
-                # Re-validate
-                resized_processable, still_too_long = self._validate_and_split_batch(
-                    [resized_item], stage, processor, tokenizer, sampling_params, max_model_len
-                )
-
-                if resized_processable:
-                    processable_batch.extend(resized_processable)
-                    logger.info(f"Successfully resized {item.item_key} for processing")
-                else:
-                    # Try even smaller
-                    resized_item = self._resize_image_for_tokens(item, target_ratio=0.5)
-                    resized_processable, still_too_long = self._validate_and_split_batch(
-                        [resized_item], stage, processor, tokenizer, sampling_params, max_model_len
-                    )
-
-                    if resized_processable:
-                        processable_batch.extend(resized_processable)
-                        logger.info(f"Successfully resized {item.item_key} to 50% for processing")
-                    else:
-                        logger.error(f"Item {item.item_key} still too long after resize, skipping")
-                        self.items_failed += 1
-
-                        # Send error result
-                        stage_result = StageResult(
-                            stage_name=stage_name,
-                            output_field=stage.output_field,
-                            outputs=[],
-                            error="Image too large even after resizing",
-                        )
-                        item.stage_results[stage_name] = stage_result
-
-                        self.result_queue.put(
-                            {
-                                "item": item,
-                                "outputs": {},
-                                "processing_time_ms": 0.0,
-                                "error": f"Failed stage {stage_name}: token limit exceeded",
-                            }
-                        )
-
-            # Process the validated batch
-            if processable_batch:
-                # Build requests for processable items
-                requests = []
-                for item in processable_batch:
-                    converted_img = ImageProcessor.prepare_for_inference(item)
-                    template_manager = PromptTemplateManager(stage.prompts)
-
-                    # Build context
-                    context = item.metadata.copy()
-                    for prev_stage_name, stage_result in item.stage_results.items():
-                        for i, output in enumerate(stage_result.outputs):
-                            context[f"{prev_stage_name}_output_{i}"] = output
-                        if len(stage_result.outputs) == 1:
-                            context[stage_result.output_field] = stage_result.outputs[0]
-                        else:
-                            context[stage_result.output_field] = stage_result.outputs
-
-                    # Format prompts
-                    formatted_prompts = template_manager.format_all(context)
-
-                    # Build requests
-                    for prompt in formatted_prompts:
-                        req = self._build_vllm_input(converted_img, prompt, processor, tokenizer)
-                        requests.append(req)
-
-                # Run inference
-                outputs = llm.generate(requests, sampling_params)
-
-                # Process outputs
-                for idx, item in enumerate(processable_batch):
-                    base_idx = idx * len(stage.prompts)
-                    stage_outputs = []
-
-                    for j in range(len(stage.prompts)):
-                        if base_idx + j < len(outputs) and outputs[base_idx + j].outputs:
-                            original_output = outputs[base_idx + j].outputs[0].text
-                            cleaned_output = self._clean_output(original_output)
-                            if cleaned_output:
-                                stage_outputs.append(cleaned_output)
-
-                    if stage_outputs:
-                        stage_result = StageResult(
-                            stage_name=stage_name,
-                            output_field=stage.output_field,
-                            outputs=stage_outputs,
-                        )
-                        item.stage_results[stage_name] = stage_result
-                    else:
-                        logger.error(f"No outputs for {item.item_key} in stage {stage_name}")
-                        self.items_failed += 1
-
-            # Update batch for next stage
-            batch = processable_batch
-
-        # Convert to results
-        for item in batch:
-            # Aggregate outputs by field
-            outputs_by_field = defaultdict(list)
-            for stage_result in item.stage_results.values():
-                outputs_by_field[stage_result.output_field].extend(stage_result.outputs)
-
-            results.append((item, dict(outputs_by_field)))
-            self.items_processed += 1
-
+        """Use the shared caption pipeline with this worker's generation backend."""
+        try:
+            results, failed = run_caption_pipeline(self, batch, self.stages, self.stage_order)
+        finally:
+            self._finish_caption_batch()
+        self.items_failed += failed
+        self.items_processed += len(results)
         return results
+
+    def _finish_caption_batch(self) -> None:
+        """Release any backend-local request buffers after success or failure."""
+
+    def _prepare_stage_batch(self, batch: list, stage: ProcessingStage) -> list:
+        """Preserve native token validation and image resize recovery."""
+        if self.model_manager is None:
+            logger.error("Model manager not initialized")
+            return []
+        try:
+            _, processor, tokenizer, sampling = self.model_manager.get_model_for_stage(
+                stage.name, stage.model
+            )
+        except KeyError as error:
+            logger.error("Model not found during batch processing: %s", error)
+            return []
+        max_length = stage.max_model_len or self.vllm_config.get("max_model_len", 16384)
+        processable, too_long = self._validate_and_split_batch(
+            batch, stage, processor, tokenizer, sampling, max_length
+        )
+        for item in too_long:
+            for ratio in (0.7, 0.5):
+                resized = self._resize_image_for_tokens(item, target_ratio=ratio)
+                accepted, _ = self._validate_and_split_batch(
+                    [resized], stage, processor, tokenizer, sampling, max_length
+                )
+                if accepted:
+                    processable.extend(accepted)
+                    break
+            else:
+                self.result_queue.put(
+                    {
+                        "item": item,
+                        "outputs": {},
+                        "processing_time_ms": 0.0,
+                        "error": f"Failed stage {stage.name}: token limit exceeded",
+                    }
+                )
+        return processable
+
+    def _generate_stage(
+        self, stage: ProcessingStage, requests: list[StageRequest], retry: bool
+    ) -> list:
+        """Translate one generation batch into native vLLM inputs."""
+        llm, processor, tokenizer, sampling = self.model_manager.get_model_for_stage(
+            stage.name, stage.model
+        )
+        if retry:
+            sampling = self.model_manager.create_sampling_params(
+                stage, self.vllm_config.get("sampling", {}), retry=True
+            )
+        inputs = [
+            self._build_vllm_input(
+                None
+                if retry and stage.retry_without_image
+                else ImageProcessor.prepare_for_inference(request.item),
+                request.prompt,
+                processor,
+                tokenizer,
+            )
+            for request in requests
+        ]
+        outputs = llm.generate(inputs, sampling)
+        if len(outputs) != len(requests):
+            raise RuntimeError("vLLM returned a different number of results than requests")
+        return [output.outputs[0].text if output.outputs else "" for output in outputs]
 
     def _build_vllm_input(self, image: Image.Image, prompt: str, processor, tokenizer) -> Dict:
         """Build vLLM input."""
+        if image is None:
+            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            prompt_text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            return {"prompt_token_ids": tokenizer(prompt_text, add_special_tokens=False).input_ids}
         try:
             from qwen_vl_utils import process_vision_info
 
@@ -1251,14 +1230,7 @@ class CaptionWorker(BaseWorker):
 
     def _clean_output(self, text: str) -> str:
         """Clean model output."""
-        if not text:
-            return ""
-
-        for token in ["<|end|>", "<|endoftext|>", "<|im_end|>", "I'm sorry", "I cannot"]:
-            if token in text:
-                text = text.split(token)[0]
-
-        return text.strip()
+        return self._validated_output(text) or ""
 
     def _get_heartbeat_data(self) -> Dict[str, Any]:
         """Get heartbeat data."""

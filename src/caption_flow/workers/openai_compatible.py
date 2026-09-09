@@ -10,12 +10,11 @@ import asyncio
 import base64
 import email.utils
 import io
-import json
 import logging
 import math
 import os
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock, Thread
@@ -25,10 +24,11 @@ import aiohttp
 from PIL import Image
 
 from .. import __version__
-from ..models import ProcessingStage, StageResult
+from ..models import ProcessingStage
 from ..utils.image_processor import ImageProcessor
-from ..utils.prompt_template import PromptTemplateManager
+from ..utils.output_policy import OutputPolicy
 from .caption import CaptionWorker, ProcessingItem
+from .pipeline import CaptionRejectedError, StageRequest
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -569,21 +569,6 @@ class OpenAICompatibleWorker(CaptionWorker):
         "presence_penalty",
         "seed",
     }
-    _DEFAULT_REFUSAL_MARKERS = (
-        "i'm sorry",
-        "i’m sorry",
-        "i cannot",
-        "i can't",
-        "i can’t",
-        "unable to provide",
-        "unable to describe",
-        "cannot provide",
-        "can't provide",
-        "can’t provide",
-        "cannot assist",
-        "can't assist",
-        "can’t assist",
-    )
     _POLICY_ERROR_MARKERS = (
         "contentfilter",
         "content filter",
@@ -596,12 +581,23 @@ class OpenAICompatibleWorker(CaptionWorker):
     )
 
     def __init__(self, config: Dict[str, Any]):  # noqa: C901
-        super().__init__(config)
         raw_config = config.get("openai_compatible")
         if raw_config is True:
             raw_config = {}
         if not isinstance(raw_config, dict):
             raise ValueError("openai_compatible worker configuration must be a mapping")
+        # Compatibility adapter for configs written before output policy was shared.
+        legacy_output = {
+            name: raw_config[name]
+            for name in OutputPolicy.__dataclass_fields__
+            if name in raw_config
+        }
+        super().__init__(
+            {
+                **config,
+                "output_processing": {**legacy_output, **config.get("output_processing", {})},
+            }
+        )
         self.api_config = raw_config
 
         raw_endpoints = raw_config.get("endpoints")
@@ -617,6 +613,7 @@ class OpenAICompatibleWorker(CaptionWorker):
         ]
         self.endpoint_pool = AdaptiveEndpointPool(endpoints)
         self.api_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._stage_image_urls: Dict[int, Optional[str]] = {}
         self.system_prompt = raw_config.get("system_prompt")
         self.include_image = bool(raw_config.get("include_image", True))
         self.image_detail = raw_config.get("image_detail", "auto")
@@ -624,52 +621,6 @@ class OpenAICompatibleWorker(CaptionWorker):
         self.image_quality = int(raw_config.get("image_quality", 90))
         configured_dimension = int(raw_config.get("max_image_dimension", 0) or 0)
         self.max_image_dimension = configured_dimension if configured_dimension > 0 else None
-        self._local_refusal_markers = (
-            self._normalize_refusal_markers(raw_config["refusal_markers"])
-            if "refusal_markers" in raw_config
-            else None
-        )
-        self.refusal_markers = (
-            self._local_refusal_markers
-            if self._local_refusal_markers is not None
-            else self._DEFAULT_REFUSAL_MARKERS
-        )
-        validate_json_output = raw_config.get("validate_json_output", False)
-        if not isinstance(validate_json_output, bool):
-            raise ValueError("openai_compatible.validate_json_output must be a boolean")
-        self.validate_json_output = validate_json_output
-        repair_json_escapes = raw_config.get("repair_invalid_json_escapes", False)
-        if not isinstance(repair_json_escapes, bool):
-            raise ValueError("openai_compatible.repair_invalid_json_escapes must be a boolean")
-        self.repair_invalid_json_escapes = repair_json_escapes
-        canonicalize_json_output = raw_config.get("canonicalize_json_output", False)
-        if not isinstance(canonicalize_json_output, bool):
-            raise ValueError("openai_compatible.canonicalize_json_output must be a boolean")
-        self.canonicalize_json_output = canonicalize_json_output
-        normalize_yxyx_bboxes = raw_config.get("normalize_yxyx_bboxes", False)
-        if not isinstance(normalize_yxyx_bboxes, bool):
-            raise ValueError("openai_compatible.normalize_yxyx_bboxes must be a boolean")
-        self.normalize_yxyx_bboxes = normalize_yxyx_bboxes
-        deduplicate_json_elements = raw_config.get("deduplicate_json_elements", False)
-        if not isinstance(deduplicate_json_elements, bool):
-            raise ValueError("openai_compatible.deduplicate_json_elements must be a boolean")
-        self.deduplicate_json_elements = deduplicate_json_elements
-        json_transforms = {
-            "repair_invalid_json_escapes": self.repair_invalid_json_escapes,
-            "canonicalize_json_output": self.canonicalize_json_output,
-            "normalize_yxyx_bboxes": self.normalize_yxyx_bboxes,
-            "deduplicate_json_elements": self.deduplicate_json_elements,
-        }
-        enabled_without_validation = [
-            name
-            for name, enabled in json_transforms.items()
-            if enabled and not validate_json_output
-        ]
-        if enabled_without_validation:
-            raise ValueError(
-                "openai_compatible.validate_json_output must be enabled when using: "
-                + ", ".join(enabled_without_validation)
-            )
         retry_extra_body = raw_config.get("retry_extra_body", {})
         if not isinstance(retry_extra_body, dict):
             raise ValueError("openai_compatible.retry_extra_body must be a mapping")
@@ -711,24 +662,19 @@ class OpenAICompatibleWorker(CaptionWorker):
         if batch_size is None:
             batch_size = sum(state.config.max_concurrency for state in self.endpoint_pool.states)
         self.vllm_config["batch_size"] = max(1, int(batch_size))
-        if self._local_refusal_markers is not None:
-            self.refusal_markers = self._local_refusal_markers
-        elif "refusal_markers" in self.vllm_config:
-            self.refusal_markers = self._normalize_refusal_markers(
-                self.vllm_config["refusal_markers"]
-            )
-        else:
-            self.refusal_markers = self._DEFAULT_REFUSAL_MARKERS
+        self._output_policy()
 
     def _handle_vllm_config_update(self, new_config: Dict[str, Any]) -> bool:
         """Apply shared prompt/stage changes without touching local credentials."""
         if not new_config:
             return True
+        new_stages = self._parse_stages_config(new_config)
+        new_order = self._topological_sort_stages(new_stages)
         self.vllm_config = dict(new_config)
         self._apply_local_overrides()
         self.mock_mode = bool(self.vllm_config.get("mock_results", False))
-        self.stages = self._parse_stages_config(self.vllm_config)
-        self.stage_order = self._topological_sort_stages(self.stages)
+        self.stages = new_stages
+        self.stage_order = new_order
         return True
 
     def _processing_thread(self):
@@ -746,285 +692,60 @@ class OpenAICompatibleWorker(CaptionWorker):
             loop.close()
             self.api_loop = None
 
-    def _process_batch_multi_stage(  # noqa: C901
-        self, batch: List[ProcessingItem], max_attempts: int = 3
-    ) -> List[Tuple[ProcessingItem, Dict]]:
-        del max_attempts  # Retries are controlled per endpoint.
+    def _prepare_stage_batch(self, batch: list, stage: ProcessingStage) -> list:
         if not self.api_loop:
             raise RuntimeError("OpenAI-compatible endpoint loop is not ready")
-
-        active_batch = list(batch)
-        image_urls: Dict[int, Optional[str]] = {}
         if self.include_image:
-            image_urls = self._image_data_urls(active_batch)
+            missing = [item for item in batch if id(item) not in self._stage_image_urls]
+            if missing:
+                self._stage_image_urls.update(self._image_data_urls(missing))
+        return batch
 
-        for stage_name in self.stage_order:
-            stage = next(stage for stage in self.stages if stage.name == stage_name)
-            requests: List[ChatRequest] = []
-            owners: List[ProcessingItem] = []
-            sampling = self._sampling_for_stage(stage)
+    def _finish_caption_batch(self) -> None:
+        self._stage_image_urls.clear()
 
-            for item in active_batch:
-                context = self._stage_context(item)
-
-                for prompt in PromptTemplateManager(stage.prompts).format_all(context):
-                    requests.append(
-                        ChatRequest(
-                            prompt=prompt,
-                            image_data_url=image_urls.get(id(item)),
-                            requested_model=stage.model,
-                            parameters=sampling,
-                            system_prompt=self.system_prompt,
-                            image_detail=self.image_detail,
-                        )
-                    )
-                    owners.append(item)
-
-            api_started = time.monotonic()
-            responses = self.api_loop.run_until_complete(self.endpoint_pool.run_many(requests))
-            outputs_by_item: Dict[int, List[str]] = defaultdict(list)
-            retryable_item_ids = set()
-            for owner, response in zip(owners, responses, strict=True):
-                if isinstance(response, Exception):
-                    logger.error(
-                        "API request failed for item %s in stage %s: %s",
-                        owner.item_key,
-                        stage_name,
-                        response,
-                    )
-                    if self._is_semantic_caption_failure(response):
-                        retryable_item_ids.add(id(owner))
-                    continue
-                cleaned = self._validated_output(self._clean_output(response))
-                if cleaned is not None:
-                    outputs_by_item[id(owner)].append(cleaned)
-                else:
-                    retryable_item_ids.add(id(owner))
-
-            retry_items = [
-                item
-                for item in active_batch
-                if id(item) in retryable_item_ids
-                and not outputs_by_item.get(id(item))
-                and stage.retry_prompt
-            ]
-            if retry_items:
-                retry_requests = []
-                retry_sampling = dict(sampling)
-                if stage.retry_sampling:
-                    retry_sampling.update(
-                        {
-                            key: value
-                            for key, value in stage.retry_sampling.items()
-                            if key in self._SUPPORTED_SAMPLING_KEYS and value is not None
-                        }
-                    )
-                for item in retry_items:
-                    context = self._stage_context(item)
-                    retry_prompt = PromptTemplateManager([stage.retry_prompt]).format_all(context)[
-                        0
-                    ]
-                    retry_requests.append(
-                        ChatRequest(
-                            prompt=retry_prompt,
-                            image_data_url=(
-                                None if stage.retry_without_image else image_urls.get(id(item))
-                            ),
-                            requested_model=stage.model,
-                            parameters=retry_sampling,
-                            extra_body=self.retry_extra_body,
-                            system_prompt=self.system_prompt,
-                            image_detail=self.image_detail,
-                        )
-                    )
-
-                logger.info(
-                    "Retrying %d empty or refused caption(s) in stage %s%s",
-                    len(retry_items),
-                    stage_name,
-                    " without images" if stage.retry_without_image else "",
-                )
-                retry_responses = self.api_loop.run_until_complete(
-                    self.endpoint_pool.run_many(retry_requests)
-                )
-                for item, response in zip(retry_items, retry_responses, strict=True):
-                    if isinstance(response, Exception):
-                        logger.error(
-                            "Fallback API request failed for item %s in stage %s: %s",
-                            item.item_key,
-                            stage_name,
-                            response,
-                        )
-                        continue
-                    cleaned = self._validated_output(self._clean_output(response))
-                    if cleaned is not None:
-                        outputs_by_item[id(item)].append(cleaned)
-                    else:
-                        logger.error(
-                            "Fallback returned no usable output for %s in stage %s",
-                            item.item_key,
-                            stage_name,
-                        )
-
-            logger.info(
-                "API stage %s completed %d request(s) in %.3f seconds",
-                stage_name,
-                len(requests) + len(retry_items),
-                time.monotonic() - api_started,
+    def _generate_stage(
+        self, stage: ProcessingStage, requests: list[StageRequest], retry: bool
+    ) -> list:
+        """Encode requests and classify provider errors for the shared pipeline."""
+        sampling = self._sampling_for_stage(stage)
+        if retry and stage.retry_sampling:
+            sampling.update(
+                {
+                    key: value
+                    for key, value in stage.retry_sampling.items()
+                    if key in self._SUPPORTED_SAMPLING_KEYS and value is not None
+                }
             )
-
-            next_batch = []
-            for item in active_batch:
-                outputs = outputs_by_item.get(id(item), [])
-                if outputs:
-                    item.stage_results[stage_name] = StageResult(
-                        stage_name=stage_name,
-                        output_field=stage.output_field,
-                        outputs=outputs,
-                    )
-                    next_batch.append(item)
-                else:
-                    logger.error("No outputs for %s in stage %s", item.item_key, stage_name)
-                    self.items_failed += 1
-            active_batch = next_batch
-            if not active_batch:
-                break
-
-        results = []
-        for item in active_batch:
-            outputs_by_field: Dict[str, List[str]] = defaultdict(list)
-            for stage_result in item.stage_results.values():
-                outputs_by_field[stage_result.output_field].extend(stage_result.outputs)
-            results.append((item, dict(outputs_by_field)))
-            self.items_processed += 1
-        return results
-
-    @staticmethod
-    def _normalize_refusal_markers(value: Any) -> Tuple[str, ...]:
-        if not isinstance(value, list) or any(
-            not isinstance(marker, str) or not marker.strip() for marker in value
-        ):
-            raise ValueError("refusal_markers must be a list of non-empty strings")
-        return tuple(dict.fromkeys(marker.strip().casefold() for marker in value))
-
-    def _is_refusal_text(self, text: str) -> bool:
-        normalized = text.strip().casefold()
-        return any(marker in normalized for marker in self.refusal_markers)
-
-    def _validated_output(self, text: str) -> Optional[str]:
-        if not text or self._is_refusal_text(text):
-            return None
-        if not self.validate_json_output:
-            return text
-
-        parsed_output = self._parse_json_output(text)
-        if parsed_output is None:
-            return None
-        parsed, text = parsed_output
-
-        if self.normalize_yxyx_bboxes:
-            self._normalize_yxyx_bbox_values(parsed)
-        if self.deduplicate_json_elements:
-            self._deduplicate_element_arrays(parsed)
-        if (
-            self.canonicalize_json_output
-            or self.normalize_yxyx_bboxes
-            or self.deduplicate_json_elements
-        ):
-            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-        return text
-
-    def _parse_json_output(self, text: str) -> Optional[Tuple[Any, str]]:
-        try:
-            return self._strict_json_loads(text), text
-        except (TypeError, ValueError) as error:
-            if self.repair_invalid_json_escapes:
-                repaired = self._repair_json_escapes(text)
-                if repaired != text:
-                    try:
-                        parsed = self._strict_json_loads(repaired)
-                    except (TypeError, ValueError):
-                        pass
-                    else:
-                        logger.warning("Repaired invalid JSON escape sequence: %s", error)
-                        return parsed, repaired
-            logger.warning("Rejecting invalid JSON output: %s", error)
-            return None
-
-    @staticmethod
-    def _strict_json_loads(text: str) -> Any:
-        def reject_constant(value: str) -> None:
-            raise ValueError(f"Invalid JSON numeric constant: {value}")
-
-        return json.loads(text, parse_constant=reject_constant)
-
-    @classmethod
-    def _deduplicate_element_arrays(cls, value: Any) -> None:
-        if isinstance(value, dict):
-            elements = value.get("elements")
-            if isinstance(elements, list):
-                unique = []
-                seen = set()
-                for element in elements:
-                    fingerprint = json.dumps(
-                        element, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                    )
-                    if fingerprint not in seen:
-                        seen.add(fingerprint)
-                        unique.append(element)
-                value["elements"] = unique
-            for child in value.values():
-                cls._deduplicate_element_arrays(child)
-        elif isinstance(value, list):
-            for child in value:
-                cls._deduplicate_element_arrays(child)
-
-    @classmethod
-    def _normalize_yxyx_bbox_values(cls, value: Any) -> None:
-        if isinstance(value, dict):
-            bbox = value.get("bbox")
-            if (
-                isinstance(bbox, list)
-                and len(bbox) == 4
-                and all(type(coordinate) is int for coordinate in bbox)
-            ):
-                ymin, xmin, ymax, xmax = bbox
-                value["bbox"] = [
-                    min(ymin, ymax),
-                    min(xmin, xmax),
-                    max(ymin, ymax),
-                    max(xmin, xmax),
-                ]
-            for child in value.values():
-                cls._normalize_yxyx_bbox_values(child)
-        elif isinstance(value, list):
-            for child in value:
-                cls._normalize_yxyx_bbox_values(child)
-
-    @staticmethod
-    def _repair_json_escapes(text: str) -> str:
-        """Escape only backslashes that cannot begin a valid JSON escape."""
-        repaired: List[str] = []
-        index = 0
-        while index < len(text):
-            char = text[index]
-            if char != "\\":
-                repaired.append(char)
-                index += 1
-                continue
-
-            following = text[index + 1] if index + 1 < len(text) else ""
-            valid_unicode = (
-                following == "u"
-                and all(digit in "0123456789abcdefABCDEF" for digit in text[index + 2 : index + 6])
-                and len(text[index + 2 : index + 6]) == 4
+        response_format = stage.response_format
+        if retry and stage.retry_response_format is not None:
+            response_format = stage.retry_response_format
+        extra_body = {"response_format": response_format} if response_format else {}
+        if retry:
+            extra_body.update(self.retry_extra_body)
+        calls = [
+            ChatRequest(
+                prompt=request.prompt,
+                image_data_url=(
+                    None
+                    if retry and stage.retry_without_image
+                    else self._stage_image_urls.get(id(request.item))
+                ),
+                requested_model=stage.model,
+                parameters=sampling,
+                extra_body=extra_body,
+                system_prompt=self.system_prompt,
+                image_detail=self.image_detail,
             )
-            if following in '"\\/bfnrt' or valid_unicode:
-                repaired.append(char)
-            else:
-                repaired.append("\\\\")
-            index += 1
-        return "".join(repaired)
+            for request in requests
+        ]
+        responses = self.api_loop.run_until_complete(self.endpoint_pool.run_many(calls))
+        return [
+            CaptionRejectedError(str(response))
+            if isinstance(response, Exception) and self._is_semantic_caption_failure(response)
+            else response
+            for response in responses
+        ]
 
     @classmethod
     def _is_semantic_caption_failure(cls, error: Exception) -> bool:
@@ -1035,17 +756,6 @@ class OpenAICompatibleWorker(CaptionWorker):
             message = str(error).lower()
             return "message content" in message
         return False
-
-    @staticmethod
-    def _stage_context(item: ProcessingItem) -> Dict[str, Any]:
-        context = dict(item.metadata)
-        for previous_name, result in item.stage_results.items():
-            for index, output in enumerate(result.outputs):
-                context[f"{previous_name}_output_{index}"] = output
-            context[result.output_field] = (
-                result.outputs[0] if len(result.outputs) == 1 else result.outputs
-            )
-        return context
 
     def _sampling_for_stage(self, stage: ProcessingStage) -> Dict[str, Any]:
         sampling = dict(self.vllm_config.get("sampling", {}))

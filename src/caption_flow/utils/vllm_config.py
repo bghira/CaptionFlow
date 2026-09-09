@@ -4,7 +4,41 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from .output_policy import validate_response_format
+
 logger = logging.getLogger(__name__)
+
+
+def create_native_sampling_params(sampling: Dict[str, Any], response_format=None):
+    """Preserve native vLLM tuning and translate a shared output constraint."""
+    from vllm import SamplingParams
+
+    validate_response_format(response_format)
+    if response_format is not None and any(
+        sampling.get(key) is not None for key in ("structured_outputs", "guided_decoding")
+    ):
+        raise ValueError("Use response_format or native structured-output sampling, not both")
+    params = {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_tokens": 256,
+        "stop": ["<|end|>", "<|endoftext|>", "<|im_end|>"],
+        "repetition_penalty": 1.05,
+        "skip_special_tokens": True,
+        **sampling,
+    }
+    if response_format and response_format.get("type") != "text":
+        from vllm import sampling_params
+
+        if response_format["type"] == "json_schema":
+            constraint = {"json": response_format["json_schema"]["schema"]}
+        elif response_format["type"] == "json_object":
+            constraint = {"json_object": True}
+        if hasattr(sampling_params, "StructuredOutputsParams"):
+            params["structured_outputs"] = sampling_params.StructuredOutputsParams(**constraint)
+        else:
+            params["guided_decoding"] = sampling_params.GuidedDecodingParams(**constraint)
+    return SamplingParams(**params)
 
 
 @dataclass
@@ -45,6 +79,9 @@ class VLLMConfigManager:
         "retry_prompt",
         "retry_sampling",
         "retry_without_image",
+        "output_processing",
+        "response_format",
+        "retry_response_format",
     }
 
     def __init__(self):
@@ -97,17 +134,8 @@ class VLLMConfigManager:
 
     def create_sampling_params(self, vllm_config: Dict[str, Any]):
         """Create SamplingParams from config."""
-        from vllm import SamplingParams
-
-        sampling_config = vllm_config.get("sampling", {})
-
-        params = SamplingParams(
-            temperature=sampling_config.get("temperature", 0.7),
-            top_p=sampling_config.get("top_p", 0.95),
-            max_tokens=sampling_config.get("max_tokens", 256),
-            stop=sampling_config.get("stop", ["<|end|>", "<|endoftext|>", "<|im_end|>"]),
-            repetition_penalty=sampling_config.get("repetition_penalty", 1.05),
-            skip_special_tokens=sampling_config.get("skip_special_tokens", True),
+        params = create_native_sampling_params(
+            vllm_config.get("sampling", {}), vllm_config.get("response_format")
         )
 
         self.current_sampling_params = params

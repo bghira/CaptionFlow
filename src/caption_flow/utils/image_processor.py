@@ -40,13 +40,18 @@ class ImageProcessor:
 
         if item.image is not None:
             image = item.image
-            item.metadata["image_width"], item.metadata["image_height"] = image.size
-            item.metadata["image_format"] = image.format or "unknown"
+            for name, value in (
+                ("image_width", image.width),
+                ("image_height", image.height),
+                ("image_format", image.format or "unknown"),
+            ):
+                if item.metadata.get(name) is None:
+                    item.metadata[name] = value
             # item.image = None
             return image
 
-        item.image = None
         image = ImageProcessor.decode_image_data(item.image_data)
+        item.image = image
         item.image_data = b""
         item.metadata["image_format"] = image.format or "unknown"
         item.metadata["image_width"], item.metadata["image_height"] = image.size
