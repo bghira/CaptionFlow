@@ -4,6 +4,16 @@ worker:
   token: "replace-with-captionflow-worker-token"
   name: "my-api-pool"
 
+  # Caption policy normally belongs in orchestrator.inference.output_processing
+  # and works identically with direct vLLM. Optional local overrides:
+  # output_processing:
+  #   refusal_markers: []
+  #   validate_json_output: true
+  #   repair_invalid_json_escapes: true
+  #   canonicalize_json_output: true
+  #   normalize_yxyx_bboxes: true
+  #   deduplicate_json_elements: true
+
   # Provider API keys stay in this process. They are never sent to CaptionFlow.
   openai_compatible:
     # Keep enough local items ready to fill all discovered request slots.
@@ -13,24 +23,9 @@ worker:
     image_format: "jpeg"
     image_quality: 90
 
-    # Optional local override for refusal detection. An empty list disables
-    # text-based refusal detection. This takes precedence over the shared
-    # orchestrator inference.refusal_markers setting.
-    # refusal_markers:
-    #   - "i cannot describe"
-    #   - "unable to provide a caption"
-
-    # Structured-output validation is optional. When enabled, invalid JSON is
-    # treated like an empty/refused result and can use inference.retry_prompt.
-    # The remaining transforms require validate_json_output: true.
-    # validate_json_output: true
-    # repair_invalid_json_escapes: true
-    # canonicalize_json_output: true
-    # normalize_yxyx_bboxes: true
-    # deduplicate_json_elements: true
-
-    # Provider-specific fields applied only to fallback requests. This is
-    # useful when the retry needs a stricter or smaller response schema.
+    # Provider-specific fields applied only to fallback requests. Prefer shared
+    # inference.retry_response_format for constraints that also apply to direct
+    # vLLM workers.
     # retry_extra_body:
     #   response_format:
     #     type: "json_object"
