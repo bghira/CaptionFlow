@@ -27,6 +27,11 @@ pip install --upgrade pip
 pip install "caption-flow[vllm]"
 ```
 
+The Linux GPU worker extra targets vLLM 0.31.x with PyTorch 2.13.0,
+torchvision 0.28.0, and torchaudio 2.11.0 (as required by vLLM), plus
+Transformers 5.10.4–5.17.x. To upgrade an existing worker from a checkout,
+run `pip install --upgrade -e ".[vllm]"` in its environment and restart it.
+
 An OpenAI-compatible API worker does not need the GPU dependencies:
 
 ```bash
