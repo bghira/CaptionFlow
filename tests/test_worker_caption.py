@@ -900,19 +900,11 @@ class TestCaptionWorker:
         # Process unit - this will trigger failures
         caption_worker._process_work_unit(unit)
 
-        # Check that work_failed was sent to orchestrator (failures > 0, processed == 0)
-        caption_worker.websocket.send.assert_called()
-
-        # Find the work_failed message
-        calls = caption_worker.websocket.send.call_args_list
-        work_failed_call = None
-        for call in calls:
-            sent_data = json.loads(call[0][0])
-            if sent_data.get("type") == "work_failed":
-                work_failed_call = sent_data
-                break
-
-        assert work_failed_call is not None, "work_failed message should have been sent"
+        # Completion/failure must follow all queued results on the same sender.
+        caption_worker.websocket.send.assert_not_called()
+        messages = list(caption_worker.result_queue.queue)
+        work_failed_call = messages[-1]["control"]
+        assert work_failed_call["type"] == "work_failed"
         assert work_failed_call["unit_id"] == "unit1"
         assert "Processing failed for" in work_failed_call["error"]
         assert "3 out of 3 items" in work_failed_call["error"]
@@ -965,21 +957,10 @@ class TestCaptionWorker:
         # Process unit (no failures, just incomplete)
         caption_worker._process_work_unit(unit)
 
-        # Check that work_failed was sent to orchestrator
-        caption_worker.websocket.send.assert_called()
-
-        # Find the work_failed message
-        calls = caption_worker.websocket.send.call_args_list
-        work_failed_call = None
-        for call in calls:
-            sent_data = json.loads(call[0][0])
-            if sent_data.get("type") == "work_failed":
-                work_failed_call = sent_data
-                break
-
-        assert (
-            work_failed_call is not None
-        ), "work_failed message should have been sent for incomplete unit"
+        caption_worker.websocket.send.assert_not_called()
+        messages = list(caption_worker.result_queue.queue)
+        work_failed_call = messages[-1]["control"]
+        assert work_failed_call["type"] == "work_failed"
         assert work_failed_call["unit_id"] == "unit1"
         assert "Processing incomplete" in work_failed_call["error"]
         assert "1/3 items processed" in work_failed_call["error"]

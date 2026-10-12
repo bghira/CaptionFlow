@@ -4,6 +4,7 @@ import datetime as _datetime
 import logging
 import os
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -198,6 +199,8 @@ class ChunkTracker(CheckpointTracker):
         auto_save_interval: int = 60,
     ):
         self.chunks: Dict[str, ChunkState] = {}
+        self.completed_chunk_ids: Set[str] = set()
+        self._batch_depth = 0
         self.max_completed_chunks_in_memory = max_completed_chunks_in_memory
         self.archive_after_hours = archive_after_hours
         self._completed_count = 0  # Track count without storing all IDs
@@ -219,7 +222,7 @@ class ChunkTracker(CheckpointTracker):
     def _deserialize_state(self, data: Dict[str, Any]) -> None:
         """Deserialize loaded data into instance state."""
         self.chunks = {}
-        self._completed_count = data.get("completed_count", 0)
+        self.completed_chunk_ids = set(data.get("completed_chunk_ids", []))
 
         # Load chunk states
         completed_chunks = 0
@@ -229,6 +232,9 @@ class ChunkTracker(CheckpointTracker):
                 self.chunks[chunk_id] = chunk_state
             if chunk_state.status == "completed":
                 completed_chunks += 1
+                self.completed_chunk_ids.add(chunk_id)
+
+        self._completed_count = len(self.completed_chunk_ids)
 
         logger.info(
             f"Loaded {len(self.chunks)} chunks from checkpoint, "
@@ -241,12 +247,37 @@ class ChunkTracker(CheckpointTracker):
         return {
             "chunks": {chunk_id: chunk.to_dict() for chunk_id, chunk in self.chunks.items()},
             "completed_count": self._completed_count,
+            "completed_chunk_ids": sorted(self.completed_chunk_ids),
         }
+
+    @contextmanager
+    def bulk_update(self):
+        """Persist one checkpoint for a storage reconciliation, not thousands."""
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if not self._batch_depth:
+                self.flush()
+
+    def reset_for_storage_rebuild(self):
+        """Discard cached acknowledgements, not caption data, before reconciliation."""
+        self.chunks.clear()
+        self.completed_chunk_ids.clear()
+        self._completed_count = 0
+        self._dirty = True
+
+    def _remember_completed(self, chunk_id: str):
+        self.completed_chunk_ids.add(chunk_id)
+        self._completed_count = len(self.completed_chunk_ids)
 
     def _mark_dirty(self):
         """Mark tracker as having pending changes."""
         self._dirty = True
         self._pending_changes += 1
+        if self._batch_depth:
+            return
 
         # Auto-save based on batch size or time interval
         now = datetime.now(_datetime.UTC)
@@ -296,6 +327,7 @@ class ChunkTracker(CheckpointTracker):
 
         if chunks_to_remove:
             for chunk_id in chunks_to_remove:
+                self._remember_completed(chunk_id)
                 del self.chunks[chunk_id]
             logger.info(f"Archived {len(chunks_to_remove)} old completed chunks from memory")
             self._mark_dirty()
@@ -313,6 +345,7 @@ class ChunkTracker(CheckpointTracker):
             # Remove oldest chunks
             to_remove = len(completed_chunks) - self.max_completed_chunks_in_memory
             for chunk_id, _ in completed_chunks[:to_remove]:
+                self._remember_completed(chunk_id)
                 del self.chunks[chunk_id]
 
             logger.info(f"Removed {to_remove} oldest completed chunks from memory")
@@ -322,6 +355,8 @@ class ChunkTracker(CheckpointTracker):
         self, chunk_id: str, shard_name: str, shard_url: str, start_index: int, chunk_size: int
     ) -> bool:
         """Add a new chunk. Returns False if chunk already exists and is completed."""
+        if chunk_id in self.completed_chunk_ids and chunk_id not in self.chunks:
+            return False
         if chunk_id in self.chunks:
             logger.debug(
                 f"Chunk {chunk_id} already exists with status: {self.chunks[chunk_id].status}"
@@ -358,10 +393,8 @@ class ChunkTracker(CheckpointTracker):
         """Mark chunk as completed."""
         if chunk_id in self.chunks:
             chunk = self.chunks[chunk_id]
-            was_completed = chunk.status == "completed"
             chunk.mark_completed()  # This clears processed_ranges
-            if not was_completed:
-                self._completed_count += 1
+            self._remember_completed(chunk_id)
             self._mark_dirty()
             logger.debug(f"Chunk {chunk_id} marked as completed")
 
@@ -394,10 +427,8 @@ class ChunkTracker(CheckpointTracker):
         chunk._invalidate_cache()
 
         if chunk.processed_count >= chunk_size:
-            was_completed = chunk.status == "completed"
             chunk.mark_completed()
-            if not was_completed:
-                self._completed_count += 1
+            self._remember_completed(chunk_id)
 
         self._mark_dirty()
         return True
@@ -405,6 +436,8 @@ class ChunkTracker(CheckpointTracker):
     def mark_failed(self, chunk_id: str):
         """Mark chunk as failed."""
         if chunk_id in self.chunks:
+            self.completed_chunk_ids.discard(chunk_id)
+            self._completed_count = len(self.completed_chunk_ids)
             chunk = self.chunks[chunk_id]
             chunk.status = "pending"  # Reset to pending for retry
             chunk.assigned_to = None
@@ -448,9 +481,7 @@ class ChunkTracker(CheckpointTracker):
         """Check if a chunk is completed (works even if chunk is archived)."""
         if chunk_id in self.chunks:
             return self.chunks[chunk_id].status == "completed"
-        # If not in memory, we can't know for sure without loading from disk
-        # Could implement a separate completed chunks index if needed
-        return False
+        return chunk_id in self.completed_chunk_ids
 
     def is_shard_complete(self, shard_name: str) -> bool:
         """Check if all chunks for a shard are complete."""
@@ -651,6 +682,8 @@ class ChunkTracker(CheckpointTracker):
                 # Mark ranges as processed
                 for start_idx, end_idx in ranges:
                     chunk.add_processed_range(start_idx, end_idx)
+                if chunk.status == "completed":
+                    self._remember_completed(chunk_id)
 
     def mark_items_processed(self, chunk_id: str, start_idx: int, end_idx: int) -> None:
         """Mark a range of items as processed within a chunk."""
@@ -691,7 +724,8 @@ class ChunkTracker(CheckpointTracker):
         # Check if chunk is now complete
         if chunk_state.get_unprocessed_ranges() == []:
             logger.info(f"Chunk {chunk_id} is now complete")
-            chunk_state.status = "completed"
+            chunk_state.mark_completed()
+            self._remember_completed(chunk_id)
 
         # Mark as dirty, will be saved based on batching logic
         self._mark_dirty()

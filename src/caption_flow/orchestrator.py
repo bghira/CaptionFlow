@@ -51,7 +51,7 @@ class Orchestrator:
         assert (
             processor_type is not None
         ), "You must supply processor_type in your orchestrator dataset configuration."
-        processor_config = ProcessorConfig(processor_type=processor_type, config=config)
+        self.processor_config = ProcessorConfig(processor_type=processor_type, config=config)
 
         # Initialize processor
         if processor_type == "webdataset":
@@ -70,7 +70,6 @@ class Orchestrator:
             caption_buffer_size=storage_config.get("caption_buffer_size", 1000),
         )
         self.auth = AuthManager(config.get("auth", {}))
-        self.processor.initialize(processor_config, self.storage)
 
         # Processing configuration
         self.chunks_per_request = config.get("chunks_per_request", 2)
@@ -132,6 +131,8 @@ class Orchestrator:
 
         # Initialize storage
         await self.storage.initialize()
+        # Checkpoints can include results that had not reached a durable flush.
+        self.processor.initialize(self.processor_config, self.storage)
 
         # Start background tasks
         asyncio.create_task(self._heartbeat_loop())
@@ -410,7 +411,9 @@ class Orchestrator:
 
         elif msg_type == "work_complete":
             unit_id = data["unit_id"]
-            self.processor.mark_completed(unit_id, worker_id)
+            if self.processor.mark_completed(unit_id, worker_id) is False:
+                logger.warning(f"Work unit {unit_id} reported complete before all results arrived")
+                return
             logger.debug(f"Work unit {unit_id} completed by worker {worker_id}")
             await self._send_activity(f"Chunk completed: {unit_id}")
 
@@ -428,9 +431,8 @@ class Orchestrator:
             logger.debug(f"Heartbeat from {worker_id}: {data}")
 
     async def _handle_results_submission(self, worker_id: str, data: Dict):
-        """Process results submission from worker - fires off async task and returns immediately."""
-        # Fire and forget - process in background
-        asyncio.create_task(self._process_result_async(worker_id, data))
+        """Accept results in connection order before handling a completion message."""
+        await self._process_result_async(worker_id, data)
 
     async def _process_result_async(self, worker_id: str, data: Dict):
         """Actually process the result in background."""
@@ -444,6 +446,9 @@ class Orchestrator:
             shard_name = job_id.shard_id
             chunk_name = job_id.chunk_id
 
+            if data.get("error") or not data.get("outputs"):
+                raise ValueError("A failed result cannot be recorded as completed work")
+
             result = WorkResult(
                 unit_id=data["unit_id"],
                 source_id=shard_name,
@@ -454,11 +459,6 @@ class Orchestrator:
                 metadata=data.get("metadata", {}),
                 processing_time_ms=data.get("processing_time_ms", 0),
             )
-
-            # Let processor handle any custom processing - this updates chunk tracker
-            # IMPORTANT: Call this BEFORE saving to storage so chunk tracker is updated
-            # regardless of whether the item is a duplicate
-            processed = self.processor.handle_result(result)
 
             # Create caption record for storage
             total_outputs = sum(len(v) for v in result.outputs.values())
@@ -480,7 +480,7 @@ class Orchestrator:
             caption = Caption(
                 job_id=job_id,
                 dataset=result.dataset,
-                shard=processed["source_id"],
+                shard=result.source_id,
                 chunk_id=chunk_name,
                 item_key=item_key,
                 captions=result.outputs.get("captions", []),
@@ -501,6 +501,11 @@ class Orchestrator:
             # Save to storage (might skip if duplicate)
             saved = await self.storage.save_caption(caption)
 
+            # Progress may only follow storage acceptance. A duplicate is also
+            # accepted: its caption is already present. Startup reconstructs
+            # progress from durable storage if buffered results are lost.
+            self.processor.handle_result(result)
+
             # Update contributor stats only if actually saved
             if saved:
                 contributor = await self.storage.get_contributor(worker_user)
@@ -509,8 +514,11 @@ class Orchestrator:
                     await self.storage.save_contributor(contributor)
 
         except Exception as e:
+            if data.get("unit_id"):
+                self.processor.mark_failed(data["unit_id"], worker_id, "Result acceptance failed")
             logger.error(
-                f"Error processing result from {worker_id} for unit {data.get('unit_id', 'unknown')}: {e}",
+                f"Error processing result from {worker_id} "
+                f"for unit {data.get('unit_id', 'unknown')}: {e}",
                 exc_info=True,
             )
 

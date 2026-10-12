@@ -17,6 +17,7 @@ import pandas as pd
 import pyarrow as pa
 
 from ..models import Caption, Contributor, JobId, StorageContents
+from ..utils.unicode_utils import utf8_safe_values
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("CAPTIONFLOW_LOG_LEVEL", "INFO").upper())
@@ -409,6 +410,10 @@ class StorageManager:
 
         # Extract outputs
         outputs = caption_dict.pop("outputs", {})
+        outputs = {
+            name: values if isinstance(values, (list, tuple)) else [values]
+            for name, values in outputs.items()
+        }
         caption_dict.pop("captions", None)
 
         # Get job_id for deduplication - convert to string early
@@ -488,8 +493,15 @@ class StorageManager:
                 for field_name in self.known_output_fields:
                     if field_name not in prepared_row:
                         prepared_row[field_name] = None
+                    elif prepared_row[field_name] is not None:
+                        prepared_row[field_name] = [
+                            json.dumps(value, ensure_ascii=False)
+                            if isinstance(value, dict)
+                            else value
+                            for value in prepared_row[field_name]
+                        ]
 
-                prepared_buffer.append(prepared_row)
+                prepared_buffer.append(utf8_safe_values(prepared_row))
 
             # Build schema and create table
             schema = self._build_caption_schema(self.known_output_fields)

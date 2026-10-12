@@ -651,21 +651,35 @@ class StorageExporter:
         logger.info(f"Created {files_created} text files in: {output_dir}")
         return files_created
 
-    def _normalize_webshart_captions(self, value: Any, export_column: str) -> List[str]:
-        """Normalize a caption export value to webshart's plural captions list."""
+    def _normalize_webshart_captions(
+        self, value: Any, export_column: str
+    ) -> List[Union[str, dict]]:
+        """Preserve native caption objects and decode JSON stored in text columns."""
+        if isinstance(value, dict):
+            return [self._serialize_value(value)]
         if isinstance(value, str):
+            if value.lstrip().startswith(("{", "[")):
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(parsed, dict) or (
+                        isinstance(parsed, list)
+                        and all(isinstance(item, (str, dict)) for item in parsed)
+                    ):
+                        return self._normalize_webshart_captions(parsed, export_column)
             return [value] if value else []
         if isinstance(value, (list, tuple)):
             captions = []
             for item in value:
                 if item is None:
                     continue
-                text = item if isinstance(item, str) else str(self._serialize_value(item))
-                if text:
-                    captions.append(text)
+                captions.extend(self._normalize_webshart_captions(item, export_column))
             return captions
         raise ExportError(
-            f"Column '{export_column}' must contain a string or list of strings "
+            f"Column '{export_column}' must contain a string, JSON object, "
+            "or list of strings/objects "
             "for webshart metadata export"
         )
 
