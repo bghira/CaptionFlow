@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+from collections import defaultdict
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -79,6 +80,74 @@ async def test_rejected_completion_does_not_announce_success():
     orchestrator._send_activity = AsyncMock()
     await orchestrator._process_worker_message("worker", {"type": "work_complete", "unit_id": "u"})
     orchestrator._send_activity.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize("registered", [False, True])
+async def test_worker_connection_waits_for_storage_before_reading_completion(saved, registered):
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.workers = {}
+    orchestrator.workers_by_user = defaultdict(set)
+    orchestrator.stats = {}
+    orchestrator.config = {
+        "dataset": {"processor_type": "webdataset"},
+        "auth": {"worker_tokens": []},
+        "storage": {"caption_buffer_size": 100},
+    }
+    orchestrator._send_activity = AsyncMock()
+    orchestrator.processor = Mock()
+    events = []
+    orchestrator.processor.handle_result.side_effect = lambda result: events.append("progress")
+    orchestrator.processor.mark_completed.side_effect = lambda *args: events.append("complete")
+    contributor = SimpleNamespace(total_captions=7)
+    orchestrator.storage = Mock()
+    orchestrator.storage.get_contributor = AsyncMock(
+        side_effect=[contributor if registered else None, contributor]
+    )
+    orchestrator.storage.save_contributor = AsyncMock()
+    saving, release = asyncio.Event(), asyncio.Event()
+
+    async def save(caption):
+        saving.set()
+        await release.wait()
+        events.append("storage")
+        return saved
+
+    orchestrator.storage.save_caption = AsyncMock(side_effect=save)
+
+    async def messages():
+        yield json.dumps({"type": "submit_results", **result_message()})
+        events.append("read completion")
+        yield json.dumps({"type": "work_complete", "unit_id": "00000:chunk:0"})
+
+    websocket = AsyncMock()
+    websocket.__aiter__.side_effect = messages
+    connection = asyncio.create_task(
+        orchestrator._handle_worker(websocket, SimpleNamespace(name="contributor"))
+    )
+    try:
+        await asyncio.wait_for(saving.wait(), timeout=2)
+        assert events == []
+        orchestrator.processor.handle_result.assert_not_called()
+        orchestrator.processor.mark_completed.assert_not_called()
+        release.set()
+        await asyncio.wait_for(connection, timeout=2)
+    finally:
+        if not connection.done():
+            connection.cancel()
+        await asyncio.gather(connection, return_exceptions=True)
+
+    assert events == ["storage", "progress", "read completion", "complete"]
+    assert contributor.total_captions == 7 + int(saved)
+    assert orchestrator.storage.save_contributor.await_count == int(saved) + int(not registered)
+    orchestrator._send_activity.assert_any_await("Chunk completed: 00000:chunk:0")
+    welcome = json.loads(websocket.send.call_args.args[0])
+    assert welcome["processor_config"] == {"dataset": {"processor_type": "webdataset"}}
+    assert not orchestrator.workers
+    assert not orchestrator.workers_by_user
+    assert orchestrator.stats["connected_workers"] == 0
+    orchestrator.processor.release_assignments.assert_called_once_with(welcome["worker_id"])
 
 
 def test_premature_completion_keeps_missing_results_retryable(tmp_path):

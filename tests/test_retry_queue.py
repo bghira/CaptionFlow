@@ -82,3 +82,51 @@ def test_promote_does_not_duplicate_assigned_or_pending_units():
     clock.return_value = 10
     processor._promote_ready_retries()
     assert list(processor.pending_units) == ["pending"]
+
+
+def test_completed_unit_restarts_backoff_without_reviving_stale_deadlines():
+    clock = Mock(return_value=0)
+    queue = RetryQueue(initial=5, maximum=20, clock=clock)
+    queue.defer("a")
+    clock.return_value = 1
+    queue.defer("a")
+    queue.complete("a")
+    queue.complete("a")
+    clock.return_value = 2
+    queue.defer("a")
+    assert queue.deadlines["a"] == 7
+    assert queue.attempts["a"] == 1
+    clock.return_value = 5
+    assert queue.ready() == []
+    clock.return_value = 7
+    assert queue.ready() == ["a"]
+    clock.return_value = 11
+    assert queue.ready() == []
+
+
+def test_ready_returns_all_due_units_once_without_promoting_future_retries():
+    clock = Mock(return_value=0)
+    queue = RetryQueue(initial=5, maximum=5, clock=clock)
+    for name in ["a", "b", "cancelled"]:
+        queue.defer(name)
+    queue.complete("cancelled")
+    clock.return_value = 3
+    queue.defer("later")
+    clock.return_value = 5
+    assert set(queue.ready()) == {"a", "b"}
+    assert queue.ready() == []
+    assert len(queue) == 1
+    clock.return_value = 8
+    assert queue.ready() == ["later"]
+    assert len(queue) == 0
+
+
+def test_backoff_remains_bounded_after_many_failures():
+    clock = Mock(return_value=0)
+    queue = RetryQueue(initial=5, maximum=300, clock=clock)
+    for _ in range(100):
+        queue.defer("a")
+    assert queue.attempts["a"] == 100
+    assert queue.deadlines["a"] == 300
+    clock.return_value = 300
+    assert queue.ready() == ["a"]
