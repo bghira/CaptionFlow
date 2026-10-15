@@ -119,7 +119,7 @@ Options:
 * **csv**: exports CSV-compatible data columns to the `--output` path containing incomplete metadata
 * **json**: creates a `.json` file for each sample inside the `--output` subdirectory containing **complete** metadata; useful for webdatasets
 * **txt**: creates `.txt` file for each sample inside the `--output` subdirectory containing ONLY captions
-* **webshart**: updates an **existing per-shard metadata `.json` file** by writing captions under the plural `captions` key. for this format, pass `--output` as the path to the existing shard metadata JSON file when exporting one shard. if you export multiple shards, pass `--output` as a directory containing one existing `{shard_name}.json` file per shard.
+* **webshart**: updates an **existing per-shard metadata `.json` file** by writing captions under the plural `captions` key. Strings, native JSON objects, and mixed lists are supported. JSON objects stored as text in Lance output columns are decoded during export, preserving nested values instead of writing Python dictionary representations. Native objects supplied through `Caption.outputs` are encoded as JSON only for Lance persistence. Requires webshart 0.6.0 or newer for native JSON caption support (included in the base dependencies). For this format, pass `--output` as the path to the existing shard metadata JSON file when exporting one shard. If you export multiple shards, pass `--output` as a directory containing one existing `{shard_name}.json` file per shard.
 * **huggingface_hub**: creates a dataset on Hugging Face Hub, possibly `--private` and `--nsfw` where necessary
 * **all**: creates the directory/file-generating export formats in a specified `--output` directory. prefer a directory here; `webshart` is a special case that expects existing per-shard metadata `.json` files rather than creating new metadata files.
 
@@ -193,6 +193,15 @@ vLLM tuning details.
 * huggingface hub datasets that are simple containers of raw image files
 * webdatasets shards containing full image data; also can be hosted on the hub
 * local folder filled with images; orchestrator will serve the data to workers
+
+For indexed Webshart reads, set `orchestrator.webshart_prefetch_shards: 1` to
+download the next shard in the background while captioning the current one.
+The default is `0` (disabled). This works with both direct vLLM and API workers,
+does not move the sample cursor, and is ignored for explicit remote-range reads.
+Size `shard_cache_gb` to hold the current shard plus the lookahead. Prefetch
+retries are spaced by `webshart_cache_retry_interval` (30 seconds by default);
+a prefetch failure never marks samples processed or prevents reading the
+current cached shard.
 
 ## configuration path
 

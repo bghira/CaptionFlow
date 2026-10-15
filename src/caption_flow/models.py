@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from PIL import Image
 
@@ -128,7 +128,9 @@ class Caption:
     caption_count: int = 1  # Number of captions generated for this item
     caption: Optional[str] = None
     captions: Optional[List[str]] = None
-    outputs: Dict[str, List[str]] = field(default_factory=dict)
+    outputs: Dict[str, Union[str, Dict[str, Any], List[Union[str, Dict[str, Any]]]]] = field(
+        default_factory=dict
+    )
     quality_score: Optional[float] = None
     quality_scores: Optional[List[float]] = None
 

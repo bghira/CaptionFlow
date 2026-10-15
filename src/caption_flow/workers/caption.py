@@ -849,15 +849,12 @@ class CaptionWorker(BaseWorker):
                 # Unit completed successfully
                 if self.websocket:
                     try:
-                        asyncio.run_coroutine_threadsafe(
-                            self.websocket.send(
-                                json.dumps({"type": "work_complete", "unit_id": unit.unit_id})
-                            ),
-                            self.main_loop,
-                        ).result(timeout=5)
+                        self.result_queue.put(
+                            {"control": {"type": "work_complete", "unit_id": unit.unit_id}}
+                        )
                         logger.info(
                             f"Unit {unit.unit_id} fully processed "
-                            f"({self.items_processed}/{total_items_in_unit}) and marked complete."
+                            f"({self.items_processed}/{total_items_in_unit}); completion queued."
                         )
                     except Exception as e:
                         logger.warning(
@@ -880,18 +877,15 @@ class CaptionWorker(BaseWorker):
 
                 if self.websocket:
                     try:
-                        asyncio.run_coroutine_threadsafe(
-                            self.websocket.send(
-                                json.dumps(
-                                    {
-                                        "type": "work_failed",
-                                        "unit_id": unit.unit_id,
-                                        "error": error_msg,
-                                    }
-                                )
-                            ),
-                            self.main_loop,
-                        ).result(timeout=5)
+                        self.result_queue.put(
+                            {
+                                "control": {
+                                    "type": "work_failed",
+                                    "unit_id": unit.unit_id,
+                                    "error": error_msg,
+                                }
+                            }
+                        )
                         logger.info(f"Unit {unit.unit_id} failure reported to orchestrator")
                     except Exception as e:
                         logger.warning(f"Could not notify work failed for unit {unit.unit_id}: {e}")
@@ -1177,9 +1171,11 @@ class CaptionWorker(BaseWorker):
             )
         inputs = [
             self._build_vllm_input(
-                None
-                if retry and stage.retry_without_image
-                else ImageProcessor.prepare_for_inference(request.item),
+                (
+                    None
+                    if retry and stage.retry_without_image
+                    else ImageProcessor.prepare_for_inference(request.item)
+                ),
                 request.prompt,
                 processor,
                 tokenizer,
@@ -1266,6 +1262,9 @@ class CaptionWorker(BaseWorker):
                 )
 
                 if self.websocket and self.connected.is_set():
+                    if "control" in result_data:
+                        await self.websocket.send(json.dumps(result_data["control"]))
+                        continue
                     item = result_data["item"]
                     logger.debug(f"Handling results for item: {item}")
                     outputs = result_data["outputs"]

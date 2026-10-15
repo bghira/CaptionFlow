@@ -52,6 +52,26 @@ class TestConfigReload:
         return orchestrator
 
     @pytest.mark.asyncio
+    async def test_bare_worker_prefetch_option_preserves_live_processor_and_config(
+        self, orchestrator
+    ):
+        original = orchestrator.config.copy()
+        processor = orchestrator.processor
+        storage = orchestrator.storage
+        auth = orchestrator.auth
+        websocket = AsyncMock(spec=ServerConnection)
+
+        await orchestrator._handle_config_reload(websocket, {"webshart_prefetch_shards": 1})
+
+        assert orchestrator.config == {**original, "webshart_prefetch_shards": 1}
+        assert orchestrator.processor is processor
+        assert orchestrator.storage is storage
+        assert orchestrator.auth is auth
+        processor.initialize.assert_not_called()
+        response = json.loads(websocket.send.call_args.args[0])
+        assert response == {"type": "reload_complete", "updated": [], "warnings": []}
+
+    @pytest.mark.asyncio
     async def test_config_reload_preserves_existing_auth_object_when_unchanged(self, orchestrator):
         """Test that config reload doesn't recreate AuthManager when auth config is unchanged."""
         # Get reference to initial auth manager

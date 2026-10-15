@@ -469,6 +469,29 @@ class TestWebDatasetOrchestratorProcessor:
             expected_process_calls, any_order=True
         )
 
+    @pytest.mark.parametrize("saved_end", [9990, 9999])
+    def test_storage_rebuild_respects_short_final_chunk(self, orchestrator_processor, saved_end):
+        processor = orchestrator_processor
+        processor.chunk_size = 64
+        processor.chunk_tracker.chunks.clear()
+        processor.shard_info_cache[0] = {
+            "name": "shard_0",
+            "num_samples": 10000,
+            "num_files": 30000,
+            "tar_path": "https://example.test/shard_0.tar",
+        }
+        processor.update_from_storage(
+            {f"shard_0:chunk:156:idx:{index}" for index in range(9984, saved_end + 1)}
+        )
+        state = processor.chunk_tracker.chunks["shard_0:chunk:156"]
+        assert state.chunk_size == 16
+        assert state.shard_url == "https://example.test/shard_0.tar"
+        if saved_end == 9999:
+            assert state.status == "completed"
+            assert state.get_unprocessed_ranges() == []
+        else:
+            assert state.get_unprocessed_ranges() == [(7, 15)]
+
     def test_update_from_storage_handles_malformed_job_ids(self, orchestrator_processor):
         """Test that malformed job IDs are handled gracefully."""
         processed_job_ids = {
@@ -559,6 +582,11 @@ class TestWebDatasetOrchestratorProcessor:
             },
         }
         orchestrator_processor.chunk_tracker.get_shards_summary = Mock(return_value=mock_summary)
+        orchestrator_processor.chunk_tracker.completed_chunk_ids = {
+            "completed1",
+            "completed2",
+            "completed3",
+        }
 
         # Add some work units
         orchestrator_processor.pending_units.extend(["unit1", "unit2"])
@@ -700,8 +728,9 @@ class TestWebDatasetOrchestratorProcessor:
         # Call mark_failed - this should NOT reset the chunk's processed ranges
         orchestrator_processor.mark_failed(unit_id, worker_id, "test error")
 
-        # Verify the unit was moved back to pending
-        assert unit_id in orchestrator_processor.pending_units
+        # Failed work is retained with backoff, not immediately cycled.
+        assert unit_id not in orchestrator_processor.pending_units
+        assert unit_id in orchestrator_processor.retry_queue.deadlines
         assert unit_id not in orchestrator_processor.assigned_units[worker_id]
 
         # Verify chunk tracker still retains the processed ranges (not reset)

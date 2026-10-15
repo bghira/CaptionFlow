@@ -616,9 +616,9 @@ class TestStorageExporter:
     def test_to_webshart_metadata_rejects_unexpected_caption_type(
         self, sample_storage_contents, temp_storage_dir
     ):
-        """Test webshart export rejects values that are not strings or lists."""
+        """Test webshart export rejects unsupported scalar values."""
         contents = StorageContents(
-            rows=[{"filename": "image1.jpg", "captions": {"bad": "shape"}}],
+            rows=[{"filename": "image1.jpg", "captions": 123}],
             columns=["filename", "captions"],
             output_fields=["captions"],
             total_rows=1,
@@ -626,8 +626,81 @@ class TestStorageExporter:
         )
         exporter = StorageExporter(contents)
 
-        with pytest.raises(ExportError, match="string or list of strings"):
+        with pytest.raises(ExportError, match="string, JSON object, or list"):
             exporter.to_webshart_metadata(temp_storage_dir / "shard-0000.json")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"description": "a café", "elements": [{"bbox": [1, 2, 30, 40]}]},
+            [{"description": "a café"}, "alternate"],
+            '{"description": "a café"}',
+            ['{"description": "a café"}', "alternate"],
+        ],
+    )
+    def test_to_webshart_metadata_preserves_native_json(self, temp_storage_dir, value):
+        import webshart
+
+        contents = StorageContents(
+            rows=[{"filename": "sample.jpg", "captions": value}],
+            columns=["filename", "captions"],
+            output_fields=["captions"],
+            total_rows=1,
+            metadata={},
+        )
+        metadata_path = temp_storage_dir / "shard-0000.json"
+        metadata_path.write_text(
+            json.dumps({"filesize": 0, "files": {"sample.jpg": {"offset": 0, "length": 0}}})
+        )
+        (temp_storage_dir / "shard-0000.tar").touch()
+        assert StorageExporter(contents).to_webshart_metadata(metadata_path) == 1
+        expected = value if isinstance(value, list) else [value]
+        expected = [
+            json.loads(item) if isinstance(item, str) and item.startswith("{") else item
+            for item in expected
+        ]
+        assert json.loads(metadata_path.read_text())["files"]["sample.jpg"]["captions"] == expected
+        dataset = webshart.discover_dataset(str(temp_storage_dir))
+        assert (
+            webshart.TarDataLoader(dataset, load_file_data=False).load_sample(0, 0).captions
+            == expected
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("as_list", [False, True])
+    async def test_native_outputs_survive_lance_storage_and_webshart_export(
+        self, temp_storage_dir, as_list
+    ):
+        native = {"description": "a café", "elements": [{"bbox": [1, 2, 30, 40]}]}
+        outputs = [native, "alternate"] if as_list else native
+        storage = StorageManager(temp_storage_dir / "storage")
+        await storage.initialize()
+        try:
+            await storage.save_caption(
+                Caption(
+                    job_id="native-caption",
+                    dataset="test-dataset",
+                    shard="default",
+                    item_key="sample",
+                    filename="sample.jpg",
+                    contributor_id="test-contributor",
+                    timestamp=datetime.now(),
+                    caption="preview",
+                    outputs={"captions": outputs},
+                )
+            )
+            contents = await storage.get_storage_contents()
+            assert contents.total_rows == 1
+            assert json.loads(contents.rows[0]["captions"][0]) == native
+            metadata_path = temp_storage_dir / "default.json"
+            metadata_path.write_text(
+                json.dumps({"filesize": 0, "files": {"sample.jpg": {"offset": 0, "length": 0}}})
+            )
+            assert StorageExporter(contents).to_webshart_metadata(metadata_path) == 1
+            stored = json.loads(metadata_path.read_text())["files"]["sample.jpg"]["captions"]
+            assert stored == (outputs if as_list else [native])
+        finally:
+            await storage.close()
 
     def test_empty_contents_handling(self):
         """Test handling of empty storage contents."""

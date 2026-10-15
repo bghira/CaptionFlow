@@ -2,10 +2,12 @@
 
 import gc
 import logging
+import math
 import os
 import threading
 import time
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, Iterator, List, Optional, Set
@@ -19,6 +21,7 @@ from caption_flow.storage import StorageManager
 
 from ..utils import ChunkTracker
 from ..utils.image_processor import ImageProcessor
+from ..utils.retry_queue import RetryQueue
 from .base import OrchestratorProcessor, ProcessorConfig, WorkerProcessor, WorkResult, WorkUnit
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         self.pending_units: Deque[str] = deque()
         self.assigned_units: Dict[str, Set[str]] = defaultdict(set)
         self.lock = threading.Lock()
+        self.retry_queue = RetryQueue()
 
         # Shard info cache
         self.shard_info_cache: Dict[int, Dict] = {}
@@ -63,6 +67,10 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         self.chunk_size = cfg.get("chunk_size", 1000)
         self.min_buffer = cfg.get("min_chunk_buffer", 10)
         self.buffer_multiplier = cfg.get("chunk_buffer_multiplier", 3)
+        self.retry_queue = RetryQueue(
+            float(cfg.get("retry_backoff_initial_seconds", 5)),
+            float(cfg.get("retry_backoff_max_seconds", 300)),
+        )
 
         # Cache configuration
         cache_dir = Path(cfg.get("cache_dir", "./webshart_cache"))
@@ -88,9 +96,12 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
             checkpoint_dir = Path(storage_cfg.get("checkpoint_dir", "./checkpoints"))
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             self.chunk_tracker = ChunkTracker(checkpoint_dir / "chunks.json")
+            # Lance is authoritative; a checkpoint may include unflushed results.
+            self.chunk_tracker.reset_for_storage_rebuild()
 
             # Restore existing state from chunk tracker
             self._restore_state(storage)
+            self.chunk_tracker.flush()
 
             # Start background unit creation
             self.unit_creation_thread = threading.Thread(
@@ -222,6 +233,21 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
             logger.info(f"Restored {restored_count} incomplete work units")
 
+    def _promote_ready_retries(self) -> None:
+        """Append due retries once, after fresh work; caller holds self.lock."""
+        queued = set(self.pending_units)
+        assigned = set().union(*self.assigned_units.values()) if self.assigned_units else set()
+        for unit_id in self.retry_queue.ready():
+            if unit_id in self.work_units and unit_id not in queued and unit_id not in assigned:
+                self.pending_units.append(unit_id)
+
+    def _fresh_buffer_size(self) -> int:
+        """Failed chunks cannot stop discovery of untouched source samples."""
+        queued = set(self.pending_units)
+        for assigned in self.assigned_units.values():
+            queued.update(assigned)
+        return sum(not self.retry_queue.is_retry(unit_id) for unit_id in queued)
+
     def _create_units_background(self) -> None:
         """Background thread to create work units on demand."""
         logger.info("Starting work unit creation thread")
@@ -232,12 +258,11 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         while not self.stop_creation.is_set():
             # Check if we need more units
             with self.lock:
-                pending_count = len(self.pending_units)
-                assigned_count = sum(len(units) for units in self.assigned_units.values())
+                self._promote_ready_retries()
                 worker_count = max(1, len(self.assigned_units))
 
                 target_buffer = max(self.min_buffer, worker_count * self.buffer_multiplier)
-                units_needed = max(0, target_buffer - (pending_count + assigned_count))
+                units_needed = max(0, target_buffer - self._fresh_buffer_size())
 
             if units_needed == 0:
                 threading.Event().wait(5)
@@ -284,8 +309,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                     # Check if chunk is already completed
                     if self.chunk_tracker:
-                        chunk_state = self.chunk_tracker.chunks.get(chunk_id)
-                        if chunk_state and chunk_state.status == "completed":
+                        if self.chunk_tracker.is_chunk_completed(chunk_id):
                             current_file_idx += self.chunk_size
                             continue
 
@@ -337,6 +361,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         assigned = []
 
         with self.lock:
+            self._promote_ready_retries()
             units_checked = 0
             max_units_to_check = len(self.pending_units)
 
@@ -349,6 +374,10 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 unit = self.work_units.get(unit_id)
 
                 if unit:
+                    if self.chunk_tracker and self.chunk_tracker.is_chunk_completed(unit_id):
+                        self.retry_queue.complete(unit_id)
+                        del self.work_units[unit_id]
+                        continue
                     # Update unprocessed ranges from chunk tracker before assigning
                     if self.chunk_tracker and unit_id in self.chunk_tracker.chunks:
                         chunk_state = self.chunk_tracker.chunks[unit_id]
@@ -360,6 +389,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                                 f"Chunk {unit_id} has no unprocessed ranges, marking as completed"
                             )
                             self.chunk_tracker.mark_completed(unit_id)
+                            self.retry_queue.complete(unit_id)
                             # Remove from work units
                             del self.work_units[unit_id]
                             continue
@@ -391,9 +421,16 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         logger.debug(f"Assigned {len(assigned)} units to worker {worker_id}")
         return assigned
 
-    def mark_completed(self, unit_id: str, worker_id: str) -> None:
-        """Mark a work unit as completed."""
+    def mark_completed(self, unit_id: str, worker_id: str) -> bool:
+        """Accept completion only when all item results have reached storage."""
         with self.lock:
+            if self.chunk_tracker and not self.chunk_tracker.is_chunk_completed(unit_id):
+                if unit_id in self.work_units:
+                    self.assigned_units[worker_id].discard(unit_id)
+                    self.pending_units = deque(uid for uid in self.pending_units if uid != unit_id)
+                    self.retry_queue.defer(unit_id)
+                return False
+            self.retry_queue.complete(unit_id)
             if unit_id in self.work_units:
                 self.assigned_units[worker_id].discard(unit_id)
 
@@ -402,14 +439,21 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
                 # Remove from memory
                 del self.work_units[unit_id]
+            return True
 
     def mark_failed(self, unit_id: str, worker_id: str, error: str) -> None:
         """Mark a work unit as failed."""
         logger.error(f"Unit {unit_id} failed on {worker_id}: {error}")
         with self.lock:
+            if self.chunk_tracker and self.chunk_tracker.is_chunk_completed(unit_id):
+                self.assigned_units[worker_id].discard(unit_id)
+                self.work_units.pop(unit_id, None)
+                self.retry_queue.complete(unit_id)
+                return
             if unit_id in self.work_units:
                 self.assigned_units[worker_id].discard(unit_id)
-                self.pending_units.append(unit_id)
+                self.pending_units = deque(uid for uid in self.pending_units if uid != unit_id)
+                self.retry_queue.defer(unit_id)
 
                 # NOTE: We don't call chunk_tracker.mark_failed() here because that would
                 # reset the entire chunk to unprocessed, losing any partial progress that
@@ -490,6 +534,18 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                         f"Marked range {start_idx}-{end_idx} as processed in chunk {result.chunk_id}"
                     )
 
+        # A late result may finish a unit after its premature completion or
+        # failure report. Clear every stale assignment without regenerating it.
+        if self.chunk_tracker and self.chunk_tracker.is_chunk_completed(result.chunk_id):
+            with self.lock:
+                self.retry_queue.complete(result.unit_id)
+                self.work_units.pop(result.unit_id, None)
+                self.pending_units = deque(
+                    uid for uid in self.pending_units if uid != result.unit_id
+                )
+                for assigned in self.assigned_units.values():
+                    assigned.discard(result.unit_id)
+
         return {
             "source_id": result.source_id,
             "chunk_id": result.chunk_id,
@@ -501,7 +557,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
         """Update work units based on what's been processed."""
         logger.info(f"Updating from {len(processed_job_ids)} processed jobs")
 
-        with self.lock:
+        with self.lock, self.chunk_tracker.bulk_update() if self.chunk_tracker else nullcontext():
             # Group by chunk
             processed_by_chunk = defaultdict(set)
 
@@ -518,7 +574,26 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
 
             # Update chunk tracker with processed items
             if self.chunk_tracker:
+                # Storage synchronization can also happen after _restore_state.
+                # Reconstructed final chunks must use the real shard bounds,
+                # not the configured full chunk size.
+                missing_shards = {
+                    chunk_id.split(":", 1)[0]
+                    for chunk_id in processed_by_chunk
+                    if chunk_id not in self.chunk_tracker.chunks
+                    and not self.chunk_tracker.is_chunk_completed(chunk_id)
+                }
+                current_shards = {}
+                if self.dataset and missing_shards:
+                    for shard_idx in range(self.dataset.num_shards):
+                        info = self._get_shard_info_cached(shard_idx)
+                        if info and info.get("name") in missing_shards:
+                            current_shards[info["name"]] = info
+                        if len(current_shards) == len(missing_shards):
+                            break
                 for chunk_id, indices in processed_by_chunk.items():
+                    if self.chunk_tracker.is_chunk_completed(chunk_id):
+                        continue
                     if indices:
                         # Get or create chunk state
                         chunk_state = self.chunk_tracker.chunks.get(chunk_id)
@@ -532,13 +607,23 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                                     chunk_idx = int(parts[2])
                                     # Infer start index from chunk index and size
                                     start_index = chunk_idx * self.chunk_size
+                                    info = current_shards.get(shard_name, {})
+                                    sample_count = info.get("num_samples", info.get("num_files"))
+                                    chunk_size = self.chunk_size
+                                    if sample_count is not None:
+                                        chunk_size = max(
+                                            0, min(chunk_size, sample_count - start_index)
+                                        )
+                                    shard_url = info.get("tar_path") or info.get(
+                                        "path", f"{shard_name}.tar"
+                                    )
                                     # Create chunk state
                                     self.chunk_tracker.add_chunk(
                                         chunk_id,
                                         shard_name,
-                                        f"{shard_name}.tar",
+                                        shard_url,
                                         start_index,
-                                        self.chunk_size,
+                                        chunk_size,
                                     )
                                     logger.info(f"Created missing chunk state for {chunk_id}")
                             except (ValueError, IndexError) as e:
@@ -578,12 +663,11 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
             # Get chunk tracker stats if available
             if self.chunk_tracker:
                 shards_summary = self.chunk_tracker.get_shards_summary()
-                total_chunks = sum(len(s.get("chunks", [])) for s in shards_summary.values())
-                completed_chunks = sum(
-                    1
+                completed_chunks = len(self.chunk_tracker.completed_chunk_ids)
+                total_chunks = completed_chunks + sum(
+                    c.status != "completed"
                     for s in shards_summary.values()
                     for c in s.get("chunks", [])
-                    if c.status == "completed"
                 )
             else:
                 total_chunks = len(self.work_units)
@@ -593,6 +677,7 @@ class WebDatasetOrchestratorProcessor(OrchestratorProcessor):
                 "total_shards": self.dataset.num_shards if self.dataset else 0,
                 "total_chunks": total_chunks,
                 "pending_units": len(self.pending_units),
+                "delayed_retry_units": len(self.retry_queue),
                 "assigned_units": sum(len(units) for units in self.assigned_units.values()),
                 "completed_chunks": completed_chunks,
                 "workers": len(self.assigned_units),
@@ -626,6 +711,11 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.decode_images = True
         self.webshart_parallel_downloads = 4
         self.webshart_chunk_size_mb = 10
+        self.webshart_cache_wait_timeout = 120.0
+        self.webshart_cache_retry_interval = 30.0
+        self.webshart_prefetch_shards = 0
+        self._prefetch_attempts: Dict[int, float] = {}
+        self._prefetch_lock = threading.Lock()
         self._remote_shard_layouts: Dict[int, Dict[str, Any]] = {}
         self.http_session: Optional[requests.Session] = None
 
@@ -643,6 +733,19 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
         self.decode_images = bool(dataset_cfg.get("decode_images", True))
         self.webshart_parallel_downloads = max(1, int(cfg.get("webshart_parallel_downloads", 4)))
         self.webshart_chunk_size_mb = max(1, int(cfg.get("webshart_chunk_size_mb", 10)))
+        lookahead = cfg.get("webshart_prefetch_shards", 0)
+        if isinstance(lookahead, bool) or not isinstance(lookahead, int) or lookahead < 0:
+            raise ValueError("webshart_prefetch_shards must be a nonnegative integer")
+        self.webshart_prefetch_shards = lookahead
+        self._prefetch_attempts.clear()
+        for name, default in (
+            ("webshart_cache_wait_timeout", 120.0),
+            ("webshart_cache_retry_interval", 30.0),
+        ):
+            value = float(cfg.get(name, default))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a finite positive number")
+            setattr(self, name, value)
         split_worker_cache = dataset_cfg.get(
             "split_worker_cache", True
         )  # multiple workers get their own cache by default
@@ -687,6 +790,72 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                 )
 
             logger.info("webshart TarDataLoader initialized")
+
+    def _wait_for_cached_shard(self, shard_name: str) -> None:
+        """Wait for a whole shard, avoiding Webshart's per-file HTTP fallback.
+
+        Webshart may fall back to individual range requests if a cache download
+        fails. On HTTP throttling, doing that for every item amplifies the
+        failure. A bounded wait leaves the whole unit available for retry.
+        """
+        if self.remote_range_reads:
+            return
+        status = getattr(self.loader, "get_shard_cache_status", None)
+        prepare = getattr(self.loader, "prepare_shard_by_name", None)
+        if not callable(status) or not callable(prepare):
+            return  # Compatibility with older Webshart versions.
+        deadline = time.monotonic() + self.webshart_cache_wait_timeout
+        next_retry = 0.0
+        while not status(shard_name).get("is_cached", False):
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(f"Timed out waiting for cached shard {shard_name}")
+            if now >= next_retry:
+                logger.info("Waiting for Webshart to cache shard %s", shard_name)
+                prepare(shard_name)
+                next_retry = now + self.webshart_cache_retry_interval
+            time.sleep(min(0.2, deadline - now))
+
+    def _prefetch_upcoming_shards(self, shard_idx: Optional[int]) -> None:
+        """Schedule bounded lookahead for indexed reads, without moving the cursor.
+
+        load_sample() does not advance Webshart's sequential iterator, so its
+        cursor-relative prefetch cannot identify the next assigned shard.
+        Webshart owns the asynchronous downloads and shared cache coordination.
+        """
+        if (
+            not self.webshart_prefetch_shards
+            or self.remote_range_reads
+            or shard_idx is None
+            or self.dataset is None
+        ):
+            return
+        prepare = getattr(self.loader, "prepare_shard_by_name", None)
+        status = getattr(self.loader, "get_shard_cache_status", None)
+        if not callable(prepare) or not callable(status):
+            return
+        end = min(shard_idx + 1 + self.webshart_prefetch_shards, self.dataset.num_shards)
+        for index in range(shard_idx + 1, end):
+            now = time.monotonic()
+            with self._prefetch_lock:
+                previous = self._prefetch_attempts.get(index)
+                if previous is not None and now - previous < self.webshart_cache_retry_interval:
+                    continue
+                self._prefetch_attempts[index] = now
+                while len(self._prefetch_attempts) > max(8, 2 * self.webshart_prefetch_shards):
+                    self._prefetch_attempts.pop(next(iter(self._prefetch_attempts)))
+            try:
+                name = self.dataset.get_shard_info(index)["name"]
+                if not status(name).get("is_cached", False):
+                    prepare(name)
+                    logger.info("Prefetching Webshart shard %s", name)
+            except Exception as error:
+                # Prefetch is opportunistic. The existing bounded cache wait
+                # remains authoritative when this shard is actually assigned.
+                # Do not log exception text that might contain signed URLs.
+                logger.warning(
+                    "Webshart prefetch failed for index %s (%s)", index, type(error).__name__
+                )
 
     def _get_remote_shard_layout(self, shard_idx: int) -> Dict[str, Any]:
         """Load a remote shard's sample ordering and byte-range metadata."""
@@ -815,6 +984,9 @@ class WebDatasetWorkerProcessor(WorkerProcessor):
                     processed_indices.append(idx)
         else:
             # Use webshart to process unprocessed ranges
+            if unprocessed_ranges:
+                self._wait_for_cached_shard(shard_name)
+                self._prefetch_upcoming_shards(shard_idx)
             for start_idx, end_idx in unprocessed_ranges:
                 try:
                     use_sample_loader = shard_idx is not None and hasattr(

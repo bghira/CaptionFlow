@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass, fields
 from typing import Any, Mapping, Optional
 
+from .unicode_utils import escape_surrogates
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_REFUSAL_MARKERS = (
@@ -104,7 +106,7 @@ class OutputPolicy:
         if not text or self.is_refusal(text):
             return None
         if not self.validate_json_output:
-            return text
+            return escape_surrogates(text)
         try:
             parsed = self._loads(text)
         except ValueError as error:
@@ -127,8 +129,10 @@ class OutputPolicy:
             or self.normalize_yxyx_bboxes
             or self.deduplicate_json_elements
         ):
-            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        return text
+            return escape_surrogates(
+                json.dumps(parsed, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            )
+        return escape_surrogates(text)
 
     @staticmethod
     def _loads(text: str) -> Any:
