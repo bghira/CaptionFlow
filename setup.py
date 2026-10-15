@@ -51,21 +51,21 @@ base_deps = [
     "urwid>=3.0.2,<5.0.0",
 ]
 
-# vLLM 0.25.1 currently selects the PyTorch 2.11.0 family. Keep these
-# explicit so a worker install cannot silently combine incompatible torch
-# packages when another dependency broadens its requirements.
+# Match vLLM 0.31's published requirements, including torchaudio 2.11.0.
+# Keep these explicit so a worker install cannot silently combine incompatible
+# torch packages when another dependency broadens its requirements.
 vllm_deps = [
-    "vllm>=0.25.1,<0.26.0",
-    "torch==2.11.0",
-    "torchvision==0.26.0",
+    "vllm>=0.31.0,<0.32.0",
+    "torch==2.13.0",
+    "torchvision==0.28.0",
     "torchaudio==2.11.0",
-    "transformers>=5.5.3,<6.0.0",
+    "transformers>=5.10.4,<5.18.0",
     "qwen-vl-utils>=0.0.14,<0.1.0",
 ]
 
 PYTORCH_DEPENDENCIES = [
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
     "torchaudio>=2.11.0",
 ]
 
@@ -92,7 +92,7 @@ extras_require = {
         "pytest>=8.0.0,<9.0.0",
         "pytest-asyncio>=1.1.0,<2.0.0",
         "pytest-cov>=6.0.0,<7.0.0",
-        "transformers>=5.5.3,<6.0.0",
+        "transformers>=5.10.4,<5.18.0",
         "black>=25.0.0,<26.0.0",
         "ruff>=0.12.0,<1.0.0",
         "mypy>=1.17.0,<2.0.0",

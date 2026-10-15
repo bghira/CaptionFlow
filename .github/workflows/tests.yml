@@ -8,6 +8,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'pyproject.toml'
+      - 'setup.py'
       - '.github/workflows/tests.yml'
   pull_request:
     branches: [ main ]
@@ -15,6 +16,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'pyproject.toml'
+      - 'setup.py'
       - '.github/workflows/tests.yml'
 
 jobs:
@@ -37,7 +39,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
+        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml', '**/setup.py') }}
         restore-keys: |
           ${{ runner.os }}-pip-${{ matrix.python-version }}-
           ${{ runner.os }}-pip-
@@ -73,7 +75,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-lint-${{ hashFiles('**/pyproject.toml') }}
+        key: ${{ runner.os }}-pip-lint-${{ hashFiles('**/pyproject.toml', '**/setup.py') }}
         restore-keys: |
           ${{ runner.os }}-pip-lint-
     
