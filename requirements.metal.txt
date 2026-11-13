@@ -1,0 +1,5 @@
+# macOS 15+, Apple Silicon, CPython 3.12. Run from the repository root.
+# Matching stable release pair; the core wheel selects PyTorch 2.14.0.
+.[apple]
+https://github.com/vllm-project/vllm/releases/download/v0.33.0rc3/vllm-0.33.0%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl
+https://github.com/vllm-project/vllm-metal/releases/download/v0.33.0/vllm_metal-0.33.0-cp312-cp312-macosx_15_0_arm64.whl
