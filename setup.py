@@ -37,7 +37,7 @@ base_deps = [
     "numpy>=2.3.5,<2.4.0; python_version < '3.13'",
     "numpy>=2.4.6,<2.5.0; python_version >= '3.13'",
     "Pillow>=13.0.0,<14.0.0",
-    "trainingsample>=0.3.2,<0.4.0",
+    "trainingsample==0.4.0",
     "pandas>=3.1.1,<4.0.0",
     "datasets>=5.2.0,<6.0.0",
     "boto3>=1.44.3,<2.0.0",
