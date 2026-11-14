@@ -199,6 +199,43 @@ async def test_pool_lifecycle_guards_and_disabled_endpoint_result():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_batch_releases_requests_and_pool_capacity():
+    pool = AdaptiveEndpointPool([endpoint_config(max_concurrency=1)])
+    pool.session = object()
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    request_tasks = []
+
+    async def blocked_request(state, request):
+        request_tasks.append(asyncio.current_task())
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    pool._request_once = blocked_request
+    batch = asyncio.create_task(pool.run_many([ChatRequest("caption", None, "model")]))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        batch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await batch
+        assert stopped.is_set(), "Cancelling a batch must stop its provider requests"
+        assert pool.snapshot()[0]["inflight"] == 0
+
+        pool._request_once = AsyncMock(return_value="next caption")
+        assert await asyncio.wait_for(
+            pool.run_many([ChatRequest("next", None, "model")]), timeout=1
+        ) == ["next caption"]
+    finally:
+        batch.cancel()
+        for task in request_tasks:
+            task.cancel()
+        await asyncio.gather(batch, *request_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_pool_disables_endpoint_after_authentication_failure():
     pool = AdaptiveEndpointPool([endpoint_config(max_retries=0)])
     pool.session = object()

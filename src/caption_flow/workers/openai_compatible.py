@@ -366,75 +366,86 @@ class AdaptiveEndpointPool:
         running: Dict[asyncio.Task, Tuple[PendingRequest, EndpointState, float]] = {}
         results: List[Any] = [None] * len(requests)
 
-        while pending or running:
-            now = asyncio.get_running_loop().time()
+        try:
+            while pending or running:
+                now = asyncio.get_running_loop().time()
 
-            # Fill every currently discovered endpoint slot.
-            made_progress = True
-            while pending and made_progress:
-                made_progress = False
-                for _ in range(len(pending)):
-                    item = pending.popleft()
-                    if item.ready_at > now:
-                        pending.append(item)
-                        continue
-                    state = self._choose_state(now)
-                    if state is None:
-                        pending.appendleft(item)
+                # Fill every currently discovered endpoint slot.
+                made_progress = True
+                while pending and made_progress:
+                    made_progress = False
+                    for _ in range(len(pending)):
+                        item = pending.popleft()
+                        if item.ready_at > now:
+                            pending.append(item)
+                            continue
+                        state = self._choose_state(now)
+                        if state is None:
+                            pending.appendleft(item)
+                            break
+                        item.attempts += 1
+                        self._reserve(state, now)
+                        task = asyncio.create_task(self._request_once(state, item.request))
+                        running[task] = (item, state, now)
+                        made_progress = True
+
+                if not running:
+                    enabled = [state for state in self.states if not state.disabled_reason]
+                    if not enabled:
+                        error = RuntimeError("All OpenAI-compatible endpoints are disabled")
+                        while pending:
+                            results[pending.popleft().index] = error
                         break
-                    item.attempts += 1
-                    self._reserve(state, now)
-                    task = asyncio.create_task(self._request_once(state, item.request))
-                    running[task] = (item, state, now)
-                    made_progress = True
+                    wake_at = self._next_wakeup(pending, now)
+                    await asyncio.sleep(max(0.01, min(1.0, wake_at - now)))
+                    continue
 
-            if not running:
-                enabled = [state for state in self.states if not state.disabled_reason]
-                if not enabled:
-                    error = RuntimeError("All OpenAI-compatible endpoints are disabled")
-                    while pending:
-                        results[pending.popleft().index] = error
-                    break
                 wake_at = self._next_wakeup(pending, now)
-                await asyncio.sleep(max(0.01, min(1.0, wake_at - now)))
-                continue
+                timeout = max(0.01, min(1.0, wake_at - now)) if pending else None
+                done, _ = await asyncio.wait(
+                    running,
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-            wake_at = self._next_wakeup(pending, now)
-            timeout = max(0.01, min(1.0, wake_at - now)) if pending else None
-            done, _ = await asyncio.wait(
-                running,
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+                for task in done:
+                    item, state, started_at = running.pop(task)
+                    self._release(state)
+                    elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
+                    try:
+                        text = task.result()
+                        self._record_success(state, elapsed_ms)
+                        results[item.index] = text
+                    except Exception as error:
+                        now = asyncio.get_running_loop().time()
+                        retry_delay = self._record_failure(state, error, now)
+                        retryable = not isinstance(error, EndpointRequestError) or error.retryable
+                        max_retries = max(state.config.max_retries for state in self.states)
+                        enabled = any(not candidate.disabled_reason for candidate in self.states)
+                        if retryable and enabled and item.attempts <= max_retries:
+                            alternative_ready = any(
+                                candidate is not state
+                                and not candidate.disabled_reason
+                                and candidate.cooldown_until <= now
+                                and candidate.next_request_at <= now
+                                for candidate in self.states
+                            )
+                            # A provider's Retry-After applies to that provider, not
+                            # to another independently configured endpoint.
+                            item.ready_at = now if alternative_ready else now + retry_delay
+                            pending.append(item)
+                        else:
+                            results[item.index] = error
 
-            for task in done:
-                item, state, started_at = running.pop(task)
-                self._release(state)
-                elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
-                try:
-                    text = task.result()
-                    self._record_success(state, elapsed_ms)
-                    results[item.index] = text
-                except Exception as error:
-                    now = asyncio.get_running_loop().time()
-                    retry_delay = self._record_failure(state, error, now)
-                    retryable = not isinstance(error, EndpointRequestError) or error.retryable
-                    max_retries = max(state.config.max_retries for state in self.states)
-                    enabled = any(not candidate.disabled_reason for candidate in self.states)
-                    if retryable and enabled and item.attempts <= max_retries:
-                        alternative_ready = any(
-                            candidate is not state
-                            and not candidate.disabled_reason
-                            and candidate.cooldown_until <= now
-                            and candidate.next_request_at <= now
-                            for candidate in self.states
-                        )
-                        # A provider's Retry-After applies to that provider, not
-                        # to another independently configured endpoint.
-                        item.ready_at = now if alternative_ready else now + retry_delay
-                        pending.append(item)
-                    else:
-                        results[item.index] = error
+        finally:
+            # asyncio.wait does not cancel its children when the batch is cancelled.
+            # Drain them before releasing slots so subsequent batches can proceed.
+            for task in running:
+                task.cancel()
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+                for _, state, _ in running.values():
+                    self._release(state)
 
         return results
 

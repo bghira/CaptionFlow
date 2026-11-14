@@ -9,6 +9,7 @@ import threading
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterator, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 import aiofiles
 import requests
@@ -173,10 +174,16 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                     while chunk := await f.read(1024 * 1024):  # 1MB chunks
                         yield chunk
 
+            encoded_filename = quote(file_path.name)
+            if encoded_filename == file_path.name:
+                disposition = f'inline; filename="{file_path.name}"'
+            else:
+                disposition = f"inline; filename*=utf-8''{encoded_filename}"
+
             return StreamingResponse(
                 stream_file(),
                 media_type=content_type,
-                headers={"Content-Disposition": f'inline; filename="{file_path.name}"'},
+                headers={"Content-Disposition": disposition},
             )
 
         @self.http_app.get("/info")
@@ -280,7 +287,7 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
                 units_needed = max(0, target_buffer - (pending_count + assigned_count))
 
             if units_needed == 0:
-                threading.Event().wait(5)
+                self.stop_creation.wait(5)
                 continue
 
             # Create units as needed
@@ -347,6 +354,9 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
 
             if units_created > 0:
                 logger.debug(f"Created {units_created} work units")
+            else:
+                # No more images to turn into units; avoid spinning while workers finish.
+                self.stop_creation.wait(1)
 
     def _subtract_ranges(
         self, total_ranges: List[Tuple[int, int]], processed_ranges: List[Tuple[int, int]]
