@@ -720,22 +720,22 @@ class StorageManager:
                 existing[row["contributor_id"]] = row
 
         repaired = []
-        for contributor_id, total in totals.items():
-            row = existing.get(contributor_id, {})
-            repaired.append(
+        for contributor_id in sorted(existing.keys() | totals.keys()):
+            row = existing.get(
+                contributor_id,
                 {
                     "contributor_id": contributor_id,
-                    "name": row.get("name") or contributor_id,
-                    "total_captions": total,
-                    "trust_level": int(row.get("trust_level") or 1),
-                }
+                    "name": contributor_id,
+                    "trust_level": 1,
+                },
             )
+            repaired.append({**row, "total_captions": totals.get(contributor_id, 0)})
 
         table = pa.Table.from_pylist(repaired, schema=self.contributor_schema)
         self.contributors_dataset = lance.write_dataset(
             table, str(self.contributors_path), mode="overwrite"
         )
-        self.existing_contributor_ids = set(totals)
+        self.existing_contributor_ids = set(existing) | set(totals)
         logger.info("Reconciled %d contributor totals from captions", len(repaired))
 
     async def _flush_jobs(self):

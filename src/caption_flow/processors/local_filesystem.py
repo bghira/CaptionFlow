@@ -423,29 +423,41 @@ class LocalFilesystemOrchestratorProcessor(OrchestratorProcessor):
         logger.debug("Returning %d work units to worker %s", len(assigned), worker_id)
         return assigned
 
-    def mark_completed(self, unit_id: str, worker_id: str) -> None:
-        """Mark a work unit as completed."""
+    def mark_completed(self, unit_id: str, worker_id: str) -> bool:
+        """Accept completion only after every caption has been accepted."""
         logger.debug("Marking unit %s as completed by worker %s", unit_id, worker_id)
         with self.lock:
-            if unit_id in self.work_units:
+            if self.chunk_tracker and self.chunk_tracker.is_chunk_completed(unit_id):
                 self.assigned_units[worker_id].discard(unit_id)
+                return True
 
-                if self.chunk_tracker:
-                    self.chunk_tracker.mark_completed(unit_id)
+            if unit_id not in self.assigned_units.get(worker_id, set()):
+                return False
+
+            self.assigned_units[worker_id].discard(unit_id)
+            if self.chunk_tracker:
+                # A completion message is not evidence that missing results were stored.
+                self.chunk_tracker.mark_failed(unit_id)
+                if unit_id not in self.pending_units:
+                    self.pending_units.append(unit_id)
+                return False
+            return True
 
     def mark_failed(self, unit_id: str, worker_id: str, error: str) -> None:
         """Mark a work unit as failed."""
         logger.debug("Marking unit %s as failed by worker %s, error: %s", unit_id, worker_id, error)
         with self.lock:
-            if unit_id in self.work_units:
-                self.assigned_units[worker_id].discard(unit_id)
+            # Repeated or late failure messages must not steal another worker's assignment.
+            if unit_id not in self.assigned_units.get(worker_id, set()):
+                return
+            self.assigned_units[worker_id].discard(unit_id)
+            if self.chunk_tracker and self.chunk_tracker.is_chunk_completed(unit_id):
+                return
+            if unit_id in self.work_units and unit_id not in self.pending_units:
                 self.pending_units.append(unit_id)
-
-                # NOTE: We don't call chunk_tracker.mark_failed() here because that would
-                # reset the entire chunk to unprocessed, losing any partial progress that
-                # was already recorded via handle_result(). The chunk tracker should retain
-                # the processed ranges and only make the remaining unprocessed items available
-                # for retry when the unit is reassigned.
+            if self.chunk_tracker:
+                # Reset ownership while retaining already accepted item ranges.
+                self.chunk_tracker.mark_failed(unit_id)
 
     def release_assignments(self, worker_id: str) -> None:
         """Release all assignments for a disconnected worker."""
