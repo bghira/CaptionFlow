@@ -27,10 +27,17 @@ pip install --upgrade pip
 pip install "caption-flow[vllm]"
 ```
 
-The Linux GPU worker extra targets vLLM 0.31.x with PyTorch 2.13.0,
-torchvision 0.28.0, and torchaudio 2.11.0 (as required by vLLM), plus
-Transformers 5.10.4–5.17.x. To upgrade an existing worker from a checkout,
+The Linux GPU worker extra targets vLLM 0.33.x with PyTorch 2.14.0,
+torchvision 0.29.0, and torchaudio 2.11.0 (as required by vLLM), plus
+Transformers 5.16.1–5.20.x and Pillow 13. To upgrade an existing worker from a checkout,
 run `pip install --upgrade -e ".[vllm]"` in its environment and restart it.
+
+The tested worker stack uses NumPy 2.3.x on Python 3.12 and 2.4.x
+on Python 3.13, and FastAPI below 0.137. These bounds are shared with the
+base install so adding the worker extra remains compatible. CI resolves
+the full Linux worker and development dependencies on both Python versions.
+Lance 8.x, DuckDB 1.x, and Hugging Face Hub 1.x remain bounded to their
+existing major versions pending separate migration testing.
 
 An OpenAI-compatible API worker does not need the GPU dependencies:
 
@@ -43,26 +50,36 @@ For an orchestrator or monitor-only install, use `pip install -e .`.
 SimpleTuner. Terminal image previews remain optional because the current
 `term-image` release requires an older Pillow major than CaptionFlow uses.
 
-On Apple Silicon, install the MPS-compatible PyTorch chain and pinned Metal
-plugin with:
+On Apple Silicon with macOS 14 or newer, install the MPS-compatible PyTorch
+chain and image utilities with:
 
 ```bash
 pip install -e ".[apple]"
 ```
 
-CaptionFlow can use vLLM on Apple Silicon too, but the normal Linux `vllm`
-wheel is not the Apple install path. The pinned `vllm-metal` dependency is
-selected automatically on native arm64 Python 3.12+. For a ready-to-run
-Metal worker, use the upstream installer, which also builds/installs the
-Apple-specific vLLM core:
+For native vLLM Metal captioning, use **macOS 15+, Apple Silicon, and Python
+3.12**. The current Metal wheels are published on
+[GitHub releases](https://github.com/vllm-project/vllm-metal/releases), while
+PyPI still carries the obsolete 0.1.0 plugin. From this checkout, install the
+matching stable vLLM 0.33.0 core and Metal 0.33.0 wheels into your environment:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
-source ~/.venv-vllm-metal/bin/activate
-pip install -e .
+python -m pip install --upgrade -r requirements.metal.txt
+python -m pip install -e ".[dev]"
+python -m pip check
+python examples/metal_smoke.py
 ```
 
-Do not combine `.[apple]` with the Linux `.[vllm]` extra.
+The smoke test downloads `mlx-community/Qwen3-VL-2B-Instruct-4bit` on first
+use and runs two images through CaptionFlow's native caption pipeline. It
+checks that the Metal plugin and MLX GPU are active, and that the captions
+identify the images' shapes and different colors. Pass `--model /path/to/model`
+to use a local checkpoint. The test does not connect to an orchestrator.
+
+The stable recipe uses the core wheel's PyTorch 2.14.0 pin. Upstream's installer
+can select newer development builds and override Torch with nightly packages;
+those are separate from this recipe. `.[apple]` alone does not install a vLLM
+runtime, and should not be combined with the Linux `.[vllm]` extra.
 
 For native macOS CPU vLLM instead, follow the
 [official source-build instructions](https://docs.vllm.ai/en/stable/getting_started/installation/cpu/?device=apple).

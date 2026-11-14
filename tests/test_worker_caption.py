@@ -508,7 +508,10 @@ class TestCaptionWorker:
         # Mock tokenizer and processor
         mock_tokenizer = Mock()
         mock_tokenizer.encode = Mock(return_value=[1] * 100)  # 100 tokens
+        # qwen-vl-utils uses the callable tokenizer; the fallback uses encode().
+        mock_tokenizer.return_value.input_ids = [1] * 100
         mock_processor = Mock()
+        mock_processor.apply_chat_template.return_value = "Describe this image"
         mock_sampling = Mock()
 
         stage = caption_worker.stages[0]
@@ -521,6 +524,13 @@ class TestCaptionWorker:
         # All should be processable
         assert len(processable) == 3
         assert len(too_long) == 0
+
+        # The 50-token safety buffer must still exclude these 100-token prompts.
+        processable, too_long = caption_worker._validate_and_split_batch(
+            batch, stage, mock_processor, mock_tokenizer, mock_sampling, max_length=150
+        )
+        assert processable == []
+        assert too_long == batch
 
     def test_resize_image_for_tokens(self, caption_worker):
         """Test image resizing for token reduction."""

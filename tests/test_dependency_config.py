@@ -27,12 +27,12 @@ def requirements_by_name(requirements):
 @pytest.mark.parametrize("extra", ["vllm", "captioning", "all"])
 def test_vllm_extras_select_matching_runtime(package_config, extra):
     dependencies = requirements_by_name(package_config["extras_require"][extra])
-    assert dependencies["vllm"].specifier.contains("0.31.0")
-    assert not dependencies["vllm"].specifier.contains("0.30.0")
+    assert dependencies["vllm"].specifier.contains("0.33.0")
     assert not dependencies["vllm"].specifier.contains("0.32.0")
+    assert not dependencies["vllm"].specifier.contains("0.34.0")
     for name, version in (
-        ("torch", "2.13.0"),
-        ("torchvision", "0.28.0"),
+        ("torch", "2.14.0"),
+        ("torchvision", "0.29.0"),
         ("torchaudio", "2.11.0"),
     ):
         assert str(dependencies[name].specifier) == f"=={version}"
@@ -42,19 +42,19 @@ def test_vllm_extras_select_matching_runtime(package_config, extra):
 def test_transformers_matches_vllm_supported_range(package_config, extra):
     dependencies = requirements_by_name(package_config["extras_require"][extra])
     versions = dependencies["transformers"].specifier
-    assert versions.contains("5.10.4")
-    assert versions.contains("5.17.0")
-    assert not versions.contains("5.10.3")
-    assert not versions.contains("5.18.0")
+    assert versions.contains("5.16.1")
+    assert versions.contains("5.20.2")
+    assert not versions.contains("5.16.0")
+    assert not versions.contains("5.21.0")
 
 
 @pytest.mark.parametrize("extra", ["cpu", "cuda", "cuda13", "rocm", "apple"])
 def test_pytorch_extras_require_updated_family(package_config, extra):
     dependencies = requirements_by_name(package_config["extras_require"][extra])
-    assert dependencies["torch"].specifier.contains("2.13.0")
-    assert not dependencies["torch"].specifier.contains("2.12.0")
-    assert dependencies["torchvision"].specifier.contains("0.28.0")
-    assert not dependencies["torchvision"].specifier.contains("0.27.0")
+    assert dependencies["torch"].specifier.contains("2.14.0")
+    assert not dependencies["torch"].specifier.contains("2.13.0")
+    assert dependencies["torchvision"].specifier.contains("0.29.0")
+    assert not dependencies["torchvision"].specifier.contains("0.28.0")
     assert dependencies["torchaudio"].specifier.contains("2.11.0")
     assert "vllm" not in dependencies
 

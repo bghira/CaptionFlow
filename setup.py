@@ -23,58 +23,61 @@ def get_version() -> str:
 
 
 base_deps = [
-    "websockets>=16.0,<17.0",
-    "pyarrow>=21.0.0,<26.0.0",
-    "click>=8.2.0,<9.0.0",
-    "pydantic>=2.12.0,<3.0.0",
-    "aiofiles>=24.1.0,<26.0.0",
-    "rich>=14.0.0,<16.0.0",
-    "cryptography>=45.0.0,<50.0.0",
-    "PyYAML>=6.0.2,<7.0.0",
-    "certbot>=5.0.0,<6.0.0",
-    "numpy>=2.2.0,<3.0.0",
-    "Pillow>=11.3.0,<13.0.0",
+    "websockets>=17.4,<18.0",
+    "pyarrow>=26.0.1,<27.0.0",
+    "click>=8.5.1,<9.0.0",
+    "pydantic>=2.14.3,<3.0.0",
+    "aiofiles>=25.1.0,<26.0.0",
+    "rich>=15.0.0,<16.0.0",
+    "cryptography>=50.0.2,<51.0.0",
+    "PyYAML>=6.0.3,<7.0.0",
+    "certbot>=5.10.0,<6.0.0",
+    # vLLM's mistral-common requires NumPy <2.4 on Python 3.12;
+    # its pinned numba 0.65 requires NumPy <2.5 on Python 3.13.
+    "numpy>=2.3.5,<2.4.0; python_version < '3.13'",
+    "numpy>=2.4.6,<2.5.0; python_version >= '3.13'",
+    "Pillow>=13.0.0,<14.0.0",
     "trainingsample>=0.3.2,<0.4.0",
-    "pandas>=3.0.0,<4.0.0",
-    "datasets>=5.0.0,<6.0.0",
-    "boto3>=1.43.0,<2.0.0",
+    "pandas>=3.1.1,<4.0.0",
+    "datasets>=5.2.0,<6.0.0",
+    "boto3>=1.44.3,<2.0.0",
     "webshart>=0.6.0,<0.7.0",
-    "pylance>=8.0.0,<9.0.0",
-    "duckdb>=1.5.0,<2.0.0",
-    "aiohttp>=3.13.3,<4.0.0",
-    "fastapi>=0.133.0,<0.137.0",
-    "uvicorn>=0.35.0,<1.0.0",
-    "huggingface-hub>=1.5.0,<2.0.0",
-    "psutil>=7.0.0,<8.0.0",
-    "requests>=2.32.0,<3.0.0",
-    "tqdm>=4.67.0,<5.0.0",
-    "urwid>=3.0.2,<5.0.0",
+    "pylance>=8.0.1,<9.0.0",
+    "duckdb>=1.5.6,<2.0.0",
+    "aiohttp>=3.14.5,<4.0.0",
+    # vLLM 0.33 requires FastAPI below 0.137.
+    "fastapi>=0.136.3,<0.137.0",
+    "uvicorn>=0.54.0,<1.0.0",
+    "huggingface-hub>=1.33.0,<2.0.0",
+    "psutil>=7.2.2,<8.0.0",
+    "requests>=2.34.2,<3.0.0",
+    "tqdm>=4.70.1,<5.0.0",
+    "urwid>=5.1.3,<6.0.0",
 ]
 
-# Match vLLM 0.31's published requirements, including torchaudio 2.11.0.
+# Match vLLM 0.33's published requirements, including torchaudio 2.11.0.
 # Keep these explicit so a worker install cannot silently combine incompatible
 # torch packages when another dependency broadens its requirements.
 vllm_deps = [
-    "vllm>=0.31.0,<0.32.0",
-    "torch==2.13.0",
-    "torchvision==0.28.0",
+    "vllm>=0.33.0,<0.34.0",
+    "torch==2.14.0",
+    "torchvision==0.29.0",
     "torchaudio==2.11.0",
-    "transformers>=5.10.4,<5.18.0",
+    "transformers>=5.16.1,<5.21.0",
     "qwen-vl-utils>=0.0.14,<0.1.0",
 ]
 
 PYTORCH_DEPENDENCIES = [
-    "torch>=2.13.0",
-    "torchvision>=0.28.0",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
     "torchaudio>=2.11.0",
 ]
 
 APPLE_PYTORCH_DEPENDENCIES = [
-    "torch>=2.13.0",
-    "torchvision>=0.28.0",
-    "torchaudio>=2.11.0",
-    # vLLM Metal publishes Apple Silicon wheels for Python 3.12+.
-    "vllm-metal==0.1.0; platform_system == 'Darwin' and platform_machine == 'arm64' and python_version >= '3.12'",
+    *PYTORCH_DEPENDENCIES,
+    "qwen-vl-utils>=0.0.14,<0.1.0",
+    # Install the matching vLLM core and Metal wheels from upstream GitHub
+    # releases separately; PyPI's vllm-metal 0.1.0 is obsolete.
 ]
 
 extras_require = {
@@ -89,13 +92,13 @@ extras_require = {
     "rocm": PYTORCH_DEPENDENCIES,
     "apple": APPLE_PYTORCH_DEPENDENCIES,
     "dev": [
-        "pytest>=8.0.0,<9.0.0",
-        "pytest-asyncio>=1.1.0,<2.0.0",
-        "pytest-cov>=6.0.0,<7.0.0",
-        "transformers>=5.10.4,<5.18.0",
-        "black>=25.0.0,<26.0.0",
-        "ruff>=0.12.0,<1.0.0",
-        "mypy>=1.17.0,<2.0.0",
+        "pytest>=9.2.0,<10.0.0",
+        "pytest-asyncio>=1.5.0,<2.0.0",
+        "pytest-cov>=7.1.0,<8.0.0",
+        "transformers>=5.16.1,<5.21.0",
+        "black>=26.10.1,<27.0.0",
+        "ruff>=0.17.5,<1.0.0",
+        "mypy>=2.4.1,<3.0.0",
     ],
     "all": [*vllm_deps],
 }
