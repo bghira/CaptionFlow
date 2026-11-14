@@ -848,19 +848,6 @@ class HuggingFaceDatasetOrchestratorProcessor(OrchestratorProcessor):
                     if chunk_state.status == "completed":
                         logger.info(f"Not re-queuing completed chunk {unit_id}")
                         should_requeue = False
-                    elif chunk_state.processed_ranges:
-                        # Check if chunk is mostly complete (>90% processed)
-                        total_items = chunk_state.chunk_size
-                        processed_items = sum(
-                            end - start + 1 for start, end in chunk_state.processed_ranges
-                        )
-                        completion_rate = processed_items / total_items if total_items > 0 else 0
-
-                        if completion_rate > 0.9:
-                            logger.info(
-                                f"Not re-queuing nearly complete chunk {unit_id} ({completion_rate:.1%} done)"
-                            )
-                            should_requeue = False
 
                 if should_requeue:
                     logger.debug(f"Adding {unit_id} to pending queue")
