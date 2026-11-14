@@ -33,6 +33,7 @@ class StorageManager:
         contributor_buffer_size: int = 50,
     ):
         self.duckdb_shard_connections = {}
+        self._duckdb_caption_version = None
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -144,10 +145,16 @@ class StorageManager:
 
         """
         shard_key = output_shard or "default"
-        if shard_key in self.duckdb_shard_connections:
-            return self.duckdb_shard_connections[shard_key]
-
-        conn = duckdb.connect(database=":memory:")
+        conn = self.duckdb_shard_connections.get(shard_key)
+        if conn is not None:
+            # DuckDB holds an Arrow snapshot, so appends also require a refresh.
+            if shard_key != "default" or (
+                self.captions_dataset is not None
+                and self._duckdb_caption_version == self.captions_dataset.version
+            ):
+                return conn
+        else:
+            conn = duckdb.connect(database=":memory:")
 
         # For the default shard, register the captions Lance dataset if it exists
         if shard_key == "default":
@@ -165,6 +172,7 @@ class StorageManager:
                     )
                     # Register the Arrow table in DuckDB so it can be queried
                     conn.register("captions", arrow_table)
+                    self._duckdb_caption_version = self.captions_dataset.version
                     logger.debug(
                         f"Registered Lance dataset {self.captions_path} as 'captions' table in DuckDB"
                     )
@@ -236,6 +244,7 @@ class StorageManager:
                     # Re-register the updated dataset
                     arrow_table = self.captions_dataset.to_table()
                     conn.register("captions", arrow_table)
+                    self._duckdb_caption_version = self.captions_dataset.version
                     logger.debug(
                         f"Updated DuckDB registration for {self.captions_path} after schema change"
                     )
