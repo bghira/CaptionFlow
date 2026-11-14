@@ -22,6 +22,7 @@ def test_base_dependency_requires_structured_caption_support():
         for dependency in dependencies
         if (requirement := Requirement(dependency)).name == "webshart"
     )
-    assert "0.6.0" in requirement.specifier
+    assert "0.7.0" in requirement.specifier
     assert "0.5.4" not in requirement.specifier
-    assert "0.7.0" not in requirement.specifier
+    assert "0.6.0" not in requirement.specifier
+    assert "0.8.0" not in requirement.specifier
